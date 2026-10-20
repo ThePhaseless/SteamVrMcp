@@ -1,6 +1,6 @@
 use alvr_common::anyhow::{Context, Result};
 use serde::Deserialize;
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
 
 #[derive(Deserialize, Default, Clone, Debug)]
 #[serde(default, deny_unknown_fields)]
@@ -56,6 +56,15 @@ pub struct Paths {
     pub runtime_dir: PathBuf,
 }
 
+/// True when Steam runs from the Flatpak data dir, or no native Steam was found and Flatpak Steam exists.
+fn is_flatpak_steam(home: &Path, steam_dir: Option<&Path>) -> bool {
+    let flatpak = home.join(".var/app/com.valvesoftware.Steam");
+    match steam_dir {
+        Some(dir) => dir.starts_with(&flatpak),
+        None => flatpak.exists(),
+    }
+}
+
 impl Paths {
     pub fn detect(cfg: &Config) -> Paths {
         let home = dirs::home_dir().unwrap_or_default();
@@ -75,8 +84,8 @@ impl Paths {
         });
         // shortcut: no HOME makes state_dir relative to cwd, upgrade if the MCP must run without HOME
         Paths {
+            flatpak_steam: is_flatpak_steam(&home, steam_dir.as_deref()),
             steam_dir,
-            flatpak_steam: home.join(".var/app/com.valvesoftware.Steam").exists(),
             steamvr_dir,
             streamer_dir,
             state_dir: dirs::state_dir().unwrap_or_default().join("vr-test-mcp"),
@@ -115,6 +124,20 @@ mod tests {
         let c = Config::default();
         assert_eq!((c.timeouts.streaming_s, c.timeouts.app_s), (240, 180));
         assert!(c.steam.env.is_empty() && c.steam.args.is_empty() && c.alvr_settings.is_empty());
+    }
+
+    #[test]
+    fn flatpak_steam_only_when_steam_dir_is_flatpak_or_missing() {
+        let home = std::env::temp_dir().join(format!("vr-test-mcp-flatpak-{}", std::process::id()));
+        let flatpak = home.join(".var/app/com.valvesoftware.Steam");
+        std::fs::create_dir_all(&flatpak).unwrap();
+        let native = home.join(".local/share/Steam");
+        assert!(!is_flatpak_steam(&home, Some(&native)));
+        assert!(is_flatpak_steam(&home, Some(&flatpak.join("data/Steam"))));
+        assert!(is_flatpak_steam(&home, None));
+        std::fs::remove_dir_all(&flatpak).unwrap();
+        assert!(!is_flatpak_steam(&home, None));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

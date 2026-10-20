@@ -18,7 +18,7 @@ struct Fixture {
     paths: Paths,
 }
 
-fn fixture(name: &str) -> Fixture {
+fn fixture(name: &str, external_drivers: impl FnOnce(&PathBuf) -> Value) -> Fixture {
     let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let root = std::env::temp_dir().join(format!("vr-test-mcp-setup-{}-{name}", std::process::id()));
     fs::remove_dir_all(&root).ok();
@@ -29,7 +29,7 @@ fn fixture(name: &str) -> Fixture {
     let v20 = root.join("alvr20/lib64/alvr");
     fs::write(
         xdg.join("openvr/openvrpaths.vrpath"),
-        json!({"external_drivers": [v20], "jsonid": "vrpathreg", "version": 1}).to_string(),
+        json!({"external_drivers": external_drivers(&v20), "jsonid": "vrpathreg", "version": 1}).to_string(),
     )
     .unwrap();
 
@@ -62,7 +62,7 @@ fn fixture(name: &str) -> Fixture {
 
 #[test]
 fn prepare_then_restore_round_trips() {
-    let f = fixture("roundtrip");
+    let f = fixture("roundtrip", |v20| json!([v20]));
     let before = Snap::take(&f.paths);
     let values = session_values(&Config::default()).unwrap();
     let report = prepare(&f.paths, &values, HOST).unwrap();
@@ -86,7 +86,7 @@ fn prepare_then_restore_round_trips() {
 
 #[test]
 fn prepare_twice_keeps_first_snapshot() {
-    let f = fixture("twice");
+    let f = fixture("twice", |v20| json!([v20]));
     let values = session_values(&Config::default()).unwrap();
     prepare(&f.paths, &values, HOST).unwrap();
     let first = fs::read(f.paths.restore_file()).unwrap();
@@ -98,7 +98,7 @@ fn prepare_twice_keeps_first_snapshot() {
 
 #[test]
 fn restore_from_file_only() {
-    let f = fixture("fileonly");
+    let f = fixture("fileonly", |v20| json!([v20]));
     let before = Snap::take(&f.paths);
     let values = session_values(&Config::default()).unwrap();
     prepare(&f.paths, &values, HOST).unwrap();
@@ -111,5 +111,18 @@ fn restore_from_file_only() {
     restore(&fresh).unwrap();
     assert_eq!(Snap::take(&fresh), before);
     assert!(!created.exists() && !fresh.restore_file().exists());
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn null_external_drivers_round_trips() {
+    let f = fixture("nulldrivers", |_| Value::Null);
+    let before = Snap::take(&f.paths);
+    assert_eq!(before.openvrpaths["external_drivers"], Value::Null);
+    let values = session_values(&Config::default()).unwrap();
+    prepare(&f.paths, &values, HOST).unwrap();
+    assert_eq!(Snap::take(&f.paths).openvrpaths["external_drivers"], json!([f.paths.driver_dir().unwrap()]));
+    restore(&f.paths).unwrap();
+    assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }

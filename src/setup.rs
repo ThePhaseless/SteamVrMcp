@@ -20,8 +20,8 @@ const NO_STREAMER: &str = "ALVR streamer not found; set streamer_dir in config.t
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(default)]
 pub struct RestoreState {
-    // None = not recorded; Some(Null) = key was absent (JSON cannot round-trip that, so it reads back as None)
-    pub external_drivers: Option<Value>,
+    /// The original `external_drivers` value, written back verbatim (null included).
+    pub external_drivers: Value,
     /// "section/key" -> original (None = absent)
     pub vrsettings: BTreeMap<String, Option<Value>>,
     pub session: Option<FileState>,
@@ -155,9 +155,10 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     if snapshot_written {
         let settings = read_json(&vrsettings)?;
         state = RestoreState {
-            external_drivers: Some(
-                alvr_server_io::load_openvr_paths_json()?.get("external_drivers").cloned().unwrap_or(Value::Null),
-            ),
+            external_drivers: alvr_server_io::load_openvr_paths_json()?
+                .get("external_drivers")
+                .cloned()
+                .unwrap_or(Value::Null),
             vrsettings: VRSETTINGS_KEYS
                 .iter()
                 .map(|(s, k)| (format!("{s}/{k}"), settings.get(s).and_then(|s| s.get(k)).cloned()))
@@ -223,18 +224,11 @@ pub fn restore(paths: &Paths) -> Result<()> {
     )
     .context("parsing restore.json")?;
 
-    match &state.external_drivers {
-        None => {}
-        Some(original) => {
-            let mut json = alvr_server_io::load_openvr_paths_json()?;
-            let obj = json.as_object_mut().context("openvrpaths.vrpath is not an object")?;
-            match original {
-                Value::Null => obj.remove("external_drivers"),
-                v => obj.insert("external_drivers".into(), v.clone()),
-            };
-            alvr_server_io::save_openvr_paths_json(&json)?;
-        }
-    }
+    let mut json = alvr_server_io::load_openvr_paths_json()?;
+    json.as_object_mut()
+        .context("openvrpaths.vrpath is not an object")?
+        .insert("external_drivers".into(), state.external_drivers.clone());
+    alvr_server_io::save_openvr_paths_json(&json)?;
 
     if !state.vrsettings.is_empty() {
         let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
