@@ -1,5 +1,6 @@
 use crate::{
     alvr_api::{self, Api},
+    checks::{self, Check, Readiness},
     config::{Config, Paths},
     headset::{self, Headset, HeadsetStatus},
     setup,
@@ -14,6 +15,7 @@ use alvr_common::{
 use alvr_events::{Event, EventType};
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     process::Child,
     sync::{Arc, Weak},
     thread,
@@ -68,16 +70,72 @@ pub struct Stack {
     state: Mutex<State>,
     /// Held for a whole SteamVR restart, so stop() never races one.
     restarting: Mutex<()>,
+    /// Failed startup checks, by name.
+    failed: Mutex<BTreeMap<&'static str, String>>,
+    on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+pub fn restore_guard(steamvr_running: bool) -> Result<()> {
+    if steamvr_running {
+        bail!("SteamVR is running; run vr_stop first");
+    }
+    Ok(())
 }
 
 impl Stack {
     pub fn new(cfg: Config, paths: Paths) -> Arc<Stack> {
         // shortcut: port read once here, re-read after prepare if web_server_port overrides must apply to a first start
         let api = paths.session_file().map_or(Api { port: 8082 }, |f| Api::from_session_file(&f));
-        let stack = Arc::new(Stack { cfg, paths, api, state: Mutex::default(), restarting: Mutex::new(()) });
+        let stack = Arc::new(Stack {
+            cfg,
+            paths,
+            api,
+            state: Mutex::default(),
+            restarting: Mutex::new(()),
+            failed: Mutex::default(),
+            on_change: Mutex::new(None),
+        });
+        stack.recheck();
         let weak = Arc::downgrade(&stack);
         thread::spawn(move || supervise(weak));
+        let weak = Arc::downgrade(&stack);
+        thread::spawn(move || watch(weak));
         stack
+    }
+
+    /// Runs the startup checks again and keeps their results for `readiness`.
+    pub fn recheck(&self) -> Vec<Check> {
+        let checks = checks::startup_checks(&self.cfg, &self.paths);
+        *self.failed.lock() = checks.iter().filter(|c| !c.ok).map(|c| (c.name, c.reason.clone())).collect();
+        checks
+    }
+
+    /// The kept check results plus the runtime state, read now.
+    pub fn readiness(&self) -> Readiness {
+        let (streaming, ours_running) = {
+            let state = self.state.lock();
+            let streaming = state.headset.as_ref().is_some_and(|h| h.status().streaming);
+            (streaming, state.headset.is_some() || state.dashboard.is_some() || state.started_steam)
+        };
+        let steamvr_running = steamvr::is_steamvr_running();
+        Readiness {
+            failed: self.failed.lock().clone(),
+            restore_file: self.paths.restore_file().exists(),
+            steamvr_running,
+            alvr_api: self.api.ping(),
+            streaming,
+            running: steamvr_running || ours_running,
+        }
+    }
+
+    /// Called from the watcher thread whenever `readiness` changes.
+    pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
+        *self.on_change.lock() = Some(f);
+    }
+
+    pub fn restore(&self) -> Result<()> {
+        restore_guard(steamvr::is_steamvr_running())?;
+        setup::restore(&self.paths)
     }
 
     fn headset_status(&self) -> Option<HeadsetStatus> {
@@ -224,6 +282,23 @@ impl Stack {
     }
 }
 
+/// Recomputes readiness every 1 s and reports changes. Not in `supervise`, which blocks for a whole restart.
+fn watch(stack: Weak<Stack>) {
+    let mut last = Readiness::default();
+    loop {
+        let Some(s) = stack.upgrade() else { return };
+        let now = s.readiness();
+        if now != last {
+            if let Some(f) = &*s.on_change.lock() {
+                f();
+            }
+            last = now;
+        }
+        drop(s);
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 /// The dashboard's other job: restart SteamVR when ALVR asks, and reconnect a headset that went quiet.
 fn supervise(stack: Weak<Stack>) {
     let mut events = None;
@@ -271,5 +346,16 @@ fn supervise(stack: Weak<Stack>) {
             s.recreate_headset();
             quiet_since = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vr_restore_refuses_while_steamvr_runs() {
+        assert_eq!(restore_guard(true).unwrap_err().to_string(), "SteamVR is running; run vr_stop first");
+        assert!(restore_guard(false).is_ok());
     }
 }

@@ -1,7 +1,8 @@
 use alvr_common::anyhow::Result;
-use std::{io::Read, path::Path, sync::mpsc, thread, time::Duration};
+use std::path::Path;
 use vr_test_mcp::{
     config::{Config, Paths},
+    server,
     stack::Stack,
     steamvr,
 };
@@ -13,21 +14,10 @@ fn main() -> Result<()> {
     }
     alvr_client_core::init_logging();
 
-    // Headless until Task 3: start, print status to stderr every 5 s until stdin closes, stop.
     let cfg = Config::load()?;
     let stack = Stack::new(cfg.clone(), Paths::detect(&cfg));
-    match stack.start() {
-        Ok(report) => eprintln!("{}", serde_json::to_string(&report)?),
-        Err(e) => eprintln!("start failed: {e:#}"),
-    }
-    let (eof_tx, eof_rx) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        std::io::stdin().read_to_end(&mut vec![]).ok();
-        eof_tx.send(()).ok();
-    });
-    while eof_rx.recv_timeout(Duration::from_secs(5)) == Err(mpsc::RecvTimeoutError::Timeout) {
-        eprintln!("{}", serde_json::to_string(&stack.status())?);
-    }
-    eprintln!("{}", serde_json::to_string(&stack.stop()?)?);
-    Ok(())
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let served = runtime.block_on(server::serve(stack));
+    runtime.shutdown_background(); // a vr_start still running must not hold the exit
+    served
 }

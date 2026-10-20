@@ -3,6 +3,7 @@ mod common;
 use common::Snap;
 use std::{fs, panic, path::Path, thread, time::Duration};
 use vr_test_mcp::{
+    checks::startup_checks,
     config::{Config, Paths},
     setup::{prepare, restore, session_values},
     stack::Stack,
@@ -118,4 +119,22 @@ fn live_start_streams_and_stop_cleans() {
     restored.unwrap();
     assert_eq!(Snap::take(&paths), before);
     assert!(!paths.restore_file().exists());
+}
+
+/// Proves done-when 9 (second half): with no config file, the startup checks pass or say exactly
+/// what to set; with the owner's config they all pass. Read-only.
+#[test]
+#[ignore]
+fn live_checks_without_config() {
+    let started = std::time::Instant::now();
+    let bare = startup_checks(&Config::default(), &Paths::detect(&Config::default()));
+    println!("without config ({:?}): {bare:#?}", started.elapsed());
+    assert!(bare.iter().all(|c| c.ok || !c.fix.is_empty()), "{bare:#?}");
+    let streamer = bare.iter().find(|c| c.name == "alvr_streamer").unwrap();
+    assert!(!streamer.ok && streamer.fix.contains("streamer_dir"), "{streamer:?}");
+
+    let cfg = Config::load().unwrap();
+    let configured = startup_checks(&cfg, &Paths::detect(&cfg));
+    println!("with config: {configured:#?}");
+    assert!(configured.iter().all(|c| c.ok), "{configured:#?}");
 }
