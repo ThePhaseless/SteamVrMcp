@@ -1,0 +1,271 @@
+use crate::{
+    alvr_api::{self, Api},
+    config::{Config, Paths},
+    headset::{self, Headset, HeadsetStatus},
+    setup,
+    steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
+};
+use alvr_common::{
+    anyhow::{Context, Result, bail},
+    error,
+    parking_lot::Mutex,
+};
+use alvr_events::{Event, EventType};
+use serde::Serialize;
+use std::{
+    process::Child,
+    sync::{Arc, Weak},
+    thread,
+    time::{Duration, Instant},
+};
+
+// client_core/src/connection.rs SERVER_RESTART_MESSAGE, shown after ServerControlPacket::Restarting
+const SERVER_RESTART_MESSAGE: &str = "The streamer is restarting\nPlease wait...";
+const WATCHDOG: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default, Serialize)]
+pub struct StartReport {
+    pub already_streaming: bool,
+    pub adopted: bool,
+    pub started_steam: bool,
+    pub restarts: u32,
+    pub unblocked_safe_mode: bool,
+    pub view_resolution: [u32; 2],
+    pub fps: f32,
+    pub codec: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct StopReport {
+    pub remaining_processes: Vec<String>,
+    pub closed_steam: bool,
+    pub used_signals: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusReport {
+    pub steam_running: bool,
+    pub steamvr_running: bool,
+    pub alvr_version: Option<String>,
+    pub headset: Option<HeadsetStatus>,
+}
+
+#[derive(Default)]
+struct State {
+    headset: Option<Headset>,
+    dashboard: Option<Child>,
+    started_steam: bool,
+    restarts: u32,
+    managing: bool,
+}
+
+/// Steam, SteamVR with ALVR, and the headset, plus the dashboard role ALVR expects.
+pub struct Stack {
+    cfg: Config,
+    paths: Paths,
+    api: Api,
+    state: Mutex<State>,
+    /// Held for a whole SteamVR restart, so stop() never races one.
+    restarting: Mutex<()>,
+}
+
+impl Stack {
+    pub fn new(cfg: Config, paths: Paths) -> Arc<Stack> {
+        // shortcut: port read once here, re-read after prepare if web_server_port overrides must apply to a first start
+        let api = paths.session_file().map_or(Api { port: 8082 }, |f| Api::from_session_file(&f));
+        let stack = Arc::new(Stack { cfg, paths, api, state: Mutex::default(), restarting: Mutex::new(()) });
+        let weak = Arc::downgrade(&stack);
+        thread::spawn(move || supervise(weak));
+        stack
+    }
+
+    fn headset_status(&self) -> Option<HeadsetStatus> {
+        self.state.lock().headset.as_ref().map(Headset::status)
+    }
+
+    fn check_version(&self) -> Result<()> {
+        let version = self.api.version()?;
+        if !alvr_api::compatible(&version) {
+            bail!("ALVR server {} is not compatible with {}", version.trim(), *alvr_common::ALVR_VERSION);
+        }
+        Ok(())
+    }
+
+    pub fn start(&self) -> Result<StartReport> {
+        let mut report = StartReport::default();
+        if let Some(h) = self.headset_status().filter(|h| h.streaming) {
+            let restarts = self.state.lock().restarts;
+            return Ok(StartReport { already_streaming: true, restarts, view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report });
+        }
+        self.paths.session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
+
+        self.state.lock().headset.get_or_insert_with(Headset::start);
+        let hostname = headset::client_hostname()?;
+        let values = setup::session_values(&self.cfg)?;
+        let steamvr_running = steamvr::is_steamvr_running();
+        if !steamvr_running {
+            report.unblocked_safe_mode = setup::prepare(&self.paths, &values, &hostname)?.unblocked_safe_mode;
+        } else if self.api.ping() {
+            self.check_version()?;
+            setup::snapshot(&self.paths)?;
+            self.api.post_json("/api/session/values", &values)?;
+            for action in setup::client_actions() {
+                self.api.post_json("/api/session/client-connections", &(&hostname, action))?;
+            }
+            report.adopted = true;
+        } else {
+            bail!("SteamVR is running without the ALVR driver; close SteamVR and retry");
+        }
+
+        {
+            let mut state = self.state.lock();
+            if state.dashboard.is_none() {
+                state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths.runtime_dir)?);
+            }
+        }
+        if !steamvr_running {
+            report.started_steam = steamvr::launch(&self.cfg, STEAMVR_URL)?;
+            self.state.lock().started_steam |= report.started_steam;
+        }
+
+        self.state.lock().managing = true;
+        let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
+        let deadline = Instant::now() + timeout;
+        if !steamvr::wait_for(timeout, || self.api.ping()) {
+            bail!("ALVR server did not answer on port {} within {} s", self.api.port, timeout.as_secs());
+        }
+        self.check_version()?;
+        let streaming = steamvr::wait_for(deadline.saturating_duration_since(Instant::now()), || {
+            self.headset_status().is_some_and(|h| h.streaming)
+        });
+        let h = self.headset_status().unwrap_or_default();
+        if !streaming {
+            let mut reason = format!("headset not streaming after {} s; last HUD message: {:?}", timeout.as_secs(), h.hud_message);
+            if !self.state.lock().started_steam {
+                reason += "; Steam was already running, so the MCP could not set its environment (steam.env, steam.args)";
+            }
+            bail!(reason);
+        }
+        report.restarts = self.state.lock().restarts;
+        Ok(StartReport { view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report })
+    }
+
+    pub fn stop(&self) -> Result<StopReport> {
+        self.state.lock().managing = false;
+        let _no_restart = self.restarting.lock();
+        let mut report = StopReport::default();
+        if self.api.ping() {
+            // on failure the signals below still stop SteamVR
+            self.api.post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
+        }
+        if !steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
+            // the next start clears the safe-mode block this causes
+            for sig in [libc::SIGTERM, libc::SIGKILL] {
+                for name in VR_PROCESS_NAMES {
+                    steamvr::pids_named(name).into_iter().for_each(|pid| steamvr::terminate(pid, sig));
+                }
+                if steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(5)) {
+                    break;
+                }
+            }
+            report.used_signals = true;
+        }
+
+        let (headset, dashboard, started_steam) = {
+            let mut state = self.state.lock();
+            (state.headset.take(), state.dashboard.take(), std::mem::take(&mut state.started_steam))
+        };
+        drop(headset);
+        if let Some(mut child) = dashboard {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        if started_steam {
+            if steamvr::is_steam_running() {
+                steamvr::launch(&self.cfg, "-shutdown")?; // Steam is running, so this only forwards -shutdown
+            }
+            report.closed_steam = steamvr::wait_gone(&["steam"], Duration::from_secs(60));
+        }
+        report.remaining_processes = VR_PROCESS_NAMES
+            .iter()
+            .filter(|n| !steamvr::pids_named(n).is_empty())
+            .map(|n| n.to_string())
+            .collect();
+        Ok(report)
+    }
+
+    pub fn status(&self) -> StatusReport {
+        StatusReport {
+            steam_running: steamvr::is_steam_running(),
+            steamvr_running: steamvr::is_steamvr_running(),
+            alvr_version: self.api.version().ok().map(|v| v.trim().to_owned()),
+            headset: self.headset_status(),
+        }
+    }
+
+    /// Replaces the headset with a fresh one, as a new MCP process would connect.
+    pub fn recreate_headset(&self) {
+        let old = self.state.lock().headset.take();
+        drop(old); // the old client must stop listening on 9943 before the new one starts
+        let new = Headset::start();
+        self.state.lock().headset = Some(new);
+    }
+
+    fn restart_steamvr(&self) {
+        let _restart = self.restarting.lock();
+        if !self.state.lock().managing {
+            return;
+        }
+        match steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api) {
+            Ok(()) => self.state.lock().restarts += 1,
+            Err(e) => error!("SteamVR restart failed: {e:#}"),
+        }
+    }
+}
+
+/// The dashboard's other job: restart SteamVR when ALVR asks, and reconnect a headset that went quiet.
+fn supervise(stack: Weak<Stack>) {
+    let mut events = None;
+    // since when the API is up but the headset is not streaming
+    let mut quiet_since: Option<Instant> = None;
+    let mut last_hud = String::new();
+    loop {
+        let Some(s) = stack.upgrade() else { return };
+        if !s.state.lock().managing {
+            (events, quiet_since) = (None, None);
+            drop(s);
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+
+        let mut restart = false;
+        match &mut events {
+            None if s.api.ping() => events = s.api.events().map_err(|e| error!("ALVR events: {e:#}")).ok(),
+            None => thread::sleep(Duration::from_millis(500)),
+            Some(stream) => match stream.next(Duration::from_millis(500)) {
+                Ok(Some(Event { event_type: EventType::ServerRequestsSelfRestart, .. })) => restart = true,
+                Ok(_) => (), // shortcut: other events are dropped until Task 9's log ring keeps them
+                Err(_) => events = None,
+            },
+        }
+        let status = s.headset_status().unwrap_or_default();
+        // a request sent before the events stream attached still shows on the headset's HUD
+        restart |= status.hud_message == SERVER_RESTART_MESSAGE && last_hud != SERVER_RESTART_MESSAGE;
+        last_hud = status.hud_message;
+        if status.streaming || events.is_none() {
+            quiet_since = None;
+        } else {
+            quiet_since.get_or_insert_with(Instant::now);
+        }
+
+        if restart {
+            s.restart_steamvr();
+            (events, quiet_since) = (None, None);
+            last_hud = s.headset_status().map(|h| h.hud_message).unwrap_or_default();
+        } else if quiet_since.is_some_and(|t| t.elapsed() > WATCHDOG) {
+            // seen in the spike: an old client stops listening after a restart
+            s.recreate_headset();
+            quiet_since = None;
+        }
+    }
+}

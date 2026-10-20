@@ -141,6 +141,45 @@ fn list_dir(dir: &Path) -> BTreeSet<PathBuf> {
     fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default()
 }
 
+/// Writes restore.json from the current files, only if absent. Some(state) when written.
+pub fn snapshot(paths: &Paths) -> Result<Option<RestoreState>> {
+    if paths.restore_file().exists() {
+        return Ok(None);
+    }
+    let session_file = paths.session_file().context(NO_STREAMER)?;
+    let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
+    let compositor = paths.vrcompositor().context("SteamVR not found; set steamvr_dir in config.toml")?;
+    let settings = read_json(&vrsettings)?;
+    let state = RestoreState {
+        external_drivers: alvr_server_io::load_openvr_paths_json()?
+            .get("external_drivers")
+            .cloned()
+            .unwrap_or(Value::Null),
+        vrsettings: VRSETTINGS_KEYS
+            .iter()
+            .map(|(s, k)| (format!("{s}/{k}"), settings.get(s).and_then(|s| s.get(k)).cloned()))
+            .collect(),
+        session: Some(match session_file.exists() {
+            true => FileState::Contents(fs::read_to_string(&session_file)?),
+            false => FileState::Absent,
+        }),
+        created_files: vec![],
+        vrcompositor: wrapped_vrcompositor(&compositor)?,
+    };
+    write_state(paths, &state)?;
+    Ok(Some(state))
+}
+
+/// Registers the headset as a trusted client reached at 127.0.0.1, without mDNS or the trust prompt.
+pub fn client_actions() -> [ClientConnectionsAction; 3] {
+    let loopback = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+    [
+        ClientConnectionsAction::AddIfMissing { trusted: true, manual_ips: loopback.clone() },
+        ClientConnectionsAction::Trust,
+        ClientConnectionsAction::SetManualIps(loopback),
+    ]
+}
+
 /// Switches SteamVR to this streamer's ALVR driver. Writes restore.json first, only if absent.
 pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Result<PrepareReport> {
     let driver_dir = paths.driver_dir().context(NO_STREAMER)?;
@@ -150,28 +189,8 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     let config_dir = session_file.parent().context("session file has no parent")?;
 
     // 1. snapshot
-    let snapshot_written = !paths.restore_file().exists();
-    let mut state = RestoreState::default();
-    if snapshot_written {
-        let settings = read_json(&vrsettings)?;
-        state = RestoreState {
-            external_drivers: alvr_server_io::load_openvr_paths_json()?
-                .get("external_drivers")
-                .cloned()
-                .unwrap_or(Value::Null),
-            vrsettings: VRSETTINGS_KEYS
-                .iter()
-                .map(|(s, k)| (format!("{s}/{k}"), settings.get(s).and_then(|s| s.get(k)).cloned()))
-                .collect(),
-            session: Some(match session_file.exists() {
-                true => FileState::Contents(fs::read_to_string(&session_file)?),
-                false => FileState::Absent,
-            }),
-            created_files: vec![],
-            vrcompositor: wrapped_vrcompositor(&compositor)?,
-        };
-        write_state(paths, &state)?;
-    }
+    let mut state = snapshot(paths)?;
+    let snapshot_written = state.is_some();
 
     // 2. driver registration, as the dashboard's launch_steamvr does it
     let others: Vec<_> = alvr_server_io::get_registered_drivers()
@@ -200,18 +219,13 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     let before = list_dir(config_dir);
     let mut session = ServerSessionManager::new(Some(session_file.clone()));
     session.set_session_values(values.to_vec())?;
-    let loopback = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-    for action in [
-        ClientConnectionsAction::AddIfMissing { trusted: true, manual_ips: loopback.clone() },
-        ClientConnectionsAction::Trust,
-        ClientConnectionsAction::SetManualIps(loopback),
-    ] {
+    for action in client_actions() {
         session.update_client_connections(hostname.into(), action);
     }
-    if snapshot_written {
+    if let Some(state) = &mut state {
         // ALVR writes session_old.json when it extrapolates an older session
         state.created_files = list_dir(config_dir).difference(&before).cloned().collect();
-        write_state(paths, &state)?;
+        write_state(paths, state)?;
     }
 
     Ok(PrepareReport { snapshot_written, unblocked_safe_mode, unwrapped_vrcompositor: wrap.is_some() })
