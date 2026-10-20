@@ -9,6 +9,7 @@ use alvr_common::{
     anyhow::{Context, Result, bail},
     error,
     parking_lot::Mutex,
+    warn,
 };
 use alvr_events::{Event, EventType};
 use serde::Serialize;
@@ -245,7 +246,10 @@ fn supervise(stack: Weak<Stack>) {
             Some(stream) => match stream.next(Duration::from_millis(500)) {
                 Ok(Some(Event { event_type: EventType::ServerRequestsSelfRestart, .. })) => restart = true,
                 Ok(_) => (), // shortcut: other events are dropped until Task 9's log ring keeps them
-                Err(_) => events = None,
+                Err(e) => {
+                    warn!("ALVR events stream closed: {e:#}");
+                    events = None;
+                }
             },
         }
         let status = s.headset_status().unwrap_or_default();

@@ -1,7 +1,7 @@
 mod common;
 
 use common::Snap;
-use std::{panic, path::Path, thread, time::Duration};
+use std::{fs, panic, path::Path, thread, time::Duration};
 use vr_test_mcp::{
     config::{Config, Paths},
     setup::{prepare, restore, session_values},
@@ -69,6 +69,16 @@ fn live_start_streams_and_stop_cleans() {
     let cfg = Config::load().unwrap();
     let paths = Paths::detect(&cfg);
     let before = Snap::take(&paths);
+    // ALVR logs errors to crash_log.txt (always on, appended); the session log is off in release
+    // builds and truncated at each SteamVR start
+    let crash_log = alvr_filesystem::filesystem_layout_from_openvr_driver_root_dir(&paths.driver_dir().unwrap())
+        .unwrap()
+        .crash_log();
+    let log_start = fs::metadata(&crash_log).map_or(0, |m| m.len() as usize);
+    let new_errors = || {
+        let bytes = fs::read(&crash_log).unwrap_or_default();
+        String::from_utf8_lossy(bytes.get(log_start..).unwrap_or(&bytes)).into_owned()
+    };
     let s = Stack::new(cfg, paths.clone());
 
     let checks = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -78,6 +88,9 @@ fn live_start_streams_and_stop_cleans() {
         assert!(r.restarts >= 1, "a fresh session (hash 0) restarts SteamVR once: {r:?}");
         assert_eq!(r.codec.as_deref(), Some("H264"));
         assert!(!steamvr::pids_named("alvr_dashboard").is_empty(), "no alvr_dashboard child");
+        // the HUD trigger restarts SteamVR even when ALVR missed the dashboard, so check ALVR's own view
+        let errors = new_errors();
+        assert!(!errors.contains("No dashboard process found"), "risk 1 failed, ALVR saw no dashboard:\n{errors}");
 
         let frames = || s.status().headset.unwrap().frames_received;
         let f0 = frames();

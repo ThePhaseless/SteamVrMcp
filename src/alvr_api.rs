@@ -1,6 +1,7 @@
 use alvr_common::{
     anyhow::{Context, Result, bail},
     semver::Version,
+    warn,
 };
 use alvr_events::Event;
 use alvr_session::SessionConfig;
@@ -83,7 +84,11 @@ impl EventStream {
         }
         loop {
             match self.0.read() {
-                Ok(Message::Text(text)) => return Ok(Some(serde_json::from_str(&text)?)),
+                // skip what does not parse, as ALVR's dashboard does (dashboard/src/data_sources.rs)
+                Ok(Message::Text(text)) => match serde_json::from_str(&text) {
+                    Ok(event) => return Ok(Some(event)),
+                    Err(e) => warn!("skipping ALVR event that does not parse: {e}"),
+                },
                 Ok(Message::Close(_)) => bail!("ALVR closed the events stream"),
                 Ok(_) => (),
                 Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {

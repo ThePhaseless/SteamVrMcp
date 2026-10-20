@@ -1,5 +1,8 @@
 use crate::{alvr_api::Api, config::{Config, Paths}, setup};
-use alvr_common::anyhow::{Context, Result, bail};
+use alvr_common::{
+    anyhow::{Context, Result, bail},
+    error,
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -109,7 +112,10 @@ pub fn run_dashboard_child() -> ! {
 /// The dashboard's restart: ALVR shuts SteamVR down cleanly, then SteamVR is launched again.
 pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
-    api.post("/api/steamvr/restart")?;
+    // on failure the wait and signals below still stop SteamVR, so it is always relaunched
+    if let Err(e) = api.post("/api/steamvr/restart") {
+        error!("{e:#}");
+    }
     let names = ["vrserver", "vrmonitor"];
     if !wait_gone(&names, Duration::from_secs(30)) {
         for name in names {
