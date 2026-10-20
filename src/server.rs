@@ -49,9 +49,9 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Every startup check (ok, reason, fix) and the current state of Steam, SteamVR, ALVR and the virtual headset.")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR and the virtual headset.")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
-        self.run(|s| json(serde_json::json!({ "checks": s.recheck(), "state": s.status() }))).await.map_err(message)
+        self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
 
     #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped.")]

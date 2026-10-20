@@ -99,7 +99,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         let lib = dir.join("bin/linux64/libopenvr_api.so");
         unsafe { libloading::Library::new(&lib) }.map(|_| lib.display().to_string()).map_err(|e| e.to_string())
     });
-    let (gpu, vendor) = gpu(cfg);
+    let (gpu, vendor) = gpu_verdict(&gpu_vendors(), cfg.steam.env.is_empty());
     let encoder = vendor
         .ok_or_else(|| "no AMD or Intel GPU".to_owned())
         .and_then(|v| render_node(v).ok_or_else(|| format!("no render node for GPU vendor {v:#06x}")))
@@ -112,7 +112,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
             streamer(paths),
             format!("install the ALVR {} streamer and set streamer_dir = \"<path to alvr_streamer_linux>\"", *ALVR_VERSION),
         ),
-        check("alvr_dashboard_absent", dashboard_absent(), "close the ALVR dashboard (or the other vr-test-mcp)"),
+        dashboard_check(),
         check("audio_input", audio, "enable a default audio input; ALVR's client opens it at every connection"),
         check(
             "gpu_direct_mode",
@@ -162,6 +162,11 @@ fn driver_versions(bytes: &[u8]) -> Vec<String> {
     found
 }
 
+/// The one static check cheap enough for every vr_status.
+pub fn dashboard_check() -> Check {
+    check("alvr_dashboard_absent", dashboard_absent(), "close the ALVR dashboard (or the other vr-test-mcp)")
+}
+
 fn parent_of(pid: u32) -> Option<u32> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat[stat.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
@@ -177,29 +182,44 @@ fn dashboard_absent() -> Result<String, String> {
     if others.is_empty() { Ok("none running".to_owned()) } else { Err(format!("alvr_dashboard running: {}", others.join(", "))) }
 }
 
-/// Port of ALVR's `linux_hardware_checks`: the result, and the vendor of the GPU to encode on.
-fn gpu(cfg: &Config) -> (Result<String, String>, Option<u32>) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() });
-    let gpus: Vec<wgpu::AdapterInfo> = instance
-        .enumerate_adapters(wgpu::Backends::VULKAN)
-        .iter()
-        .map(|a| a.get_info())
-        .filter(|i| matches!(i.device_type, wgpu::DeviceType::DiscreteGpu | wgpu::DeviceType::IntegratedGpu))
+/// PCI vendor of each GPU (`card<N>`), from sysfs, so the check never wakes a sleeping dGPU.
+fn gpu_vendors() -> Vec<u32> {
+    let Ok(dir) = fs::read_dir("/sys/class/drm") else { return vec![] };
+    let mut cards: Vec<String> = dir
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.strip_prefix("card").is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())))
         .collect();
-    let names = gpus.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ");
+    cards.sort();
+    cards
+        .iter()
+        .filter_map(|c| fs::read_to_string(format!("/sys/class/drm/{c}/device/vendor")).ok())
+        .filter_map(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        .collect()
+}
+
+/// Port of ALVR's `linux_hardware_checks` over PCI vendors: the result, and the vendor to encode on.
+fn gpu_verdict(vendors: &[u32], steam_env_empty: bool) -> (Result<String, String>, Option<u32>) {
+    let name = |v: &u32| match *v {
+        AMD => "AMD".to_owned(),
+        INTEL => "Intel".to_owned(),
+        NVIDIA => "NVIDIA".to_owned(),
+        other => format!("{other:#06x}"),
+    };
+    let names = vendors.iter().map(name).collect::<Vec<_>>().join(", ");
     // shortcut: cannot see which GPU Steam will use; vr_start reports compositor errors
-    let Some(supported) = gpus.iter().find(|i| [AMD, INTEL].contains(&i.vendor)) else {
-        return match gpus.iter().any(|i| i.vendor == NVIDIA) {
+    let Some(supported) = vendors.iter().find(|v| [AMD, INTEL].contains(v)) else {
+        return match vendors.contains(&NVIDIA) {
             true => (Err("ALVR 21 direct mode does not work on NVIDIA (ALVR #3421)".to_owned()), None),
-            false => (Err(format!("no AMD or Intel Vulkan GPU, found [{names}]")), None),
+            false => (Err(format!("no AMD or Intel GPU in /sys/class/drm, found [{names}]")), None),
         };
     };
-    let reason = match (gpus.len(), cfg.steam.env.is_empty()) {
-        (1, _) => names,
-        (_, true) => format!("hybrid [{names}]: steam.env is empty, so SteamVR may not run on {}", supported.name),
-        (_, false) => format!("hybrid [{names}]: SteamVR must run on {} through steam.env", supported.name),
+    let reason = match (vendors.len(), steam_env_empty) {
+        (1, _) => format!("{names} GPU"),
+        (_, true) => format!("hybrid [{names}]: steam.env is empty, so SteamVR may not run on the {} GPU", name(supported)),
+        (_, false) => format!("hybrid [{names}]: SteamVR must run on the {} GPU through steam.env", name(supported)),
     };
-    (Ok(reason), Some(supported.vendor))
+    (Ok(reason), Some(*supported))
 }
 
 fn render_node(vendor: u32) -> Option<PathBuf> {
@@ -327,6 +347,19 @@ mod tests {
         let streamer = checks.iter().find(|c| c.name == "alvr_streamer").unwrap();
         assert!(!streamer.ok && streamer.fix.contains("streamer_dir"), "{streamer:?}");
         assert!(checks.iter().all(|c| !c.fix.is_empty()));
+    }
+
+    #[test]
+    fn gpu_vendors_decide_direct_mode() {
+        let nvidia_only = gpu_verdict(&[NVIDIA], true);
+        assert_eq!(nvidia_only, (Err("ALVR 21 direct mode does not work on NVIDIA (ALVR #3421)".to_owned()), None));
+        assert_eq!(gpu_verdict(&[], true).1, None);
+        assert!(gpu_verdict(&[], true).0.is_err());
+        assert_eq!(gpu_verdict(&[AMD], true).1, Some(AMD));
+        let (hybrid, vendor) = gpu_verdict(&[NVIDIA, AMD], true);
+        assert!(hybrid.unwrap().contains("steam.env"));
+        assert_eq!(vendor, Some(AMD));
+        assert_eq!(gpu_verdict(&[0x1234, INTEL], false).1, Some(INTEL));
     }
 
     #[test]

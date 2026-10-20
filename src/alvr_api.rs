@@ -14,6 +14,8 @@ use std::{
 };
 use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTlsStream};
 
+const TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The ALVR server's REST and events API on 127.0.0.1.
 pub struct Api {
     pub port: u16,
@@ -30,11 +32,11 @@ impl Api {
     }
 
     // shortcut: no chunked decoding; axum answers these routes with Content-Length, switch to a client crate if a route streams
-    fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String> {
+    fn request(&self, method: &str, path: &str, body: Option<&str>, timeout: Duration) -> Result<String> {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
-        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))
+        let mut stream = TcpStream::connect_timeout(&addr, timeout.min(Duration::from_secs(1)))
             .with_context(|| format!("ALVR API not reachable on port {}", self.port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_read_timeout(Some(timeout))?;
         stream.write_all(build_request(method, path, body).as_bytes())?;
         let mut response = String::new();
         stream.read_to_string(&mut response)?;
@@ -47,19 +49,20 @@ impl Api {
     }
 
     pub fn get(&self, path: &str) -> Result<String> {
-        self.request("GET", path, None)
+        self.request("GET", path, None, TIMEOUT)
     }
 
     pub fn post(&self, path: &str) -> Result<()> {
-        self.request("POST", path, None).map(drop)
+        self.request("POST", path, None, TIMEOUT).map(drop)
     }
 
     pub fn post_json<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        self.request("POST", path, Some(&serde_json::to_string(body)?)).map(drop)
+        self.request("POST", path, Some(&serde_json::to_string(body)?), TIMEOUT).map(drop)
     }
 
     pub fn ping(&self) -> bool {
-        self.get("/api/ping").is_ok()
+        // short, so readiness answers at once even when ALVR stalls
+        self.request("GET", "/api/ping", None, Duration::from_millis(500)).is_ok()
     }
 
     pub fn version(&self) -> Result<String> {
@@ -136,6 +139,15 @@ mod tests {
     fn stable_versions_match_on_major() {
         assert_eq!(protocol_id_of("21.3.0").unwrap(), "21");
         assert_eq!(protocol_id_of("21.0.0-dev14").unwrap(), "21-dev14");
+    }
+
+    #[test]
+    fn ping_gives_up_fast_on_a_stalled_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
+        let api = Api { port: listener.local_addr().unwrap().port() };
+        let started = std::time::Instant::now();
+        assert!(!api.ping());
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]

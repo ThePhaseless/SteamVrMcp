@@ -3203,7 +3203,6 @@ dependencies = [
  "tokio",
  "toml",
  "tungstenite",
- "wgpu",
 ]
 
 [[package]]

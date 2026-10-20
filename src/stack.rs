@@ -15,7 +15,6 @@ use alvr_common::{
 use alvr_events::{Event, EventType};
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
     process::Child,
     sync::{Arc, Weak},
     thread,
@@ -70,8 +69,8 @@ pub struct Stack {
     state: Mutex<State>,
     /// Held for a whole SteamVR restart, so stop() never races one.
     restarting: Mutex<()>,
-    /// Failed startup checks, by name.
-    failed: Mutex<BTreeMap<&'static str, String>>,
+    /// Results of the last startup checks.
+    checks: Mutex<Vec<Check>>,
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -92,7 +91,7 @@ impl Stack {
             api,
             state: Mutex::default(),
             restarting: Mutex::new(()),
-            failed: Mutex::default(),
+            checks: Mutex::default(),
             on_change: Mutex::new(None),
         });
         stack.recheck();
@@ -103,11 +102,18 @@ impl Stack {
         stack
     }
 
-    /// Runs the startup checks again and keeps their results for `readiness`.
-    pub fn recheck(&self) -> Vec<Check> {
-        let checks = checks::startup_checks(&self.cfg, &self.paths);
-        *self.failed.lock() = checks.iter().filter(|c| !c.ok).map(|c| (c.name, c.reason.clone())).collect();
-        checks
+    /// Runs all startup checks again and keeps their results for `readiness`. Only at `new` and vr_start:
+    /// some checks are slow.
+    pub fn recheck(&self) {
+        *self.checks.lock() = checks::startup_checks(&self.cfg, &self.paths);
+    }
+
+    /// The kept check results, with `alvr_dashboard_absent` re-run, so closing a dashboard un-hides vr_start.
+    pub fn checks(&self) -> Vec<Check> {
+        let mut checks = self.checks.lock();
+        let dashboard = checks::dashboard_check();
+        checks.iter_mut().filter(|c| c.name == dashboard.name).for_each(|c| *c = dashboard.clone());
+        checks.clone()
     }
 
     /// The kept check results plus the runtime state, read now.
@@ -119,7 +125,7 @@ impl Stack {
         };
         let steamvr_running = steamvr::is_steamvr_running();
         Readiness {
-            failed: self.failed.lock().clone(),
+            failed: self.checks.lock().iter().filter(|c| !c.ok).map(|c| (c.name, c.reason.clone())).collect(),
             restore_file: self.paths.restore_file().exists(),
             steamvr_running,
             alvr_api: self.api.ping(),
