@@ -121,6 +121,8 @@ impl Shared {
     fn on_streaming_started(&mut self, fps: f32, view_resolution: [u32; 2]) {
         let status = &mut self.status;
         (status.streaming, status.fps, status.view_resolution) = (true, fps, view_resolution);
+        // The handshake's "stream will begin soon" text would otherwise outlive the stream start.
+        status.hud_message.clear();
         status.stream_generation = STREAMS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     }
 
@@ -416,6 +418,14 @@ mod tests {
         assert!(a.status.stream_generation > 0 && b.status.stream_generation > a.status.stream_generation);
         b.on_streaming_stopped();
         assert!(b.status.stream_generation > a.status.stream_generation, "kept after the stream stops");
+    }
+
+    #[test]
+    fn streaming_clears_the_handshake_hud() {
+        let mut s = Shared::default();
+        s.status.hud_message = "ALVR v21\nThe stream will begin soon\nPlease wait...".into();
+        s.on_streaming_started(72.0, [1088, 1216]);
+        assert_eq!(s.status.hud_message, "");
     }
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/red_blue.h264");
