@@ -1,6 +1,7 @@
 use crate::{
     alvr_api::{self, Api},
     checks::{self, Check, Readiness},
+    clock,
     config::{Config, Paths},
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot},
     openvr::{self, OpenVr},
@@ -18,6 +19,7 @@ use alvr_common::{
 use alvr_events::{Event, EventType};
 use alvr_packets::{PathSegment, PathValuePair, parse_path, path_to_string};
 use alvr_session::{RecenteringMode, SessionConfig, Settings, settings_schema::SchemaNode};
+use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -89,6 +91,10 @@ pub struct StatusReport {
     pub warning: Option<&'static str>,
     /// The last SteamVR restart that failed, also one the supervisor ran: "<age> s ago: <reason>".
     pub last_restart_error: Option<String>,
+    /// Session clock: seconds since MCP start, and the same instant and T0 as RFC 3339 UTC.
+    pub now_t_s: f64,
+    pub now_at: String,
+    pub t0_at: String,
 }
 
 /// One ALVR session value to set.
@@ -121,6 +127,9 @@ pub const STEAMVR_INPUT_2_0: &str = "session_settings.headset.controllers.conten
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct LogLine {
+    /// Seconds on the session clock; `at` is the same instant as RFC 3339 UTC.
+    pub t_s: f64,
+    pub at: String,
     /// Local time of day, HH:MM:SS.mmm.
     pub t: String,
     /// "alvr" | "vrserver" | "vrcompositor" | "vrmonitor"
@@ -222,25 +231,28 @@ fn real_time_in(node: &SchemaNode, path: &[PathSegment]) -> bool {
 }
 
 /// SteamVR's "Wed Oct 21 2026 05:00:36.212461 [Info] - text" lines; a line without that prefix
-/// continues the one before and gets its time and level.
+/// continues the one before and gets its time and level. One before any stamped line is dropped.
 pub fn steamvr_log_lines(source: &str, lines: Vec<String>) -> Vec<LogLine> {
-    let (mut t, mut level) = (String::new(), String::new());
+    let mut last: Option<(String, f64, String, String)> = None;
     lines
         .into_iter()
-        .map(|line| {
+        .filter_map(|line| {
             let parsed = line.split_once(" [").and_then(|(stamp, rest)| {
                 let (lvl, text) = rest.split_once("] - ")?;
-                let time = stamp.rsplit(' ').next()?.get(..12).filter(|t| t.as_bytes()[2] == b':')?;
-                Some((time.to_owned(), lvl.to_lowercase(), text.to_owned()))
+                let naive = NaiveDateTime::parse_from_str(stamp, "%a %b %d %Y %H:%M:%S%.f").ok()?;
+                let local = Local.from_local_datetime(&naive).earliest()?;
+                let t_s = clock::wall_t_s(local.into());
+                Some(((naive.format("%H:%M:%S%.3f").to_string(), t_s, lvl.to_lowercase()), text.to_owned()))
             });
             let text = match parsed {
-                Some((time, lvl, text)) => {
-                    (t, level) = (time, lvl);
+                Some(((t, t_s, level), text)) => {
+                    last = Some((t, t_s, clock::at(t_s), level));
                     text
                 }
                 None => line,
             };
-            LogLine { t: t.clone(), source: source.to_owned(), level: level.clone(), text }
+            let (t, t_s, at, level) = last.clone()?;
+            Some(LogLine { t_s, at, t, source: source.to_owned(), level, text })
         })
         .collect()
 }
@@ -260,8 +272,7 @@ pub fn filter_logs(mut lines: Vec<LogLine>, q: &LogQuery) -> Result<Vec<LogLine>
         return Err(format!("limit must be 1 to {LOGS_KEPT}"));
     }
     let contains = q.contains.as_deref().map(str::to_lowercase);
-    // shortcut: sorted by time of day, so a window across midnight sorts wrongly; carry dates if that matters
-    lines.sort_by(|a, b| a.t.cmp(&b.t)); // stable: equal times keep their source order
+    lines.sort_by(|a, b| a.t_s.total_cmp(&b.t_s)); // stable: equal times keep their source order
     lines.retain(|l| {
         (source == "all" || l.source == source)
             && (l.source != "alvr" || min.is_none_or(|m| severity(&l.level).is_some_and(|s| s >= m)))
@@ -464,7 +475,7 @@ impl Stack {
     pub async fn run_sequence(&self, steps: Vec<SequenceStep>) -> Result<SequenceReport> {
         let rig = self.rig.lock().clone(); // own statement: no lock while planning
         let plan = rig::plan_sequence(steps, &rig).map_err(|e| anyhow!(e))?;
-        let start = tokio::time::Instant::now();
+        let (started_t_s, start) = (clock::now_s(), tokio::time::Instant::now());
         let (mut end, mut steps) = (start, vec![]);
         for (step, action) in plan {
             tokio::time::sleep_until(start + Duration::from_secs_f32(step.at_s)).await;
@@ -477,7 +488,7 @@ impl Stack {
             steps.push(AppliedStep { at_s: step.at_s, action: step.action, applied_s, ok, error });
         }
         tokio::time::sleep_until(end).await;
-        Ok(SequenceReport { steps, total_s: start.elapsed().as_secs_f32() })
+        Ok(SequenceReport { started_t_s, started_at: clock::at(started_t_s), steps, total_s: start.elapsed().as_secs_f32() })
     }
 
     /// Sets the play area (meters). The tracking thread sends it; the result says what ALVR's recentering mode does with it.
@@ -736,6 +747,7 @@ impl Stack {
             let state = self.state.lock();
             (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
         };
+        let now = clock::now_s();
         StatusReport {
             steam_running: steamvr::is_steam_running(),
             steamvr_running: steamvr::is_steamvr_running(),
@@ -744,6 +756,9 @@ impl Stack {
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
             warning: leaked.then_some(LEAKED),
             last_restart_error,
+            now_t_s: now,
+            now_at: clock::at(now),
+            t0_at: clock::at(0.0),
         }
     }
 
@@ -888,11 +903,12 @@ impl Stack {
     }
 
     fn keep_log(&self, t: String, entry: LogEntry) {
+        let t_s = clock::now_s();
         let mut ring = self.alvr_logs.lock();
         if ring.len() == LOGS_KEPT {
             ring.pop_front();
         }
-        ring.push_back(LogLine { t, source: "alvr".into(), level: level_name(entry.severity), text: entry.content });
+        ring.push_back(LogLine { t_s, at: clock::at(t_s), t, source: "alvr".into(), level: level_name(entry.severity), text: entry.content });
     }
 
     /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
@@ -1280,7 +1296,43 @@ mod tests {
     }
 
     fn line(t: &str, source: &str, level: &str, text: &str) -> LogLine {
-        LogLine { t: t.into(), source: source.into(), level: level.into(), text: text.into() }
+        LogLine { t: t.into(), t_s: 0.0, at: String::new(), source: source.into(), level: level.into(), text: text.into() }
+    }
+
+    fn stamped(day: &str, time: &str) -> String {
+        format!("{day} {time} [Info] - x")
+    }
+
+    #[test]
+    fn steamvr_lines_carry_session_time() {
+        let lines = steamvr_log_lines(
+            "vrserver",
+            ["Wed Oct 21 2026 05:00:36.212461 [Info] - a", "cont", "Wed Oct 21 2026 05:00:37.212461 [Info] - b"].map(String::from).to_vec(),
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].t_s, lines[0].t_s);
+        assert!((lines[2].t_s - lines[0].t_s - 1.0).abs() < 0.001);
+        assert!(lines.iter().all(|l| l.at.ends_with('Z')));
+        assert_eq!(lines[0].t, "05:00:36.212");
+        assert!(steamvr_log_lines("vrserver", vec!["orphan".into()]).is_empty(), "no stamp yet: dropped");
+    }
+
+    #[test]
+    fn logs_sort_across_midnight() {
+        let steam = steamvr_log_lines(
+            "vrserver",
+            vec![stamped("Wed Oct 21 2026", "00:00:01.000000"), stamped("Tue Oct 20 2026", "23:59:59.000000")],
+        );
+        let sorted = filter_logs(steam, &LogQuery::default()).unwrap();
+        assert_eq!(sorted.iter().map(|l| l.t.as_str()).collect::<Vec<_>>(), ["23:59:59.000", "00:00:01.000"]);
+    }
+
+    #[test]
+    fn status_reports_session_clock() {
+        let s = test_stack().status();
+        assert!(s.now_t_s >= 0.0);
+        assert!(s.t0_at.ends_with('Z') && s.now_at.ends_with('Z'));
+        assert!(s.now_at >= s.t0_at);
     }
 
     fn query(source: &str, contains: Option<&str>, min_level: Option<&str>, limit: Option<usize>) -> LogQuery {
@@ -1312,9 +1364,11 @@ mod tests {
             "vrserver",
             ["Wed Oct 21 2026 05:00:36.212461 [Info] - b", "continuation", "Wed Oct 21 2026 05:00:38.000001 [Error] - d"].map(String::from).to_vec(),
         );
-        assert_eq!(steam[0], line("05:00:36.212", "vrserver", "info", "b"));
-        assert_eq!(steam[1], line("05:00:36.212", "vrserver", "info", "continuation"), "belongs to the line before");
-        let alvr = vec![line("05:00:35.000", "alvr", "info", "a"), line("05:00:37.000", "alvr", "warning", "c")];
+        assert_eq!((steam[0].t.as_str(), steam[0].level.as_str(), steam[0].text.as_str()), ("05:00:36.212", "info", "b"));
+        assert_eq!((steam[1].t.as_str(), steam[1].level.as_str(), steam[1].text.as_str()), ("05:00:36.212", "info", "continuation"), "belongs to the line before");
+        let alvr_at = |t_s, level: &str, text: &str| LogLine { t_s, ..line("", "alvr", level, text) };
+        let base = steam[0].t_s;
+        let alvr = vec![alvr_at(base - 1.0, "info", "a"), alvr_at(base + 1.0, "warning", "c")];
         let merged = filter_logs([alvr, steam].concat(), &LogQuery::default()).unwrap();
         assert_eq!(merged.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["a", "b", "continuation", "c", "d"]);
     }

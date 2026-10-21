@@ -130,7 +130,7 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app.")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
@@ -287,12 +287,12 @@ impl VrServer {
         json(self.stack.recenter()).map_err(message)
     }
 
-    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: per step at_s, action, applied_s, ok and error, plus total_s. Can take minutes: it lasts as long as its steps.")]
+    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: started_t_s and started_at (the session clock when it began), per step at_s, action, applied_s, ok and error, plus total_s. Can take minutes: it lasts as long as its steps.")]
     async fn run_sequence(&self, Parameters(args): Parameters<SequenceArgs>) -> Result<CallToolResult, String> {
         json(self.stack.run_sequence(args.steps).await.map_err(message)?).map_err(message)
     }
 
-    #[tool(description = "Haptic events the app sent, oldest first: t_s (seconds on the MCP's clock), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
+    #[tool(description = "Haptic events the app sent, oldest first: t_s (seconds since MCP start), at (the same instant as RFC 3339 UTC), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
     async fn get_haptics(&self, Parameters(args): Parameters<HapticsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
@@ -308,7 +308,7 @@ impl VrServer {
         self.run(move |s| json(s.set_hand_tracking_flavour(skeletal)?)).await.map_err(message)
     }
 
-    #[tool(description = "ALVR log events (kept since vr_start, newest 1000) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
+    #[tool(description = "ALVR log events (kept since vr_start, newest 1000) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t_s, at (session clock: seconds since MCP start, and RFC 3339 UTC), t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
     async fn get_logs(&self, Parameters(args): Parameters<LogQuery>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.logs(args)?)).await.map_err(message)
     }

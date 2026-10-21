@@ -26,6 +26,7 @@ libloading = "0.8"
 openh264 = "0.9"
 png = "0.18"
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 # xr_probe example only

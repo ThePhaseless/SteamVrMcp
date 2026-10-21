@@ -5,13 +5,13 @@ use alvr_common::{
     glam::{Quat, UVec2, Vec3},
     parking_lot::Mutex,
 };
-use crate::{alvr_api::Api, rig::Rig};
+use crate::{alvr_api::Api, clock, rig::Rig};
 use openh264::{decoder::Decoder, formats::YUVSource};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -49,20 +49,21 @@ pub struct Screenshot {
     pub width: u32,
     pub height: u32,
     pub frame_timestamp_ms: u64,
+    /// When the IDR frame arrived, on the session clock.
+    pub t_s: f64,
+    pub at: String,
 }
 
-/// The time base of haptic events, shared by every headset so a recreated one keeps `since_s` meaningful.
-static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-/// Shared by every headset, like ORIGIN, so a recreated headset never repeats a generation.
+/// Shared by every headset, so a recreated headset never repeats a generation.
 static STREAMS_STARTED: AtomicU64 = AtomicU64::new(0);
 
 const HAPTICS_KEPT: usize = 1024;
 
-/// A haptic pulse the app sent. `t_s` is seconds on the MCP's clock (since its first headset started).
+/// A haptic pulse the app sent. `t_s` is seconds on the session clock; `at` is the same instant as RFC 3339.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct HapticEvent {
     pub t_s: f64,
+    pub at: String,
     /// "left", "right" or "other".
     pub hand: String,
     pub duration_s: f32,
@@ -76,7 +77,7 @@ struct Shared {
     config_nal: Vec<u8>,
     /// Set by a screenshot in progress: the first IDR frame to arrive lands in `idr`.
     armed: bool,
-    idr: Option<(Duration, Vec<u8>)>,
+    idr: Option<(Duration, Vec<u8>, Instant)>,
     /// Timestamp of the newest video frame, for ALVR's client statistics.
     last_frame: Duration,
     /// The newest HAPTICS_KEPT haptic events, oldest first.
@@ -92,7 +93,7 @@ impl Shared {
         self.status.frames_received += 1;
         self.last_frame = timestamp;
         if self.armed && self.idr.is_none() && has_idr(nal) {
-            self.idr = Some((timestamp, nal.to_vec()));
+            self.idr = Some((timestamp, nal.to_vec(), Instant::now()));
         }
         self.status.codec.is_some()
     }
@@ -266,9 +267,9 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
                     shared.lock().on_decoder_config(format!("{codec:?}"), config_nal);
                 }
                 ClientCoreEvent::Haptics { device_id, duration, frequency, amplitude } => {
-                    let t_s = ORIGIN.elapsed().as_secs_f64();
+                    let t_s = clock::now_s();
                     let hand = hand_name(device_id).to_owned();
-                    shared.lock().on_haptics(HapticEvent { t_s, hand, duration_s: duration.as_secs_f32(), frequency, amplitude });
+                    shared.lock().on_haptics(HapticEvent { t_s, at: clock::at(t_s), hand, duration_s: duration.as_secs_f32(), frequency, amplitude });
                 }
                 ClientCoreEvent::RealTimeConfig(_) => (),
             }
@@ -296,7 +297,6 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
 impl Headset {
     /// Starts the client; its tracking thread sends what `rig` holds.
     pub fn start(rig: Arc<Mutex<Rig>>) -> Headset {
-        LazyLock::force(&ORIGIN);
         let context = Arc::new(ClientCoreContext::new(capabilities(), vec![]));
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(RelaxedAtomic::new(false));
@@ -360,14 +360,15 @@ impl Grabber {
             thread::sleep(Duration::from_millis(10));
         };
         posted?;
-        let ((timestamp, frame), config_nal) = frame.context("no IDR frame arrived within 2 s")?;
+        let ((timestamp, frame, arrived), config_nal) = frame.context("no IDR frame arrived within 2 s")?;
         let (width, height, rgb) = decode_idr(&config_nal, &frame)?;
         let (width, rgb) = crop(eye, width, height, &rgb);
         let mut png = vec![];
         let mut encoder = png::Encoder::new(&mut png, width, height);
         (encoder.set_color(png::ColorType::Rgb), encoder.set_depth(png::BitDepth::Eight));
         encoder.write_header()?.write_image_data(&rgb)?;
-        Ok(Screenshot { png, width, height, frame_timestamp_ms: timestamp.as_millis() as u64 })
+        let t_s = clock::t_s(arrived);
+        Ok(Screenshot { png, width, height, frame_timestamp_ms: timestamp.as_millis() as u64, t_s, at: clock::at(t_s) })
     }
 }
 
@@ -461,7 +462,7 @@ mod tests {
     #[test]
     fn haptics_ring_filters_and_clears() {
         let mut s = Shared::default();
-        let event = |t_s| HapticEvent { t_s, hand: "left".into(), duration_s: 0.1, frequency: 160.0, amplitude: 0.8 };
+        let event = |t_s| HapticEvent { t_s, at: clock::at(t_s), hand: "left".into(), duration_s: 0.1, frequency: 160.0, amplitude: 0.8 };
         for i in 0..1030 {
             s.on_haptics(event(i as f64));
         }
@@ -484,6 +485,6 @@ mod tests {
         assert_eq!(s.idr, None, "not an IDR");
         s.on_frame(Duration::from_millis(3), FIXTURE);
         s.on_frame(Duration::from_millis(4), FIXTURE);
-        assert_eq!(s.idr, Some((Duration::from_millis(3), FIXTURE.to_vec())));
+        assert_eq!(s.idr.map(|(t, nal, _)| (t, nal)), Some((Duration::from_millis(3), FIXTURE.to_vec())));
     }
 }

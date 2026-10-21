@@ -399,6 +399,9 @@ pub struct AppliedStep {
 
 #[derive(Debug, Serialize)]
 pub struct SequenceReport {
+    /// When the sequence began, on the session clock.
+    pub started_t_s: f64,
+    pub started_at: String,
     pub steps: Vec<AppliedStep>,
     /// Until the last step and the latest animation are done.
     pub total_s: f32,

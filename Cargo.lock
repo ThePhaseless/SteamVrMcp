@@ -3349,6 +3349,7 @@ dependencies = [
  "ash",
  "base64",
  "bindgen",
+ "chrono",
  "dirs",
  "libc",
  "libloading 0.8.9",

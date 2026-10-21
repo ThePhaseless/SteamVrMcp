@@ -19,6 +19,7 @@ fn main() -> Result<()> {
         alvr_common::error!("{e:#}");
         Config::default()
     });
+    std::sync::LazyLock::force(&vr_test_mcp::clock::T0);
     let stack = Stack::new(cfg.clone(), Paths::detect(&cfg));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let served = runtime.block_on(server::serve(stack));
