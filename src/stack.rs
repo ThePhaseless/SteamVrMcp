@@ -35,10 +35,14 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
-/// A client that was streaming when vrserver went away is stuck in ALVR's TCP EOF spin, so its
-/// pause and drop never return.
-fn must_leak(streaming: bool, vrserver_running: bool) -> bool {
-    streaming && !vrserver_running
+const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs `f` on its own thread and returns its result, or None if it is still running after
+/// `timeout`; the thread is then left running (detached).
+fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || tx.send(f()).ok());
+    rx.recv_timeout(timeout).ok()
 }
 
 /// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
@@ -341,16 +345,17 @@ impl Stack {
         bail!("ALVR sent no session within 5 s")
     }
 
-    /// Drops a headset taken out of the state, or leaks it when ALVR's client could never finish.
+    /// Drops a headset taken out of the state; one whose drop does not return in time is leaked.
     fn dispose(&self, headset: Headset) {
-        if !must_leak(headset.status().streaming, steamvr::is_steamvr_running()) {
-            drop(headset);
-            return;
+        if within(HEADSET_TIMEOUT, move || drop(headset)).is_none() {
+            self.mark_leaked();
         }
-        // shortcut: ALVR TCP EOF spin on the client after the server exits (sockets/src/stream_socket/tcp.rs:137-147) never returns from pause/drop; the leaked thread spins one core until the MCP exits; drop when fixed upstream
+    }
+
+    // shortcut: ALVR TCP EOF spin on the client after the server exits (sockets/src/stream_socket/tcp.rs:137-147) never returns from pause/drop; after a 5 s timeout the headset is abandoned on its helper thread, which spins one core until the MCP exits; drop when fixed upstream
+    fn mark_leaked(&self) {
         warn!("{LEAKED}");
         self.state.lock().leaked = true;
-        std::mem::forget(headset);
     }
 
     fn restart_steamvr(&self) {
@@ -362,12 +367,14 @@ impl Stack {
         // first, outside the state lock; a client whose server is already gone is replaced
         let taken = self.state.lock().headset.take(); // own statement: the guard must not outlive it
         let headset = taken.and_then(|h| {
-            if must_leak(h.status().streaming, steamvr::is_steamvr_running()) {
-                self.dispose(h);
-                return None;
+            let paused = within(HEADSET_TIMEOUT, move || {
+                h.pause();
+                h
+            });
+            if paused.is_none() {
+                self.mark_leaked();
             }
-            h.pause();
-            Some(h)
+            paused
         });
         let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api);
         let headset = headset.inspect(Headset::resume).unwrap_or_else(Headset::start);
@@ -485,10 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn headset_leaks_only_when_its_server_is_gone_mid_stream() {
-        assert!(!must_leak(true, true), "server alive: the client disconnects cleanly");
-        assert!(must_leak(true, false), "server gone while streaming: pause and drop never return");
-        assert!(!must_leak(false, false), "never streamed: no stream thread to spin");
+    fn within_reports_a_stuck_closure_as_leaked() {
+        assert_eq!(within(Duration::from_secs(1), || 5), Some(5));
+        assert_eq!(within(Duration::from_millis(20), || thread::sleep(Duration::from_millis(300))), None);
     }
 
     #[test]
