@@ -9,16 +9,19 @@ use crate::{
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
 use alvr_common::{
-    ConnectionState,
+    ConnectionState, LogEntry, LogSeverity,
     anyhow::{Context, Result, anyhow, bail},
     error,
     parking_lot::Mutex,
     warn,
 };
 use alvr_events::{Event, EventType};
-use alvr_session::SessionConfig;
-use serde::Serialize;
+use alvr_packets::{PathSegment, PathValuePair, parse_path, path_to_string};
+use alvr_session::{SessionConfig, Settings, settings_schema::SchemaNode};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
+    collections::VecDeque,
     process::Child,
     sync::{Arc, Weak},
     thread,
@@ -81,7 +84,182 @@ pub struct StatusReport {
     pub steamvr_running: bool,
     pub alvr_version: Option<String>,
     pub headset: Option<HeadsetStatus>,
+    /// Only while the OpenVR reader is connected, so vr_status never connects one.
+    pub scene_app: Option<openvr::SceneApp>,
     pub warning: Option<&'static str>,
+}
+
+/// One ALVR session value to set.
+#[derive(Clone, Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SettingValue {
+    /// ALVR's path syntax from the session JSON root, e.g. "session_settings.video.preferred_fps" or
+    /// "session_settings.headset.controllers.content.gestures[2].joystick_range".
+    pub path: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct SettingsReport {
+    /// SteamVR restarted at least once.
+    pub restarted: bool,
+    /// How many SteamVR restarts happened: ALVR may ask for one more once the headset negotiates.
+    pub restarts: u32,
+    pub streaming: bool,
+}
+
+/// ALVR's `steamvr_input_2_0`: on, a bare hand is a separate skeletal hand-tracker device.
+pub const STEAMVR_INPUT_2_0: &str = "session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0";
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LogLine {
+    /// Local time of day, HH:MM:SS.mmm.
+    pub t: String,
+    /// "alvr" | "vrserver" | "vrcompositor" | "vrmonitor"
+    pub source: String,
+    /// "error" | "warning" | "info" | "debug"
+    pub level: String,
+    pub text: String,
+}
+
+#[derive(Debug, Default, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LogQuery {
+    /// "alvr", "vrserver", "vrcompositor", "vrmonitor" or "all" (default).
+    pub source: Option<String>,
+    /// Keep only lines whose text contains this, ignoring case.
+    pub contains: Option<String>,
+    /// "error", "warning", "info" or "debug": the lowest level kept for ALVR events. SteamVR lines are not filtered by level.
+    pub min_level: Option<String>,
+    /// How many of the newest matching lines to return, 1 to 1000 (default 100).
+    pub limit: Option<usize>,
+}
+
+const LOG_SOURCES: [&str; 5] = ["alvr", "vrserver", "vrcompositor", "vrmonitor", "all"];
+const STEAMVR_LOGS: [&str; 3] = ["vrserver", "vrcompositor", "vrmonitor"];
+/// ALVR events kept, and SteamVR lines read per log.
+const LOGS_KEPT: usize = 1000;
+
+fn level_name(severity: LogSeverity) -> String {
+    format!("{severity:?}").to_lowercase()
+}
+
+fn severity(level: &str) -> Option<LogSeverity> {
+    [LogSeverity::Error, LogSeverity::Warning, LogSeverity::Info, LogSeverity::Debug].into_iter().find(|s| level_name(*s) == level)
+}
+
+/// The values in ALVR's own types; a bad path fails here, before any request.
+pub fn parse_values(values: Vec<SettingValue>) -> Result<Vec<PathValuePair>> {
+    values.into_iter().map(|v| Ok(PathValuePair { path: parse_path(&v.path)?, value: v.value })).collect()
+}
+
+/// Ok when `session` (ALVR's session as JSON) holds every value.
+pub fn verify_applied(session: &Value, values: &[PathValuePair]) -> Result<(), String> {
+    for v in values {
+        let path = path_to_string(&v.path);
+        let found = v.path.iter().try_fold(session, |node, segment| match segment {
+            PathSegment::Name(name) => node.get(name),
+            PathSegment::Index(index) => node.get(index),
+        });
+        match found {
+            None => return Err(format!("{path} is not in ALVR's session")),
+            Some(found) if !json_eq(found, &v.value) => return Err(format!("{path} is {found} in ALVR's session, not {}", v.value)),
+            Some(_) => (),
+        }
+    }
+    Ok(())
+}
+
+/// Equality with numbers compared at f32 precision: ALVR stores most numbers as f32.
+fn json_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN));
+            (x - y).abs() <= f32::EPSILON as f64 * x.abs().max(1.0)
+        }
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| json_eq(x, y)),
+        (Value::Object(x), Value::Object(y)) => x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| json_eq(v, w))),
+        _ => a == b,
+    }
+}
+
+/// Whether ALVR's settings schema flags `path`, or an entry above it, "real-time": ALVR applies
+/// it while streaming, so no restart is needed (the dashboard's "can be changed in real-time").
+pub fn is_real_time(path: &[PathSegment]) -> bool {
+    match path {
+        [PathSegment::Name(root), rest @ ..] if root == "session_settings" => {
+            real_time_in(&Settings::schema(alvr_session::session_settings_default()), rest)
+        }
+        _ => false,
+    }
+}
+
+fn real_time_in(node: &SchemaNode, path: &[PathSegment]) -> bool {
+    use PathSegment::{Index, Name};
+    match (node, path) {
+        (SchemaNode::Section { entries, .. }, [Name(name), rest @ ..]) => {
+            entries.iter().find(|e| e.name == *name).is_some_and(|e| e.flags.contains("real-time") || real_time_in(&e.content, rest))
+        }
+        (SchemaNode::Choice { variants, .. }, [Name(name), rest @ ..]) => variants
+            .iter()
+            .find(|v| v.name == *name)
+            .is_some_and(|v| v.flags.contains("real-time") || v.content.as_ref().is_some_and(|c| real_time_in(c, rest))),
+        (SchemaNode::Optional { content, .. } | SchemaNode::Switch { content, .. }, [Name(name), rest @ ..]) if name == "content" => {
+            real_time_in(content, rest)
+        }
+        (SchemaNode::Array(items), [Index(index), rest @ ..]) => items.get(*index).is_some_and(|c| real_time_in(c, rest)),
+        // shortcut: below vectors and dictionaries, and at an enum's `variant`, every path counts as restart-relevant, so it restarts SteamVR; walk them if a real-time path there matters
+        _ => false,
+    }
+}
+
+/// SteamVR's "Wed Oct 21 2026 05:00:36.212461 [Info] - text" lines; a line without that prefix
+/// continues the one before and gets its time and level.
+pub fn steamvr_log_lines(source: &str, lines: Vec<String>) -> Vec<LogLine> {
+    let (mut t, mut level) = (String::new(), String::new());
+    lines
+        .into_iter()
+        .map(|line| {
+            let parsed = line.split_once(" [").and_then(|(stamp, rest)| {
+                let (lvl, text) = rest.split_once("] - ")?;
+                let time = stamp.rsplit(' ').next()?.get(..12).filter(|t| t.as_bytes()[2] == b':')?;
+                Some((time.to_owned(), lvl.to_lowercase(), text.to_owned()))
+            });
+            let text = match parsed {
+                Some((time, lvl, text)) => {
+                    (t, level) = (time, lvl);
+                    text
+                }
+                None => line,
+            };
+            LogLine { t: t.clone(), source: source.to_owned(), level: level.clone(), text }
+        })
+        .collect()
+}
+
+/// `lines` in time order, filtered by `q`, newest `limit` kept. `min_level` applies to ALVR events only.
+pub fn filter_logs(mut lines: Vec<LogLine>, q: &LogQuery) -> Result<Vec<LogLine>, String> {
+    let source = q.source.as_deref().unwrap_or("all");
+    if !LOG_SOURCES.contains(&source) {
+        return Err(format!("source must be one of {LOG_SOURCES:?}"));
+    }
+    let min = match q.min_level.as_deref() {
+        Some(level) => Some(severity(level).ok_or("min_level must be error, warning, info or debug")?),
+        None => None,
+    };
+    let limit = q.limit.unwrap_or(100);
+    if !(1..=LOGS_KEPT).contains(&limit) {
+        return Err(format!("limit must be 1 to {LOGS_KEPT}"));
+    }
+    let contains = q.contains.as_deref().map(str::to_lowercase);
+    // shortcut: sorted by time of day, so a window across midnight sorts wrongly; carry dates if that matters
+    lines.sort_by(|a, b| a.t.cmp(&b.t)); // stable: equal times keep their source order
+    lines.retain(|l| {
+        (source == "all" || l.source == source)
+            && (l.source != "alvr" || min.is_none_or(|m| severity(&l.level).is_some_and(|s| s >= m)))
+            && contains.as_ref().is_none_or(|c| l.text.to_lowercase().contains(c))
+    });
+    Ok(lines.split_off(lines.len().saturating_sub(limit)))
 }
 
 #[derive(Default)]
@@ -112,6 +290,8 @@ pub struct Stack {
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// The poses every headset sends; outlives headset restarts. Locked only briefly.
     rig: Arc<Mutex<Rig>>,
+    /// The newest LOGS_KEPT ALVR log events the supervisor saw, oldest first. Locked only briefly.
+    alvr_logs: Mutex<VecDeque<LogLine>>,
 }
 
 pub fn restore_guard(steamvr_running: bool) -> Result<()> {
@@ -135,6 +315,7 @@ impl Stack {
             reader: Mutex::new(None),
             on_change: Mutex::new(None),
             rig: Arc::default(),
+            alvr_logs: Mutex::default(),
         });
         stack.recheck();
         let weak = Arc::downgrade(&stack);
@@ -413,13 +594,88 @@ impl Stack {
     }
 
     pub fn status(&self) -> StatusReport {
+        let reader_connected = self.reader.lock().is_some(); // own statement: read() locks it again
         StatusReport {
             steam_running: steamvr::is_steam_running(),
             steamvr_running: steamvr::is_steamvr_running(),
             alvr_version: self.api.version().ok().map(|v| v.trim().to_owned()),
             headset: self.headset_status(),
+            scene_app: reader_connected.then(|| self.scene_app()).flatten(),
             warning: self.state.lock().leaked.then_some(LEAKED),
         }
+    }
+
+    /// Sets ALVR session values and checks ALVR stored them. Then, unless ALVR's schema flags every
+    /// path real-time, restarts SteamVR and waits for a new stream.
+    pub fn set_alvr_settings(&self, values: Vec<SettingValue>) -> Result<SettingsReport> {
+        let values = parse_values(values)?;
+        let restart = !values.iter().all(|v| is_real_time(&v.path));
+        if restart && !self.state.lock().managing {
+            bail!("these settings need a SteamVR restart, which only a vr_start session does; run vr_start first");
+        }
+        let mut events = self.api.events()?;
+        self.api.post_json("/api/session/values", &values)?;
+        // ALVR answers 200 even when it rejects the values: it logs why and sends no new session
+        // (server_core web_server.rs:181-185, server_io lib.rs:156-187)
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut mismatch = "ALVR sent no session within 3 s".to_owned();
+        while Instant::now() < deadline {
+            match events.next(Duration::from_millis(200))? {
+                Some(Event { event_type: EventType::Session(session), .. }) => match verify_applied(&serde_json::to_value(&*session)?, &values) {
+                    Ok(()) => break,
+                    Err(e) => mismatch = e,
+                },
+                Some(Event { event_type: EventType::Log(LogEntry { severity: LogSeverity::Error, content }), .. })
+                    if content.starts_with("Failed to set session values") =>
+                {
+                    bail!(content)
+                }
+                _ => (),
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("ALVR did not apply the values: {mismatch}");
+        }
+        drop(events);
+
+        let status = || self.headset_status().unwrap_or_default();
+        if !restart {
+            return Ok(SettingsReport { streaming: status().streaming, ..Default::default() });
+        }
+        let (restarts, generation) = (self.state.lock().restarts, status().stream_generation);
+        // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147): on loopback a headset reconnect strands the server, so restart SteamVR instead of reconnecting for ALVR's handshake check; drop when fixed upstream
+        self.restart_steamvr();
+        // a restart ALVR asks for once the headset negotiates (e.g. a new fps) is the supervisor's
+        let streaming = steamvr::wait_for(Duration::from_secs(self.cfg.timeouts.streaming_s), || {
+            let h = status();
+            h.streaming && h.codec.is_some() && h.stream_generation > generation
+        });
+        let restarts = self.state.lock().restarts.saturating_sub(restarts);
+        Ok(SettingsReport { restarted: restarts > 0, restarts, streaming })
+    }
+
+    /// The Index flavour (`steamvr_input_2_0` off) or the skeletal-tracker flavour (on).
+    pub fn set_hand_tracking_flavour(&self, skeletal_tracker: bool) -> Result<SettingsReport> {
+        self.set_alvr_settings(vec![SettingValue { path: STEAMVR_INPUT_2_0.into(), value: skeletal_tracker.into() }])
+    }
+
+    /// ALVR log events the supervisor kept, merged with the tails of SteamVR's own logs, filtered.
+    pub fn logs(&self, q: LogQuery) -> Result<Vec<LogLine>> {
+        let mut lines: Vec<LogLine> = self.alvr_logs.lock().iter().cloned().collect();
+        if let Some(steam) = &self.paths.steam_dir {
+            for name in STEAMVR_LOGS {
+                lines.extend(steamvr_log_lines(name, steamvr::log_tail(steam, name, LOGS_KEPT)));
+            }
+        }
+        filter_logs(lines, &q).map_err(|e| anyhow!(e))
+    }
+
+    fn keep_log(&self, t: String, entry: LogEntry) {
+        let mut ring = self.alvr_logs.lock();
+        if ring.len() == LOGS_KEPT {
+            ring.pop_front();
+        }
+        ring.push_back(LogLine { t, source: "alvr".into(), level: level_name(entry.severity), text: entry.content });
     }
 
     /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
@@ -544,7 +800,8 @@ fn supervise(stack: Weak<Stack>) {
             None => thread::sleep(Duration::from_millis(500)),
             Some(stream) => match stream.next(Duration::from_millis(500)) {
                 Ok(Some(Event { event_type: EventType::ServerRequestsSelfRestart, .. })) => restart = true,
-                Ok(_) => (), // shortcut: other events are dropped until Task 9's log ring keeps them
+                Ok(Some(Event { timestamp, event_type: EventType::Log(entry) })) => s.keep_log(timestamp, entry),
+                Ok(_) => (),
                 Err(e) => {
                     warn!("ALVR events stream closed: {e:#}");
                     events = None;
@@ -578,6 +835,7 @@ fn supervise(stack: Weak<Stack>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn vr_restore_refuses_while_steamvr_runs() {
@@ -606,6 +864,87 @@ mod tests {
     fn within_reports_a_stuck_closure_as_leaked() {
         assert_eq!(within(Duration::from_secs(1), || 5), Some(5));
         assert_eq!(within(Duration::from_millis(20), || thread::sleep(Duration::from_millis(300))), None);
+    }
+
+    fn pairs(path: &str, value: serde_json::Value) -> Vec<PathValuePair> {
+        vec![PathValuePair { path: parse_path(path).unwrap(), value }]
+    }
+
+    #[test]
+    fn verify_applied_detects_mismatch() {
+        let session = json!({ "session_settings": { "video": { "preferred_fps": 72.0 } } });
+        let e = verify_applied(&session, &pairs("session_settings.video.preferred_fps", json!(90.0))).unwrap_err();
+        assert!(e.contains("session_settings.video.preferred_fps") && e.contains("72"), "{e}");
+    }
+
+    #[test]
+    fn verify_applied_accepts_match() {
+        let mut session = serde_json::to_value(SessionConfig::default()).unwrap();
+        // ALVR stores f32, so a requested 0.9 comes back as 0.8999999761581421
+        session["session_settings"]["video"]["preferred_fps"] = json!(0.9f32);
+        assert_eq!(verify_applied(&session, &pairs("session_settings.video.preferred_fps", json!(0.9))), Ok(()));
+        let index = "session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0";
+        session["session_settings"]["headset"]["controllers"]["content"]["hand_skeleton"]["content"]["steamvr_input_2_0"] = json!(true);
+        assert_eq!(verify_applied(&session, &pairs(index, json!(true))), Ok(()));
+        let e = verify_applied(&session, &pairs("session_settings.video.nope", json!(1))).unwrap_err();
+        assert!(e.contains("session_settings.video.nope"), "{e}");
+    }
+
+    #[test]
+    fn settings_reject_bad_path() {
+        let e = parse_values(vec![SettingValue { path: "video..fps".into(), value: json!(90.0) }]).unwrap_err();
+        assert!(format!("{e:#}").contains("invalid path"), "{e:#}");
+    }
+
+    #[test]
+    fn real_time_follows_alvr_schema() {
+        let rt = |p: &str| is_real_time(&parse_path(p).unwrap());
+        assert!(!rt("session_settings.video.preferred_fps"), "flagged steamvr-restart");
+        assert!(!rt("session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0"));
+        assert!(rt("session_settings.extra.logging.log_haptics"), "flagged leaf");
+        assert!(rt("session_settings.headset.controllers.content.haptics.enabled"), "under a flagged entry");
+        assert!(!rt("session_settings.video.nope"));
+        assert!(!rt("client_connections"));
+    }
+
+    fn line(t: &str, source: &str, level: &str, text: &str) -> LogLine {
+        LogLine { t: t.into(), source: source.into(), level: level.into(), text: text.into() }
+    }
+
+    fn query(source: &str, contains: Option<&str>, min_level: Option<&str>, limit: Option<usize>) -> LogQuery {
+        LogQuery { source: Some(source.into()), contains: contains.map(Into::into), min_level: min_level.map(Into::into), limit }
+    }
+
+    #[test]
+    fn logs_filter_by_level_and_text() {
+        let ring = vec![
+            line("10:00:00.000", "alvr", "info", "Connected"),
+            line("10:00:01.000", "alvr", "error", "Encoder FAILED"),
+            line("10:00:02.000", "alvr", "error", "second error"),
+            line("10:00:03.000", "vrserver", "info", "failed to load"),
+        ];
+        let texts = |q| filter_logs(ring.clone(), &q).unwrap().into_iter().map(|l| l.text).collect::<Vec<_>>();
+        assert_eq!(texts(query("alvr", None, Some("error"), None)), ["Encoder FAILED", "second error"]);
+        assert_eq!(texts(query("all", None, Some("error"), None)), ["Encoder FAILED", "second error", "failed to load"], "min_level is for ALVR only");
+        assert_eq!(texts(query("all", Some("fAiLeD"), None, None)), ["Encoder FAILED", "failed to load"]);
+        assert_eq!(texts(query("all", None, None, Some(2))), ["second error", "failed to load"], "limit keeps the newest");
+        assert_eq!(texts(LogQuery::default()).len(), 4, "all sources by default");
+        for bad in [query("steamvr", None, None, None), query("all", None, Some("fatal"), None), query("all", None, None, Some(0))] {
+            assert!(filter_logs(ring.clone(), &bad).is_err());
+        }
+    }
+
+    #[test]
+    fn logs_merge_sources_in_time_order() {
+        let steam = steamvr_log_lines(
+            "vrserver",
+            ["Wed Oct 21 2026 05:00:36.212461 [Info] - b", "continuation", "Wed Oct 21 2026 05:00:38.000001 [Error] - d"].map(String::from).to_vec(),
+        );
+        assert_eq!(steam[0], line("05:00:36.212", "vrserver", "info", "b"));
+        assert_eq!(steam[1], line("05:00:36.212", "vrserver", "info", "continuation"), "belongs to the line before");
+        let alvr = vec![line("05:00:35.000", "alvr", "info", "a"), line("05:00:37.000", "alvr", "warning", "c")];
+        let merged = filter_logs([alvr, steam].concat(), &LogQuery::default()).unwrap();
+        assert_eq!(merged.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["a", "b", "continuation", "c", "d"]);
     }
 
     #[test]

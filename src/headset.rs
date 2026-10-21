@@ -10,7 +10,10 @@ use openh264::{decoder::Decoder, formats::YUVSource};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -23,6 +26,9 @@ pub struct HeadsetStatus {
     pub codec: Option<String>,
     pub frames_received: u64,
     pub hud_message: String,
+    /// Streams started by any headset of this MCP, as of this headset's latest; grows on every
+    /// StreamingStarted, so a caller sees a new stream even when it missed the gap between.
+    pub stream_generation: u64,
 }
 
 /// Which part of the side-by-side frame a screenshot shows.
@@ -47,6 +53,9 @@ pub struct Screenshot {
 
 /// The time base of haptic events, shared by every headset so a recreated one keeps `since_s` meaningful.
 static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Shared by every headset, like ORIGIN, so a recreated headset never repeats a generation.
+static STREAMS_STARTED: AtomicU64 = AtomicU64::new(0);
 
 const HAPTICS_KEPT: usize = 1024;
 
@@ -107,6 +116,12 @@ impl Shared {
             self.haptics.clear();
         }
         events
+    }
+
+    fn on_streaming_started(&mut self, fps: f32, view_resolution: [u32; 2]) {
+        let status = &mut self.status;
+        (status.streaming, status.fps, status.view_resolution) = (true, fps, view_resolution);
+        status.stream_generation = STREAMS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     }
 
     fn on_streaming_stopped(&mut self) {
@@ -228,12 +243,7 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
                 ClientCoreEvent::StreamingStarted(config) => {
                     let negotiated = &config.negotiated_config;
                     let fps = negotiated.refresh_rate_hint;
-                    {
-                        let status = &mut shared.lock().status;
-                        status.streaming = true;
-                        status.fps = fps;
-                        status.view_resolution = negotiated.view_resolution.to_array();
-                    }
+                    shared.lock().on_streaming_started(fps, negotiated.view_resolution.to_array());
                     context.send_view_params(view_params());
                     streaming.set(true);
                     let (context, rig, streaming) = (Arc::clone(&context), Arc::clone(&rig), Arc::clone(&streaming));
@@ -306,11 +316,6 @@ impl Headset {
     /// A handle that takes screenshots without the headset itself, so callers need not hold a lock around the wait.
     pub fn grabber(&self) -> Grabber {
         Grabber(Arc::clone(&self.shared))
-    }
-
-    pub fn reconnect(&self) {
-        self.pause();
-        self.resume();
     }
 
     /// Disconnects and stays disconnected until `resume`.
@@ -396,6 +401,17 @@ mod tests {
         assert!(!s.on_frame(Duration::from_millis(3), &[]), "a new stream needs a new DecoderConfig");
         assert_eq!((s.status.frames_received, s.last_frame), (3, Duration::from_millis(3)));
         assert_eq!(s.status.codec, None);
+    }
+
+    #[test]
+    fn stream_generation_grows_across_headsets() {
+        let (mut a, mut b) = (Shared::default(), Shared::default());
+        a.on_streaming_started(72.0, [1088, 1216]);
+        b.on_streaming_started(90.0, [1088, 1216]);
+        assert!(a.status.streaming && a.status.fps == 72.0 && a.status.view_resolution == [1088, 1216]);
+        assert!(a.status.stream_generation > 0 && b.status.stream_generation > a.status.stream_generation);
+        b.on_streaming_stopped();
+        assert!(b.status.stream_generation > a.status.stream_generation, "kept after the stream stops");
     }
 
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/red_blue.h264");

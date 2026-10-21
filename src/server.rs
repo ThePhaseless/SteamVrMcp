@@ -6,7 +6,7 @@ use crate::{
         HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, TouchArgs, TrackpadArgs,
         TriggerArgs,
     },
-    stack::Stack,
+    stack::{LogQuery, SettingValue, Stack},
 };
 use alvr_common::anyhow::{self, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -63,6 +63,28 @@ struct HapticsArgs {
     clear: bool,
 }
 
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SettingsArgs {
+    values: Vec<SettingValue>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+enum Flavour {
+    /// A bare hand drives the Valve Index controller device.
+    Index,
+    /// A bare hand is a separate full-skeleton hand-tracker device, as VRChat expects.
+    SkeletalTracker,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct FlavourArgs {
+    flavour: Flavour,
+}
+
 /// A tool result with `v` as pretty JSON text.
 fn json(v: impl Serialize) -> Result<CallToolResult> {
     Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v)?)]))
@@ -85,7 +107,7 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR and the virtual headset.")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app.")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
@@ -235,6 +257,22 @@ impl VrServer {
     #[tool(description = "Haptic events the app sent, oldest first: t_s (seconds on the MCP's clock), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
     async fn get_haptics(&self, Parameters(args): Parameters<HapticsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
+    }
+
+    #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). A bad path or value fails before any restart.")]
+    async fn set_alvr_settings(&self, Parameters(args): Parameters<SettingsArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.set_alvr_settings(args.values)?)).await.map_err(message)
+    }
+
+    #[tool(description = "How a bare tracked hand appears in SteamVR: \"index\" (ALVR's default; it drives the Index controller and pinches act as buttons) or \"skeletal_tracker\" (a separate full-skeleton hand tracker per hand). Sets ALVR's steamvr_input_2_0 through set_alvr_settings, so SteamVR restarts.")]
+    async fn set_hand_tracking_flavour(&self, Parameters(args): Parameters<FlavourArgs>) -> Result<CallToolResult, String> {
+        let skeletal = matches!(args.flavour, Flavour::SkeletalTracker);
+        self.run(move |s| json(s.set_hand_tracking_flavour(skeletal)?)).await.map_err(message)
+    }
+
+    #[tool(description = "ALVR log events (kept since vr_start, newest 1000) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
+    async fn get_logs(&self, Parameters(args): Parameters<LogQuery>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.logs(args)?)).await.map_err(message)
     }
 
     #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs.")]

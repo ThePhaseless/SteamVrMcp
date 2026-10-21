@@ -25,7 +25,7 @@ use vr_test_mcp::{
         PoseArgs, RigAction, TouchArgs, TrackpadArgs, TriggerArgs,
     },
     setup::{prepare, restore, session_values},
-    stack::Stack,
+    stack::{LogQuery, SettingValue, Stack},
     steamvr,
 };
 
@@ -620,6 +620,93 @@ fn live_bare_hand_pinch_is_trigger() {
     let (line, opened) = probe.wait(Duration::from_secs(1), |l| (0.0..0.1).contains(&value(l)));
     println!("open: {}", line["right"]);
     assert!(opened, "open hand did not release the trigger: {}", line["right"]);
+}
+
+fn preferred_fps(fps: f64) -> Vec<SettingValue> {
+    vec![SettingValue { path: "session_settings.video.preferred_fps".into(), value: json!(fps) }]
+}
+
+/// Proves done-when 7: a restart-relevant change restarts SteamVR and returns to streaming on its
+/// own. Also shows get_logs carrying ALVR's rejection of a bad path and SteamVR's own log lines.
+/// Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_restart_relevant_setting_restarts() {
+    let s = ensure_streaming();
+    // later tests expect the default 72 Hz, also after a failed assertion
+    struct Reset(Arc<Stack>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                println!("reset to 72 Hz: {:?}", self.0.set_alvr_settings(preferred_fps(72.0)));
+            }
+        }
+    }
+    let _reset = Reset(Arc::clone(&s));
+
+    for fps in [90.0, 72.0] {
+        let report = s.set_alvr_settings(preferred_fps(fps)).unwrap();
+        let headset = s.status().headset;
+        println!("{fps} Hz: {report:?}; headset {headset:?}");
+        assert!(report.restarted && report.streaming, "{report:?}");
+        assert_eq!(headset.map(|h| h.fps), Some(fps as f32));
+    }
+
+    let bad = vec![SettingValue { path: "session_settings.video.nope".into(), value: json!(1) }];
+    let e = format!("{:#}", s.set_alvr_settings(bad).unwrap_err());
+    println!("bad path: {e}");
+    assert!(e.contains("session_settings.video.nope"), "{e}");
+    let query = |source: &str, contains: Option<&str>| LogQuery { source: Some(source.into()), contains: contains.map(Into::into), min_level: None, limit: Some(5) };
+    let rejected = s.logs(query("alvr", Some("video.nope"))).unwrap();
+    println!("alvr: {rejected:#?}");
+    assert!(rejected.iter().any(|l| l.level == "error"), "{rejected:?}");
+    let vrserver = s.logs(query("vrserver", None)).unwrap();
+    println!("vrserver: {vrserver:#?}");
+    assert!(!vrserver.is_empty());
+}
+
+/// Proves done-when 6 (skeletal-tracker flavour): SteamVR reports hand-tracker skeletons for both
+/// hands, and switching flavour restarts SteamVR on its own. Needs Steam closed or its GPU
+/// supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_flavour_switch() {
+    let s = ensure_streaming();
+    // later tests expect controllers in the Index flavour, also after a failed assertion
+    struct Reset(Arc<Stack>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            for hand in [Hand::Left, Hand::Right] {
+                self.0.apply(RigAction::SetHandMode(HandModeArgs { hand, mode: HandMode::Controller })).ok();
+            }
+            if thread::panicking() {
+                println!("reset to Index flavour: {:?}", self.0.set_hand_tracking_flavour(false));
+            }
+        }
+    }
+    let reset = Reset(Arc::clone(&s));
+
+    let report = s.set_hand_tracking_flavour(true).unwrap();
+    println!("skeletal tracker: {report:?}");
+    assert!(report.restarted && report.streaming, "{report:?}");
+    for hand in [Hand::Left, Hand::Right] {
+        s.apply(RigAction::SetHandMode(HandModeArgs { hand, mode: HandMode::Hand })).unwrap();
+    }
+    let serials = ["VRLINKQ_Hand_Left", "VRLINKQ_Hand_Right"];
+    let trackers = |st: &TrackedState| {
+        serials.iter().all(|serial| st.devices.iter().any(|d| d.serial == *serial && d.pose_valid))
+            && ["left", "right"].iter().all(|h| st.skeletons.get(*h).is_some_and(|k| k.active))
+    };
+    // as in live_finger_curls_per_finger: skeleton actions read inactive while the scene app starts
+    let found = steamvr::wait_for(Duration::from_secs(60), || s.tracked_state(false).is_ok_and(|st| trackers(&st)));
+    let state = s.tracked_state(false);
+    println!("{state:#?}");
+    assert!(found, "no posed {serials:?} with active skeletons after 60 s; scene app {:?}", s.scene_app());
+
+    drop(reset); // controllers back before the switch
+    let report = s.set_hand_tracking_flavour(false).unwrap();
+    println!("index: {report:?}");
+    assert!(report.restarted && report.streaming, "{report:?}");
 }
 
 /// Not a check: ends a live window. Stops the stack this process started (or a SteamVR left by an

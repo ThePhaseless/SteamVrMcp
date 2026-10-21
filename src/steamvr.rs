@@ -84,6 +84,14 @@ pub fn launch(cfg: &Config, url: &str) -> Result<bool> {
     Ok(start_steam)
 }
 
+/// The last `lines` lines of SteamVR's own log `<steam>/logs/<name>.txt`; none when it is unreadable.
+pub fn log_tail(steam_dir: &Path, name: &str, lines: usize) -> Vec<String> {
+    let Ok(bytes) = fs::read(steam_dir.join("logs").join(format!("{name}.txt"))) else { return vec![] };
+    let text = String::from_utf8_lossy(&bytes);
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].iter().map(|l| l.to_string()).collect()
+}
+
 /// Starts this binary as `alvr_dashboard` through a link in `runtime_dir`. ALVR creates the
 /// headset at SteamVR start only while a process of that name exists.
 pub fn spawn_dashboard_child(runtime_dir: &Path) -> Result<Child> {
@@ -137,6 +145,17 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_tail_keeps_the_last_lines() {
+        let steam = std::env::temp_dir().join(format!("vr-test-mcp-log-tail-{}", std::process::id()));
+        fs::create_dir_all(steam.join("logs")).unwrap();
+        fs::write(steam.join("logs/vrserver.txt"), "a\nb\nc\n").unwrap();
+        assert_eq!(log_tail(&steam, "vrserver", 2), ["b", "c"]);
+        assert_eq!(log_tail(&steam, "vrserver", 9), ["a", "b", "c"]);
+        assert!(log_tail(&steam, "vrmonitor", 2).is_empty(), "missing file");
+        fs::remove_dir_all(&steam).ok();
+    }
 
     #[test]
     fn pids_named_finds_self() {
