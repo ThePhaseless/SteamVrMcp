@@ -219,9 +219,9 @@ pub fn snapshot(paths: &Paths) -> Result<Option<RestoreState>> {
             .cloned()
             .unwrap_or(Value::Null),
         vrsettings: BTreeMap::new(),
-        vrsettings_file: Some(FileState::Contents(fs::read_to_string(&vrsettings)?)),
+        vrsettings_file: Some(FileState::Contents(fs::read_to_string(&vrsettings).with_context(|| vrsettings.display().to_string())?)),
         session: Some(match session_file.exists() {
-            true => FileState::Contents(fs::read_to_string(&session_file)?),
+            true => FileState::Contents(fs::read_to_string(&session_file).with_context(|| session_file.display().to_string())?),
             false => FileState::Absent,
         }),
         created_files: vec![],
@@ -265,8 +265,8 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     // 3. vrcompositor wrapper
     let wrap = wrapped_vrcompositor(&compositor)?;
     if let Some(wrap) = &wrap {
-        fs::remove_file(&compositor)?;
-        fs::rename(&wrap.real_path, &compositor)?;
+        fs::remove_file(&compositor).with_context(|| compositor.display().to_string())?;
+        fs::rename(&wrap.real_path, &compositor).with_context(|| format!("{} -> {}", wrap.real_path.display(), compositor.display()))?;
     }
 
     // 4. vrsettings
@@ -308,7 +308,7 @@ pub fn restore(paths: &Paths) -> Result<()> {
     if let Some(original) = &state.vrsettings_file {
         let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
         match original {
-            FileState::Contents(text) => fs::write(&path, text)?,
+            FileState::Contents(text) => fs::write(&path, text).with_context(|| path.display().to_string())?,
             FileState::Absent => remove_file(&path)?,
         }
     } else if !state.vrsettings.is_empty() {
@@ -324,7 +324,7 @@ pub fn restore(paths: &Paths) -> Result<()> {
     if let Some(original) = &state.session {
         let path = paths.session_file().context(NO_STREAMER)?;
         match original {
-            FileState::Contents(text) => fs::write(&path, text)?,
+            FileState::Contents(text) => fs::write(&path, text).with_context(|| path.display().to_string())?,
             FileState::Absent => remove_file(&path)?,
         }
     }
@@ -335,8 +335,8 @@ pub fn restore(paths: &Paths) -> Result<()> {
     if let Some(wrap) = &state.vrcompositor {
         let compositor = paths.vrcompositor().context("SteamVR not found; set steamvr_dir in config.toml")?;
         if fs::read_link(&compositor).is_err() {
-            fs::rename(&compositor, &wrap.real_path)?;
-            std::os::unix::fs::symlink(&wrap.link_target, &compositor)?;
+            fs::rename(&compositor, &wrap.real_path).with_context(|| format!("{} -> {}", compositor.display(), wrap.real_path.display()))?;
+            std::os::unix::fs::symlink(&wrap.link_target, &compositor).with_context(|| compositor.display().to_string())?;
         }
     }
 

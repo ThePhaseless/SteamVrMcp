@@ -362,16 +362,29 @@ pub fn log_tail(steam_dir: &Path, name: &str, lines: usize) -> Vec<String> {
     all[all.len().saturating_sub(lines)..].iter().map(|l| l.to_string()).collect()
 }
 
+/// Creates `dir` (mode 0700) if absent, then requires a real directory owned by this user that no
+/// one else can write: the runtime dir may fall back to the shared temp dir.
+pub fn private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| dir.display().to_string())?;
+    let meta = fs::symlink_metadata(dir).with_context(|| dir.display().to_string())?;
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        bail!("{} must be a directory of this user with mode 0700, not {:o}; remove it", dir.display(), meta.mode() & 0o7777);
+    }
+    Ok(())
+}
+
 /// Starts this binary as `alvr_dashboard` through a link in `runtime_dir`. ALVR creates the
 /// headset at SteamVR start only while a process of that name exists.
 pub fn spawn_dashboard_child(runtime_dir: &Path) -> Result<Child> {
-    fs::create_dir_all(runtime_dir)?;
+    private_dir(runtime_dir)?;
     let link = runtime_dir.join(alvr_filesystem::dashboard_fname());
     match fs::remove_file(&link) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e).context(link.display().to_string()),
         _ => (),
     }
-    std::os::unix::fs::symlink(std::env::current_exe()?, &link)?;
+    // the running image itself, even after a rebuild replaced the file on disk
+    std::os::unix::fs::symlink(format!("/proc/{}/exe", std::process::id()), &link)?;
     Command::new(&link)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -579,6 +592,21 @@ mod tests {
         assert_eq!(signalable(i32::MAX as u32 + 1), None, "negative as i32: a process group");
         assert_eq!(signalable(u32::MAX), None, "-1: every process");
         assert_eq!(signalable(4242), Some(4242));
+    }
+
+    #[test]
+    fn runtime_dir_must_be_private() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-runtime-{}", std::process::id()));
+        let dir = root.join("vr-test-mcp");
+        private_dir(&dir).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        private_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(private_dir(&dir).unwrap_err().to_string().contains("755"), "others could swap the link");
+        symlink(&root, root.join("link")).unwrap();
+        assert!(private_dir(&root.join("link")).is_err(), "a symlink is not ours to trust");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -179,3 +179,13 @@ fn old_restore_json_still_restores() {
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
+
+#[test]
+fn missing_owner_file_is_named() {
+    let f = fixture("missing", |v20| json!([v20]));
+    let vrsettings = f.paths.vrsettings_file().unwrap();
+    fs::remove_file(&vrsettings).unwrap();
+    let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
+    assert!(e.contains(&vrsettings.display().to_string()), "{e}");
+    fs::remove_dir_all(&f.root).ok();
+}
