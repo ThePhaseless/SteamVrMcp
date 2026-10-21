@@ -369,7 +369,7 @@ pub fn log_mark(steam_dir: &Path, name: &str) -> LogMark {
 }
 
 /// The offset to read a log from, given `mark` taken earlier and the file's mark `now`: 0 when it is
-/// another file (SteamVR rotates its logs at every start) or shorter (truncated).
+/// another file (SteamVR rotates vrserver.txt to vrserver.previous.txt on some starts) or shorter (truncated).
 fn read_from(mark: LogMark, now: LogMark) -> u64 {
     let ((from, id), (len, now_id)) = (mark, now);
     if (id.is_some() && id != now_id) || len < from { 0 } else { from }

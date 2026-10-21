@@ -52,7 +52,8 @@ const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a cold vr_start waits for vrserver to log ALVR's HMD activation before it resumes the headset.
-const HMD_ACTIVATION_WAIT: Duration = Duration::from_secs(30);
+/// Below WATCHDOG, which counts the paused time as quiet and would otherwise restart SteamVR on a slow gate.
+const HMD_ACTIVATION_WAIT: Duration = Duration::from_secs(20);
 
 /// Bound on each OpenVR call, connect and disconnect: a stale connection must not hang a tool.
 const OPENVR_TIMEOUT: Duration = Duration::from_secs(5);
