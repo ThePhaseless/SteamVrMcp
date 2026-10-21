@@ -1,4 +1,5 @@
 pub mod alvr_api;
+pub mod audio;
 pub mod applog;
 pub mod checks;
 pub mod clock;

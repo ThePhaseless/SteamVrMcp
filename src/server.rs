@@ -66,6 +66,20 @@ struct ProximityArgs {
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+struct RecordAudioArgs {
+    /// Seconds to record, 0.1 to 60; default 5.
+    seconds: Option<f64>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct AudioLevelArgs {
+    /// Seconds to measure, 0.05 to 10; default 1.
+    window_s: Option<f64>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 struct FrameTimingArgs {
     /// Seconds to measure, 0.5 to 60; default 5.
     window_s: Option<f64>,
@@ -339,6 +353,16 @@ impl VrServer {
         self.run(move |s| json(s.frame_timing(args.window_s)?)).await.map_err(message)
     }
 
+    #[tool(description = "Record seconds (0.1 to 60, default 5) of what the default audio output plays, from its monitor through PipeWire, into a WAV file (16-bit stereo, 48 kHz) in the MCP's private runtime dir. Returns path, seconds, sample_rate, channels, left and right ({rms_dbfs, peak_dbfs}, silence is -120), t_s and at of the end. Limit: it holds everything the desktop plays, other apps included, and the files stay until logout. Needs the game's audio to reach the default output.")]
+    async fn record_audio(&self, Parameters(args): Parameters<RecordAudioArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.record_audio(args.seconds)?)).await.map_err(message)
+    }
+
+    #[tool(description = "Wait window_s (0.05 to 10, default 1), then report the level of what the default audio output plays over it, from its monitor through PipeWire: left and right ({rms_dbfs, peak_dbfs}, silence is -120), window_s, t_s and at of the end. Limit: it hears everything the desktop plays, other apps included.")]
+    async fn audio_level(&self, Parameters(args): Parameters<AudioLevelArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.audio_level(args.window_s)?)).await.map_err(message)
+    }
+
     #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). A bad path or value fails before any restart. With a restart the call can take minutes.")]
     async fn set_alvr_settings(&self, Parameters(args): Parameters<SettingsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.set_alvr_settings(args.values)?)).await.map_err(message)
@@ -490,12 +514,12 @@ mod tests {
             press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
             set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
             set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release \
-            read_app_log wait_for_log set_proximity get_frame_timing"
+            read_app_log wait_for_log set_proximity get_frame_timing record_audio audio_level"
             .split_whitespace()
             .map(String::from)
             .collect();
         want.sort();
-        assert_eq!((names.len(), names), (39, want));
+        assert_eq!((names.len(), names), (41, want));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::{alvr_api, config::{Config, Paths}, desktop, steamvr};
+use crate::{alvr_api, audio, config::{Config, Paths}, desktop, steamvr};
 use alvr_common::{ALVR_VERSION, semver::Version};
 use serde::Serialize;
 use std::{
@@ -34,7 +34,7 @@ pub struct Readiness {
 }
 
 /// Tools that change nothing, so an observer without the lease keeps them.
-pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release", "read_app_log", "wait_for_log", "get_frame_timing"];
+pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release", "read_app_log", "wait_for_log", "get_frame_timing", "record_audio", "audio_level"];
 
 /// The checks vr_start needs.
 pub const CORE: [&str; 7] =
@@ -101,6 +101,7 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
             let reasons: Vec<String> = SOURCES.iter().map(|s| source_ready(s, r)).filter_map(Result::err).collect();
             if reasons.len() == SOURCES.len() { Err(reasons.join("; ")) } else { Ok(()) }
         }
+        "record_audio" | "audio_level" => checks(&["audio_capture"]),
         "read_app_log" | "wait_for_log" => holds(r.app_logs, "no [app_logs] entry in config.toml"),
         "get_tracked_state" => {
             holds(r.steamvr_running, "SteamVR is not running")?;
@@ -151,6 +152,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         unsafe { libloading::Library::new(&lib) }.map(|_| lib.display().to_string()).map_err(|e| e.to_string())
     });
     let portal = desktop::check();
+    let pipewire = audio::check();
     let decoder = openh264::decoder::Decoder::new().map(|_| "OpenH264 decoder".to_owned()).map_err(|e| e.to_string());
     let (gpu, vendor) = gpu_verdict(&gpu_vendors(), cfg.steam.env.is_empty());
     let encoder = vendor
@@ -181,6 +183,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
             portal,
             "install xdg-desktop-portal with the backend for your desktop (for example -kde, -gnome, -gtk or -wlr)",
         ),
+        check("audio_capture", pipewire, "run PipeWire for this user session"),
     ]
 }
 
@@ -341,9 +344,10 @@ mod tests {
     use super::*;
     use crate::{config::{Config, Paths}, server::VrServer};
 
-    const ALL_CHECKS: [&str; 11] = [
+    const ALL_CHECKS: [&str; 12] = [
         "config", "steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input",
         "gpu_direct_mode", "h264_encoder", "openvr_client", "screenshot_decoder", "desktop_portal",
+        "audio_capture",
     ];
 
     fn all_ready() -> Readiness {
@@ -430,6 +434,15 @@ mod tests {
         let r = Readiness { failed: [("desktop_portal", "no bus".to_owned())].into(), streaming: false, steamvr_running: false, ..all_ready() };
         let err = tool_ready("screenshot", &r).unwrap_err();
         assert!(err.contains("headset is not streaming") && err.contains("SteamVR is not running") && err.contains("desktop_portal"), "{err}");
+    }
+
+    #[test]
+    fn audio_tools_need_audio_capture() {
+        let r = Readiness { failed: [("audio_capture", "no PipeWire".to_owned())].into(), ..all_ready() };
+        for tool in ["record_audio", "audio_level"] {
+            assert!(tool_ready(tool, &r).unwrap_err().contains("audio_capture"), "{tool}");
+            assert_eq!(tool_ready(tool, &Readiness { streaming: false, ..all_ready() }), Ok(()), "{tool}");
+        }
     }
 
     #[test]

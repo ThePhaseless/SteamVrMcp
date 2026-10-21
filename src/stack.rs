@@ -1,5 +1,6 @@
 use crate::{
     alvr_api::{self, Api},
+    audio,
     applog::{self, AppLogs},
     checks::{self, Check, Readiness},
     clock,
@@ -755,6 +756,35 @@ impl Stack {
         self.read(|vr| vr.frame_stats())
     }
 
+    /// Captures `seconds` (default 5, 0.1 to 60) of the default sink's monitor into a WAV file in the private runtime dir.
+    // shortcut: recordings accumulate until logout (tmpfs), prune when a test records many
+    pub fn record_audio(&self, seconds: Option<f64>) -> Result<Value> {
+        let seconds = seconds.unwrap_or(5.0);
+        if !(0.1..=60.0).contains(&seconds) {
+            bail!("seconds must be from 0.1 to 60, got {seconds}");
+        }
+        let samples = audio::capture(seconds)?;
+        let (t_s, [left, right]) = (clock::now_s(), audio::levels(&samples));
+        let dir = self.paths().runtime_dir.join("audio");
+        steamvr::private_dir(&self.paths().runtime_dir)?;
+        steamvr::private_dir(&dir)?;
+        let path = dir.join(format!("{}.wav", shot_stem(SystemTime::now(), std::process::id())));
+        std::fs::write(&path, audio::wav(&samples)).with_context(|| path.display().to_string())?;
+        let seconds = samples.len() as f64 / f64::from(audio::CHANNELS) / f64::from(audio::RATE);
+        Ok(serde_json::json!({ "path": path, "seconds": seconds, "sample_rate": audio::RATE, "channels": audio::CHANNELS, "left": left, "right": right, "t_s": t_s, "at": clock::at(t_s) }))
+    }
+
+    /// Captures `window_s` (default 1, 0.05 to 10) of the default sink's monitor and reports each channel's level.
+    pub fn audio_level(&self, window_s: Option<f64>) -> Result<Value> {
+        let window_s = window_s.unwrap_or(1.0);
+        if !(0.05..=10.0).contains(&window_s) {
+            bail!("window_s must be from 0.05 to 10, got {window_s}");
+        }
+        let [left, right] = audio::levels(&audio::capture(window_s)?);
+        let t_s = clock::now_s();
+        Ok(serde_json::json!({ "window_s": window_s, "left": left, "right": right, "t_s": t_s, "at": clock::at(t_s) }))
+    }
+
     /// Waits `window_s` (default 5, 0.5 to 60), then reports the compositor's frames in it, the
     /// cumulative-counter deltas and the mean of ALVR's statistics. A part that failed is null, with
     /// its error in `notes`.
@@ -1506,6 +1536,17 @@ mod tests {
     fn frame_timing_rejects_bad_window() {
         for w in [0.1, 61.0] {
             assert!(test_stack().frame_timing(Some(w)).unwrap_err().to_string().contains("window_s"), "{w}");
+        }
+    }
+
+    #[test]
+    fn audio_args_bounds() {
+        let stack = test_stack();
+        for s in [0.0, 61.0, f64::NAN] {
+            assert!(stack.record_audio(Some(s)).unwrap_err().to_string().contains("seconds"), "{s}");
+        }
+        for w in [0.01, 11.0, f64::NAN] {
+            assert!(stack.audio_level(Some(w)).unwrap_err().to_string().contains("window_s"), "{w}");
         }
     }
 
