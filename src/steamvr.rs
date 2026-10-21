@@ -347,26 +347,40 @@ fn log_file(steam_dir: &Path, name: &str) -> PathBuf {
 
 /// Where Steam's console log ends now; read from here after a launch.
 pub fn console_log_len(steam_dir: &Path) -> u64 {
-    log_len(steam_dir, "console_log")
+    log_mark(steam_dir, "console_log").0
 }
 
 /// What Steam wrote to its console log after `from`; all of it when the log is now shorter (rotated).
 pub fn console_log_since(steam_dir: &Path, from: u64) -> String {
-    log_since(steam_dir, "console_log", from)
+    log_since(steam_dir, "console_log", (from, None))
 }
 
-/// Where `<steam>/logs/<name>.txt` ends now.
-pub fn log_len(steam_dir: &Path, name: &str) -> u64 {
-    fs::metadata(log_file(steam_dir, name)).map_or(0, |m| m.len())
+/// A log's length and, when known, its file identity (dev, inode).
+pub type LogMark = (u64, Option<(u64, u64)>);
+
+fn mark_of(meta: &fs::Metadata) -> LogMark {
+    use std::os::unix::fs::MetadataExt;
+    (meta.len(), Some((meta.dev(), meta.ino())))
 }
 
-/// What `<steam>/logs/<name>.txt` got after `from`; all of it when the log is now shorter (rotated).
-pub fn log_since(steam_dir: &Path, name: &str, from: u64) -> String {
+/// Where `<steam>/logs/<name>.txt` ends now, and which file that is; no identity when it is missing.
+pub fn log_mark(steam_dir: &Path, name: &str) -> LogMark {
+    fs::metadata(log_file(steam_dir, name)).map_or((0, None), |m| mark_of(&m))
+}
+
+/// The offset to read a log from, given `mark` taken earlier and the file's mark `now`: 0 when it is
+/// another file (SteamVR rotates its logs at every start) or shorter (truncated).
+fn read_from(mark: LogMark, now: LogMark) -> u64 {
+    let ((from, id), (len, now_id)) = (mark, now);
+    if (id.is_some() && id != now_id) || len < from { 0 } else { from }
+}
+
+/// What `<steam>/logs/<name>.txt` got after `mark`; all of it when the log was rotated or truncated.
+pub fn log_since(steam_dir: &Path, name: &str, mark: LogMark) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let mut bytes = vec![];
     if let Ok(mut file) = fs::File::open(log_file(steam_dir, name)) {
-        let len = file.metadata().map_or(0, |m| m.len());
-        let from = if len < from { 0 } else { from };
+        let from = file.metadata().map_or(0, |m| read_from(mark, mark_of(&m)));
         file.seek(SeekFrom::Start(from)).and_then(|_| file.read_to_end(&mut bytes)).ok();
     }
     String::from_utf8_lossy(&bytes).into_owned()
@@ -792,6 +806,16 @@ mod tests {
         assert!(has_leftovers(&["steamtours", "vrmonitor"]), "Steam refuses the relaunch: WaitingPrevProcess");
         assert!(!has_leftovers(&[]));
         assert!(!has_leftovers(&["vrserver", "steamtours"]), "a running SteamVR is adopted, not killed");
+    }
+
+    #[test]
+    fn read_from_starts_over_on_another_file() {
+        let old = (100, Some((1, 7)));
+        assert_eq!(read_from(old, (150, Some((1, 7)))), 100, "same file, grown");
+        assert_eq!(read_from(old, (150, Some((1, 8)))), 0, "rotated, and the new file already outgrew the old");
+        assert_eq!(read_from(old, (50, Some((1, 7)))), 0, "truncated");
+        assert_eq!(read_from((0, None), (150, Some((1, 8)))), 0, "missing before the launch");
+        assert_eq!(read_from((100, None), (150, Some((1, 8)))), 100, "no identity taken: length only");
     }
 
     #[test]

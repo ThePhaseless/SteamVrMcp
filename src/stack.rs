@@ -1034,7 +1034,7 @@ impl Stack {
         let paths = self.paths();
         let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
-        let vrserver_from = steam_dir.map_or(0, |d| steamvr::log_len(d, "vrserver"));
+        let vrserver_from = steam_dir.map_or((0, None), |d| steamvr::log_mark(d, "vrserver"));
         let mut handed = None;
         if !steamvr_running {
             report.started_steam = steamvr::launch(&self.cfg(), STEAMVR_URL)?;
@@ -1070,7 +1070,6 @@ impl Stack {
             // ALVR answers from inside DriverProvider::Init, before Hmd::activate, so wait for vrserver to log the activation
             let activated = steam_dir.is_some_and(|d| {
                 let deadline = Instant::now() + HMD_ACTIVATION_WAIT;
-                // shortcut: a rotated vrserver.txt that already outgrew the old one's length hides its start, so the wait runs to the deadline; compare inodes if that shows up
                 while !hmd_activated(&steamvr::log_since(d, "vrserver", vrserver_from)) {
                     if stopped() || Instant::now() >= deadline {
                         return false;
