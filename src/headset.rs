@@ -301,12 +301,11 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
                     let negotiated = &config.negotiated_config;
                     let fps = negotiated.refresh_rate_hint;
                     shared.lock().on_streaming_started(fps, negotiated.view_resolution.to_array());
-                    // SteamVR 2.18 keeps an OpenXR session at VISIBLE until it has a proximity state. The rig lock
-                    // stays held across the send so a concurrent set_proximity cannot be overtaken by this older value.
-                    {
-                        let rig = rig.lock();
-                        context.send_proximity_state(rig.on_head);
-                    }
+                    // SteamVR 2.18 keeps an OpenXR session at VISIBLE until it has a proximity state.
+                    let order = rig.lock().proximity_send.clone();
+                    let _order = order.lock();
+                    let on_head = rig.lock().on_head;
+                    context.send_proximity_state(on_head);
                     context.send_view_params(view_params());
                     streaming.set(true);
                     let (context, rig, streaming) = (Arc::clone(&context), Arc::clone(&rig), Arc::clone(&streaming));
@@ -389,8 +388,8 @@ impl Headset {
         self.context.resume();
     }
 
-    pub fn set_proximity(&self, on_head: bool) {
-        self.context.send_proximity_state(on_head);
+    pub fn context(&self) -> Arc<ClientCoreContext> {
+        Arc::clone(&self.context)
     }
 }
 

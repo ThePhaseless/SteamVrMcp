@@ -164,7 +164,7 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
@@ -332,7 +332,7 @@ impl VrServer {
         json(self.stack.recenter()).map_err(message)
     }
 
-    #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows SteamVR's last worn or removed event as the hmd's head_proximity (null before any). The headset reports worn at every stream start, and an explicit on_head false is resent after a SteamVR restart or reconnect.")]
+    #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows SteamVR's last worn or removed event as the hmd's head_proximity (null before any). The headset is worn until set_proximity says otherwise; the last value is resent at every stream start.")]
     async fn set_proximity(&self, Parameters(args): Parameters<ProximityArgs>) -> Result<CallToolResult, String> {
         self.stack.set_proximity(args.on_head).map_err(message)?;
         json(serde_json::json!({ "ok": true, "on_head": args.on_head })).map_err(message)

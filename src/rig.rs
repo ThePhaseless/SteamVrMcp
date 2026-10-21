@@ -4,6 +4,7 @@
 use crate::hand::{self, Curls, Gesture};
 use alvr_common::{
     DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose,
+    parking_lot::Mutex,
     glam::{EulerRot, Quat, Vec2, Vec3, Vec4},
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
@@ -11,6 +12,7 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -597,6 +599,8 @@ pub struct Rig {
     playspace_pending: bool,
     /// What the headset reports as worn at every stream start; here because the rig outlives headsets.
     pub on_head: bool,
+    /// Orders proximity sends so the latest wins, without holding the rig lock across a blocking socket write.
+    pub proximity_send: Arc<Mutex<()>>,
 }
 
 impl Default for Rig {
@@ -617,6 +621,7 @@ impl Rig {
             playspace: Vec2::ONE,
             playspace_pending: false,
             on_head: true,
+            proximity_send: Arc::default(),
         }
     }
 

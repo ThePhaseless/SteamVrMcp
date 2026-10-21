@@ -771,12 +771,12 @@ impl Stack {
     pub fn set_proximity(&self, on_head: bool) -> Result<()> {
         // the reader sees proximity only as events, so connect it before the event is sent
         self.read(|_| Ok(())).ok();
-        let state = self.state.lock();
-        let headset = state.headset.as_ref().context("no headset")?;
-        // rig lock across the send: see the StreamingStarted arm
-        let mut rig = self.rig.lock();
-        rig.on_head = on_head;
-        headset.set_proximity(on_head);
+        let context = self.state.lock().headset.as_ref().context("no headset")?.context();
+        // only the ordering lock is held across the send: see the StreamingStarted arm
+        let order = self.rig.lock().proximity_send.clone();
+        let _order = order.lock();
+        self.rig.lock().on_head = on_head;
+        context.send_proximity_state(on_head);
         Ok(())
     }
 
