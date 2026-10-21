@@ -314,6 +314,14 @@ pub fn game_pid(scene: Option<&openvr::SceneApp>, comm: impl Fn(u32) -> Option<S
     }
 }
 
+/// vr_stop signals SteamVR only when it is ALVR's (`alvrs`), never one the user runs without ALVR.
+pub fn stop_guard(steamvr_running: bool, alvrs: impl FnOnce() -> bool) -> Result<()> {
+    if steamvr_running && !alvrs() {
+        bail!("SteamVR is running without ALVR; close it yourself");
+    }
+    Ok(())
+}
+
 pub fn restore_guard(steamvr_running: bool) -> Result<()> {
     if steamvr_running {
         bail!("SteamVR is running; run vr_stop first");
@@ -364,16 +372,17 @@ impl Stack {
         let (streaming, ours_running) = {
             let state = self.state.lock();
             let streaming = state.headset.as_ref().is_some_and(|h| h.status().streaming);
-            (streaming, state.headset.is_some() || state.dashboard.is_some() || state.started_steam)
+            (streaming, state.managing || state.headset.is_some() || state.dashboard.is_some() || state.started_steam)
         };
         let steamvr_running = steamvr::is_steamvr_running();
+        let alvr_api = self.api.ping();
         Readiness {
             failed: self.checks.lock().iter().filter(|c| !c.ok).map(|c| (c.name, c.reason.clone())).collect(),
             restore_file: self.paths.restore_file().exists(),
             steamvr_running,
-            alvr_api: self.api.ping(),
+            alvr_api,
             streaming,
-            running: steamvr_running || ours_running,
+            running: ours_running || (steamvr_running && (alvr_api || steamvr::vrserver_has_alvr())),
         }
     }
 
@@ -609,6 +618,11 @@ impl Stack {
     }
 
     pub fn stop(&self) -> Result<StopReport> {
+        let ours = {
+            let state = self.state.lock();
+            state.managing || state.started_steam
+        };
+        stop_guard(steamvr::is_steamvr_running(), || ours || self.api.ping() || steamvr::vrserver_has_alvr())?;
         self.state.lock().managing = false;
         let _no_restart = self.restarting.lock();
         self.drop_reader();
@@ -1012,6 +1026,13 @@ mod tests {
     fn vr_restore_refuses_while_steamvr_runs() {
         assert_eq!(restore_guard(true).unwrap_err().to_string(), "SteamVR is running; run vr_stop first");
         assert!(restore_guard(false).is_ok());
+    }
+
+    #[test]
+    fn vr_stop_leaves_a_steamvr_without_alvr_alone() {
+        assert_eq!(stop_guard(true, || false).unwrap_err().to_string(), "SteamVR is running without ALVR; close it yourself");
+        assert!(stop_guard(true, || true).is_ok());
+        assert!(stop_guard(false, || panic!("not asked while SteamVR is down")).is_ok());
     }
 
     #[test]

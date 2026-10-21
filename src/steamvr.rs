@@ -46,6 +46,16 @@ pub fn is_steamvr_running() -> bool {
     !pids_named("vrserver").is_empty()
 }
 
+/// Whether `/proc/<pid>/maps` lists a file whose path contains `file`.
+pub fn has_mapped(pid: u32, file: &str) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/maps")).is_ok_and(|maps| maps.contains(file))
+}
+
+/// Whether a running vrserver loaded ALVR's driver, even one whose API no longer answers.
+pub fn vrserver_has_alvr() -> bool {
+    pids_named("vrserver").into_iter().any(|pid| has_mapped(pid, "driver_alvr_server.so"))
+}
+
 pub fn is_steam_running() -> bool {
     !pids_named("steam").is_empty()
 }
@@ -564,6 +574,13 @@ mod tests {
         assert_eq!(signalable(i32::MAX as u32 + 1), None, "negative as i32: a process group");
         assert_eq!(signalable(u32::MAX), None, "-1: every process");
         assert_eq!(signalable(4242), Some(4242));
+    }
+
+    #[test]
+    fn mapped_files_come_from_proc_maps() {
+        assert!(has_mapped(std::process::id(), "libc.so"));
+        assert!(!has_mapped(std::process::id(), "driver_alvr_server.so"));
+        assert!(!has_mapped(0, "libc.so"), "no such process");
     }
 
     #[test]

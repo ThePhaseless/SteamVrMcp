@@ -25,7 +25,7 @@ pub struct Readiness {
     pub steamvr_running: bool,
     pub alvr_api: bool,
     pub streaming: bool,
-    /// Steam started by the MCP, SteamVR, or the MCP's headset.
+    /// A vr_start session, Steam started by the MCP, SteamVR with ALVR, or the MCP's headset.
     pub running: bool,
 }
 
@@ -46,7 +46,7 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
     match tool {
         "vr_status" | "get_logs" => Ok(()),
         "vr_start" => checks(&CORE),
-        "vr_stop" => holds(r.running, "nothing is running: no SteamVR, headset or MCP-started Steam"),
+        "vr_stop" => holds(r.running, "nothing to stop: no SteamVR with ALVR, headset or MCP-started Steam"),
         "vr_restore" => holds(r.restore_file, "no restore.json: nothing to restore"),
         "set_alvr_settings" | "set_hand_tracking_flavour" => {
             checks(&CORE)?;
