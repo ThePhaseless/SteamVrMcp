@@ -24,12 +24,20 @@ pub const VR_PROCESS_NAMES: &[&str] = &[
     "vrmonitor",
 ];
 
-/// Every pid in /proc owned by this user: another user's Steam or SteamVR (a second account) is not ours to see or stop.
+/// Every pid in /proc whose real uid is this user's: another user's Steam or SteamVR (a second account) is not ours to see or stop.
+/// The /proc dir owner would hide our non-dumpable file-capability helpers (vrcompositor-launcher), which show as root.
 pub fn all_pids() -> Vec<u32> {
-    use std::os::unix::fs::MetadataExt;
     let Ok(dir) = fs::read_dir("/proc") else { return vec![] };
-    let me = unsafe { libc::geteuid() };
-    dir.flatten().filter(|e| e.metadata().is_ok_and(|m| m.uid() == me)).filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+    let me = unsafe { libc::getuid() };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse().ok())
+        .filter(|pid| fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| real_uid(&s)) == Some(me))
+        .collect()
+}
+
+/// The real uid: the first field of the `Uid:` line of `/proc/<pid>/status`.
+fn real_uid(status: &str) -> Option<u32> {
+    status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse().ok()
 }
 
 pub fn pids_named(name: &str) -> Vec<u32> {
@@ -65,6 +73,7 @@ pub fn is_steam_running() -> bool {
 
 /// The `steam.env` entries that a Steam process's NUL-separated environ lacks or has with another value,
 /// as `KEY=<want> but has <got|missing>`.
+// shortcut: steam.sh rewrites LD_* and STEAM_RUNTIME* keys, so such a key in steam.env always mismatches; skip those keys if a user sets one
 pub fn env_mismatches(environ: &[u8], want: &BTreeMap<String, String>) -> Vec<String> {
     let have: BTreeMap<&[u8], &[u8]> = environ.split(|&b| b == 0).filter_map(|e| {
         let i = e.iter().position(|&b| b == b'=')?;
@@ -381,6 +390,19 @@ pub fn url_not_taken(since: &str, tail: &str, url: &str) -> Option<String> {
     Some(msg)
 }
 
+/// None while Steam may still take `url`, or once `since` showed it took it: `taken` latches that, so
+/// later polls skip the scan. After URL_TAKEN_WAIT without it, url_not_taken's message; only then is `tail` read.
+fn url_check(taken: &mut bool, since: &str, waited: Duration, url: &str, tail: impl FnOnce() -> String) -> Option<String> {
+    if *taken {
+        return None;
+    }
+    *taken = since.contains(&format!("ExecuteSteamURL: \"{url}\""));
+    if *taken || waited < URL_TAKEN_WAIT {
+        return None;
+    }
+    url_not_taken(since, &tail(), url)
+}
+
 /// How long a dialog-step wait may last before it counts as a dialog: seen live, Steam continued after up to 5 s.
 const DIALOG_GRACE: Duration = Duration::from_secs(10);
 
@@ -389,20 +411,21 @@ const DIALOG_GRACE: Duration = Duration::from_secs(10);
 /// it also fails fast when Steam logs no ExecuteSteamURL for it within URL_TAKEN_WAIT.
 pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option<&str>, timeout: Duration, mut done: impl FnMut() -> bool) -> Result<bool> {
     let (mut since, mut blocked) = (None, None);
-    let (began, mut not_taken) = (Instant::now(), None);
+    let (began, mut not_taken, mut taken) = (Instant::now(), None, false);
     let finished = wait_for(timeout, || {
         if done() {
             return true;
         }
-        if let (Some(d), Some(url)) = (steam_dir, handed_url) {
-            if began.elapsed() >= URL_TAKEN_WAIT {
-                not_taken = url_not_taken(&console_log_since(d, log_from), &log_tail(d, "console_log", 200).join("\n"), url);
-                if not_taken.is_some() {
-                    return true;
-                }
+        // one read per poll serves both the URL check and the dialog check
+        let log = steam_dir.map(|d| console_log_since(d, log_from));
+        if let (Some(d), Some(log), Some(url)) = (steam_dir, &log, handed_url) {
+            // shortcut: counts from the hand-off, so a Steam still starting up (login, self-update) can miss it; count from its startup line if that shows up in reports
+            not_taken = url_check(&mut taken, log, began.elapsed(), url, || log_tail(d, "console_log", 200).join("\n"));
+            if not_taken.is_some() {
+                return true;
             }
         }
-        let pending = steam_dir.and_then(|d| pending_interstitial(&console_log_since(d, log_from)));
+        let pending = log.as_deref().and_then(pending_interstitial);
         let started = *since.get_or_insert_with(Instant::now);
         if pending.is_none() {
             since = None;
@@ -569,7 +592,18 @@ mod tests {
     fn all_pids_lists_only_this_users_processes() {
         let pids = all_pids();
         assert!(pids.contains(&std::process::id()));
-        assert!(!pids.contains(&1), "pid 1 belongs to root, another user's Steam or SteamVR must not count");
+        if unsafe { libc::getuid() } != 0 {
+            assert!(!pids.contains(&1), "pid 1 belongs to root, another user's Steam or SteamVR must not count");
+        }
+    }
+
+    #[test]
+    fn real_uid_is_the_first_uid_field() {
+        assert_eq!(real_uid("Name:\tvrserver\nPid:\t7\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\n"), Some(1000));
+        // a file-capability helper (vrcompositor-launcher) is non-dumpable: /proc shows it as root, the real uid stays ours
+        assert_eq!(real_uid("Name:\tvrcompositor-la\nUid:\t1000\t0\t0\t0\n"), Some(1000));
+        assert_eq!(real_uid("garbage\nUid:\tx\n"), None);
+        assert_eq!(real_uid(""), None);
     }
 
     #[test]
@@ -599,6 +633,18 @@ mod tests {
         assert!(url_not_taken("", &looping, url).unwrap().ends_with(cause));
         let once = "Steam Runtime Launch Service: steam-runtime-launcher-service pid 7 exited\n";
         assert!(!url_not_taken("", once, url).unwrap().contains("keeps failing"), "one exit is a normal SteamVR stop");
+    }
+
+    #[test]
+    fn a_taken_url_stays_taken() {
+        let url = "steam://rungameid/250820";
+        let mut taken = false;
+        assert_eq!(url_check(&mut taken, "", Duration::ZERO, url, || panic!("tail read before the wait ran out")), None);
+        assert_eq!(url_check(&mut taken, &format!("ExecuteSteamURL: \"{url}\"\n"), Duration::ZERO, url, || panic!("tail read")), None);
+        assert!(taken);
+        assert_eq!(url_check(&mut taken, "", URL_TAKEN_WAIT, url, || panic!("tail read after the URL was taken")), None, "a rotated log does not undo it");
+        let mut taken = false;
+        assert!(url_check(&mut taken, "", URL_TAKEN_WAIT, url, String::new).unwrap().starts_with("Steam did not take"));
     }
 
     #[test]

@@ -488,6 +488,15 @@ pub fn stop_guard(steamvr_running: bool, alvrs: impl FnOnce() -> bool) -> Result
     Ok(())
 }
 
+/// An ALVR answering while none of this user's vrservers runs belongs to someone else (another user's SteamVR):
+/// starting ours would talk to it, and ours could not bind the port.
+pub fn foreign_alvr_guard(our_vrserver: bool, api_answers: impl FnOnce() -> bool, port: u16) -> Result<()> {
+    if !our_vrserver && api_answers() {
+        bail!("port {port} answers, but no SteamVR of this user runs (another user's SteamVR/ALVR?); close it and retry");
+    }
+    Ok(())
+}
+
 /// A game that finds no SteamVR would start one from its own process, under its own prefix and process group.
 pub fn launch_guard(steamvr_running: bool) -> Result<()> {
     if !steamvr_running {
@@ -977,6 +986,7 @@ impl Stack {
         let steamvr_running = steamvr::is_steamvr_running();
         let mut restart_adopted = false;
         if !steamvr_running {
+            foreign_alvr_guard(false, || self.api().ping(), self.api().port)?;
             if steamvr::has_leftovers(&steamvr::alive_vr_processes()) {
                 if !steamvr::kill_vr_processes() {
                     bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", steamvr::alive_vr_processes(), steamvr::KILL_WAIT.as_secs());
@@ -1036,6 +1046,8 @@ impl Stack {
         if let Some(name) = exited {
             bail!("failed: {name} exited before ALVR answered");
         }
+        // a foreign ALVR that came up during the wait answers before ours could
+        foreign_alvr_guard(steamvr::is_steamvr_running(), || true, self.api().port)?;
         self.check_version()?;
         let streaming = self.wait_streaming(began, deadline.saturating_duration_since(Instant::now()), 0)?;
         let h = self.headset_status().unwrap_or_default();
@@ -1067,7 +1079,8 @@ impl Stack {
         if let Some(h) = headset {
             self.dispose(h);
         }
-        if self.api().ping() {
+        // only our vrserver hosts our ALVR: an answer on the port otherwise is another user's, never shut down
+        if steamvr::vrserver_has_alvr() && self.api().ping() {
             // on failure the signals below still stop SteamVR
             self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
@@ -1867,6 +1880,16 @@ mod tests {
         assert_eq!(stop_guard(true, || false).unwrap_err().to_string(), "SteamVR is running without ALVR; close it yourself");
         assert!(stop_guard(true, || true).is_ok());
         assert!(stop_guard(false, || panic!("not asked while SteamVR is down")).is_ok());
+    }
+
+    #[test]
+    fn an_alvr_without_our_vrserver_is_foreign() {
+        assert_eq!(
+            foreign_alvr_guard(false, || true, 8082).unwrap_err().to_string(),
+            "port 8082 answers, but no SteamVR of this user runs (another user's SteamVR/ALVR?); close it and retry"
+        );
+        assert!(foreign_alvr_guard(false, || false, 8082).is_ok());
+        assert!(foreign_alvr_guard(true, || panic!("our vrserver hosts the ALVR that answers"), 8082).is_ok());
     }
 
     #[test]
