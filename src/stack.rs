@@ -87,6 +87,8 @@ pub struct StatusReport {
     /// Only while the OpenVR reader is connected, so vr_status never connects one.
     pub scene_app: Option<openvr::SceneApp>,
     pub warning: Option<&'static str>,
+    /// The last SteamVR restart that failed, also one the supervisor ran: "<age> s ago: <reason>".
+    pub last_restart_error: Option<String>,
 }
 
 /// One ALVR session value to set.
@@ -278,6 +280,8 @@ struct State {
     watchdog_fired: bool,
     leaked: bool,
     managing: bool,
+    /// When and why the last SteamVR restart failed.
+    last_restart_error: Option<(Instant, String)>,
 }
 
 /// Steam, SteamVR with ALVR, and the headset, plus the dashboard role ALVR expects.
@@ -288,6 +292,8 @@ pub struct Stack {
     state: Mutex<State>,
     /// Held for a whole SteamVR restart, so stop() never races one.
     restarting: Mutex<()>,
+    /// Held for a whole vr_start, so a second one refuses.
+    starting: Mutex<()>,
     /// Results of the last startup checks.
     checks: Mutex<Vec<Check>>,
     /// The OpenVR reader and the vrserver pid it connected to. Its own lock, held across OpenVR
@@ -339,6 +345,7 @@ impl Stack {
             api,
             state: Mutex::default(),
             restarting: Mutex::new(()),
+            starting: Mutex::new(()),
             checks: Mutex::default(),
             reader: Mutex::new(None),
             on_change: Mutex::new(None),
@@ -534,6 +541,10 @@ impl Stack {
     }
 
     pub fn start(&self) -> Result<StartReport> {
+        let Some(_starting) = self.starting.try_lock() else { bail!("not ready: vr_start is already running") };
+        if self.restarting.is_locked() {
+            bail!("not ready: SteamVR is restarting");
+        }
         self.state.lock().watchdog_fired = false;
         let started = self.start_inner();
         if started.is_err() {
@@ -543,9 +554,14 @@ impl Stack {
     }
 
     fn start_inner(&self) -> Result<StartReport> {
+        let began = Instant::now();
         let mut report = StartReport::default();
         if let Some(h) = self.headset_status().filter(|h| h.streaming) {
-            let restarts = self.state.lock().restarts;
+            let restarts = {
+                let mut state = self.state.lock();
+                state.managing = true; // a stream the MCP left unmanaged gets its supervisor back
+                state.restarts
+            };
             return Ok(StartReport { already_streaming: true, restarts, view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report });
         }
         self.paths.session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
@@ -593,18 +609,19 @@ impl Stack {
 
         self.state.lock().managing = true;
         if restart_adopted {
-            self.restart_steamvr()?;
+            self.restart_steamvr(false)?;
         }
         let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
         let deadline = Instant::now() + timeout;
-        if !steamvr::wait_launched(steam_dir, log_from, timeout, || self.api.ping())? {
+        let stopped = || !self.state.lock().managing;
+        if !steamvr::wait_launched(steam_dir, log_from, timeout, || stopped() || self.api.ping())? {
             bail!("ALVR server did not answer on port {} within {} s", self.api.port, timeout.as_secs());
         }
+        if stopped() {
+            bail!("vr_stop ended the session");
+        }
         self.check_version()?;
-        let streaming = steamvr::wait_for(deadline.saturating_duration_since(Instant::now()), || {
-            // DecoderConfig follows StreamingStarted
-            self.headset_status().is_some_and(|h| h.streaming && h.codec.is_some())
-        });
+        let streaming = self.wait_streaming(began, deadline.saturating_duration_since(Instant::now()), 0)?;
         let h = self.headset_status().unwrap_or_default();
         if !streaming {
             let mut reason = format!("headset not streaming after {} s; last HUD message: {:?}", timeout.as_secs(), h.hud_message);
@@ -669,19 +686,46 @@ impl Stack {
 
     pub fn status(&self) -> StatusReport {
         let reader_connected = self.reader.lock().is_some(); // own statement: read() locks it again
+        let (leaked, last_restart_error) = {
+            let state = self.state.lock();
+            (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
+        };
         StatusReport {
             steam_running: steamvr::is_steam_running(),
             steamvr_running: steamvr::is_steamvr_running(),
             alvr_version: self.api.version().ok().map(|v| v.trim().to_owned()),
             headset: self.headset_status(),
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
-            warning: self.state.lock().leaked.then_some(LEAKED),
+            warning: leaked.then_some(LEAKED),
+            last_restart_error,
+        }
+    }
+
+    /// Waits up to `timeout` for a stream with a codec (DecoderConfig follows StreamingStarted) and a
+    /// generation above `after`. Fails at once when vr_stop ends the session, or a SteamVR restart
+    /// that failed after `since` (one the supervisor ran too) means no stream will come.
+    fn wait_streaming(&self, since: Instant, timeout: Duration, after: u64) -> Result<bool> {
+        let mut aborted = None;
+        let streaming = steamvr::wait_for(timeout, || {
+            let state = self.state.lock();
+            aborted = match &state.last_restart_error {
+                _ if !state.managing => Some("vr_stop ended the session".to_owned()),
+                Some((t, e)) if *t >= since => Some(e.clone()),
+                _ => None,
+            };
+            let h = state.headset.as_ref().map(Headset::status).unwrap_or_default();
+            aborted.is_some() || (h.streaming && h.codec.is_some() && h.stream_generation > after)
+        });
+        match aborted {
+            Some(why) => bail!(why),
+            None => Ok(streaming),
         }
     }
 
     /// Sets ALVR session values and checks ALVR stored them. Then, unless ALVR's schema flags every
     /// path real-time, restarts SteamVR and waits for a new stream.
     pub fn set_alvr_settings(&self, values: Vec<SettingValue>) -> Result<SettingsReport> {
+        let began = Instant::now();
         if self.restarting.is_locked() {
             bail!("not ready: SteamVR is restarting");
         }
@@ -721,14 +765,12 @@ impl Stack {
         }
         let restarts = self.state.lock().restarts; // own statement: status() locks state too
         let generation = status().stream_generation;
+        const STORED: &str = "the values are already stored in ALVR; SteamVR may be down";
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147): on loopback a headset reconnect strands the server, so restart SteamVR instead of reconnecting for ALVR's handshake check; drop when fixed upstream
-        self.restart_steamvr()?;
+        self.restart_steamvr(false).context(STORED)?;
         // a restart ALVR asks for once the headset negotiates (e.g. a new fps) is the supervisor's
         let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
-        let streaming = steamvr::wait_for(timeout, || {
-            let h = status();
-            h.streaming && h.codec.is_some() && h.stream_generation > generation
-        });
+        let streaming = self.wait_streaming(began, timeout, generation).context(STORED)?;
         if !streaming {
             bail!("headset not streaming {} s after the SteamVR restart; last HUD message: {:?}", timeout.as_secs(), status().hud_message);
         }
@@ -808,14 +850,8 @@ impl Stack {
 
     /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
     pub fn recreate_headset(&self) -> Result<()> {
-        let old = self.state.lock().headset.take();
-        if let Some(h) = old {
-            self.dispose(h); // the old client must stop listening on 9943 before the new one starts
-        }
-        let new = Headset::start(Arc::clone(&self.rig));
-        self.state.lock().headset = Some(new);
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
-        self.restart_steamvr()
+        self.restart_steamvr(true)
     }
 
     /// The server's session, which ALVR sends as an event in reply to GET /api/session.
@@ -844,14 +880,19 @@ impl Stack {
         self.state.lock().leaked = true;
     }
 
-    fn restart_steamvr(&self) -> Result<()> {
+    /// Restarts SteamVR around the headset, or with a new headset if `fresh_headset`. A failure is
+    /// kept for vr_status and for the streaming waits.
+    fn restart_steamvr(&self, fresh_headset: bool) -> Result<()> {
         let _restart = self.restarting.lock();
         if !self.state.lock().managing {
             bail!("SteamVR is being stopped; no restart");
         }
         // as in stop(): a client still streaming when vrserver exits never disconnects, so pause it
         // first, outside the state lock; a client whose server is already gone is replaced
-        let taken = self.state.lock().headset.take(); // own statement: the guard must not outlive it
+        let mut taken = self.state.lock().headset.take(); // own statement: the guard must not outlive it
+        if fresh_headset && let Some(old) = taken.take() {
+            self.dispose(old); // the old client must stop listening on 9943 before the new one starts
+        }
         let headset = taken.and_then(|h| {
             let paused = within(HEADSET_TIMEOUT, move || {
                 h.pause();
@@ -863,7 +904,9 @@ impl Stack {
             paused
         });
         self.drop_reader();
-        let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api);
+        let mut started_steam = false;
+        let stopped = || !self.state.lock().managing;
+        let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api, stopped, &mut started_steam);
         let headset = headset.inspect(Headset::resume).unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
         let spare = {
             let mut state = self.state.lock();
@@ -875,9 +918,20 @@ impl Stack {
         if let Some(h) = spare {
             self.dispose(h);
         }
-        restarted.context("SteamVR restart failed")?;
-        self.state.lock().restarts += 1;
-        Ok(())
+        let mut state = self.state.lock();
+        state.started_steam |= started_steam;
+        match restarted.context("SteamVR restart failed") {
+            Ok(()) => {
+                state.restarts += 1;
+                Ok(())
+            }
+            Err(e) => {
+                if state.managing {
+                    state.last_restart_error = Some((Instant::now(), format!("{e:#}")));
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -953,7 +1007,7 @@ fn supervise(stack: Weak<Stack>) {
         }
 
         if restart {
-            s.restart_steamvr().map_err(|e| error!("{e:#}")).ok();
+            s.restart_steamvr(false).map_err(|e| error!("{e:#}")).ok();
             (events, quiet_since) = (None, None);
             last_hud = s.headset_status().map(|h| h.hud_message).unwrap_or_default();
         } else if quiet_since.is_some_and(|t| t.elapsed() > WATCHDOG) && !s.state.lock().watchdog_fired {
@@ -1020,6 +1074,36 @@ mod tests {
         let r = r.unwrap();
         assert_eq!(r.steps.iter().map(|s| s.ok).collect::<Vec<_>>(), [false, true]);
         assert!(r.steps[0].error.as_deref().unwrap().contains("not tracked"), "{r:?}");
+    }
+
+    #[test]
+    fn streaming_waits_end_at_a_failed_restart_or_a_stop() {
+        let stack = test_stack();
+        let since = Instant::now();
+        stack.state.lock().managing = true;
+        stack.state.lock().last_restart_error = Some((since - Duration::from_secs(1), "older".into()));
+        assert!(!stack.wait_streaming(since, Duration::from_millis(300), 0).unwrap(), "a failure before the wait is not its own");
+        stack.state.lock().last_restart_error = Some((Instant::now(), "SteamVR restart failed: boom".into()));
+        let waited = Instant::now();
+        let e = stack.wait_streaming(since, Duration::from_secs(30), 0).unwrap_err();
+        assert!(e.to_string().contains("boom") && waited.elapsed() < Duration::from_secs(2), "{e:#}");
+        assert!(stack.status().last_restart_error.is_some_and(|e| e.contains("boom")), "vr_status shows it");
+        stack.state.lock().managing = false;
+        let e = stack.wait_streaming(Instant::now(), Duration::from_secs(30), 0).unwrap_err();
+        assert_eq!(e.to_string(), "vr_stop ended the session");
+    }
+
+    #[test]
+    fn vr_start_refuses_while_a_start_or_restart_runs() {
+        let stack = test_stack();
+        stack.state.lock().managing = true;
+        let starting = stack.starting.lock();
+        assert_eq!(stack.start().unwrap_err().to_string(), "not ready: vr_start is already running");
+        drop(starting);
+        let restarting = stack.restarting.lock();
+        assert_eq!(stack.start().unwrap_err().to_string(), "not ready: SteamVR is restarting");
+        drop(restarting);
+        assert!(stack.state.lock().managing, "a refused start leaves the running session managed");
     }
 
     #[test]

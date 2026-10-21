@@ -390,8 +390,9 @@ pub fn run_dashboard_child() -> ! {
     std::process::exit(0)
 }
 
-/// The dashboard's restart: ALVR shuts SteamVR down cleanly, then SteamVR is launched again.
-pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
+/// The dashboard's restart: ALVR shuts SteamVR down cleanly, then SteamVR is launched again. The
+/// wait for the relaunch ends early once `stopped`; `started_steam` is set when the relaunch started Steam.
+pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn() -> bool, started_steam: &mut bool) -> Result<()> {
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
     let old = pids_named("vrserver");
     // on failure the wait and signals below still stop SteamVR, so it is always relaunched
@@ -407,16 +408,20 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
             let left: Vec<_> = VR_PROCESS_NAMES.iter().filter(|n| !pids_named(n).is_empty()).collect();
             bail!("SteamVR processes still running after SIGKILL: {left:?}");
         }
-        // SteamVR has exited, so it no longer rewrites the file
-        setup::undo_safe_mode_blocks(paths)?;
+        // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
+        // blocked, so log it and relaunch anyway
+        setup::undo_safe_mode_blocks(paths).map_err(|e| error!("{e:#}")).ok();
     }
     setup::unblock_safe_mode(&vrsettings)?;
     let log_from = paths.steam_dir.as_deref().map_or(0, console_log_len);
-    launch(cfg, STEAMVR_URL)?;
+    *started_steam = launch(cfg, STEAMVR_URL)?;
     // the old server can still answer ping while it hangs in shutdown
-    let relaunched = || is_new_vrserver(&old, &pids_named("vrserver")) && api.ping();
+    let relaunched = || stopped() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping());
     if !wait_launched(paths.steam_dir.as_deref(), log_from, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
         bail!("ALVR did not come back within {} s after the SteamVR restart", cfg.timeouts.streaming_s);
+    }
+    if stopped() {
+        bail!("vr_stop ended the SteamVR restart");
     }
     Ok(())
 }
