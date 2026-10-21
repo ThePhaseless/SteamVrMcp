@@ -40,7 +40,7 @@ The server reads the file at startup, at each `vr_start`, and at `vr_status` whe
 | `timeouts.app_s` | Wait for a launched app's scene. Default 180. |
 | `app_logs` | Table of Steam app id to glob patterns of the game's own log files, read by `read_app_log` and `wait_for_log`. |
 
-`steam.env` and `steam.args` apply only when the MCP starts Steam. If Steam is already running, the MCP uses it as it is and cannot change its environment. Steam gets only the desktop session's variables (`HOME`, `PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_*`, locale, D-Bus and Pulse) plus `steam.env`. The rest of the agent's environment, API keys included, stays out of Steam and its games.
+`steam.env` and `steam.args` apply only when the MCP starts Steam. If Steam is already running, the MCP uses it as it is and cannot change its environment. When Steam runs without the `steam.env` values, `vr_start` fails at once and asks you to close Steam first. Steam gets only the desktop session's variables (`HOME`, `PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_*`, locale, D-Bus and Pulse) plus `steam.env`. The rest of the agent's environment, API keys included, stays out of Steam and its games.
 
 To find `<vendor:device>`, look for the `[vvvv:dddd]` pair on the GPU's line in `lspci -nn`, or the vendorID and deviceID in `vulkaninfo --summary`.
 

@@ -61,6 +61,27 @@ pub fn is_steam_running() -> bool {
     !pids_named("steam").is_empty()
 }
 
+/// The `steam.env` entries that a Steam process's NUL-separated environ lacks or has with another value,
+/// as `KEY=<want> but has <got|missing>`.
+pub fn env_mismatches(environ: &[u8], want: &BTreeMap<String, String>) -> Vec<String> {
+    let have: BTreeMap<&[u8], &[u8]> = environ.split(|&b| b == 0).filter_map(|e| {
+        let i = e.iter().position(|&b| b == b'=')?;
+        Some((&e[..i], &e[i + 1..]))
+    }).collect();
+    want.iter().filter_map(|(k, v)| match have.get(k.as_bytes()) {
+        Some(got) if *got == v.as_bytes() => None,
+        Some(got) => Some(format!("{k}={v} but has {}", String::from_utf8_lossy(got))),
+        None => Some(format!("{k}={v} but has missing")),
+    }).collect()
+}
+
+/// The environ of the running Steam client (not the bootstrap script, whose exe is a shell); none if unreadable.
+pub fn running_steam_environ() -> Option<Vec<u8>> {
+    let pids = pids_named("steam");
+    let client = pids.iter().find(|&&p| exe_of(p).is_some_and(|e| e.file_name().is_some_and(|n| n == "steam")));
+    fs::read(format!("/proc/{}/environ", client.or(pids.first())?)).ok()
+}
+
 /// Polls `done` every 100 ms until it holds or `timeout` passes.
 pub fn wait_for(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
@@ -756,5 +777,15 @@ mod tests {
     fn pids_named_finds_self() {
         let comm = std::fs::read_to_string("/proc/self/comm").unwrap();
         assert!(pids_named(comm.trim()).contains(&std::process::id()));
+    }
+
+    #[test]
+    fn env_mismatches_name_missing_and_changed_keys() {
+        let want: BTreeMap<String, String> = [("A", "1"), ("B", "2"), ("C", "3")].map(|(k, v)| (k.into(), v.into())).into();
+        assert!(env_mismatches(b"A=1\0B=2\0C=3\0X=y", &want).is_empty());
+        assert_eq!(env_mismatches(b"A=1\0B=2", &want), ["C=3 but has missing"]);
+        assert_eq!(env_mismatches(b"A=1\0B=9\0C=3", &want), ["B=2 but has 9"]);
+        // a non-UTF-8 entry elsewhere must not hide a match or a mismatch
+        assert_eq!(env_mismatches(b"JUNK=\xff\xfe\0A=1\0B=2\0C=0", &want), ["C=3 but has 0"]);
     }
 }

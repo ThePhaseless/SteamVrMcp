@@ -962,6 +962,15 @@ impl Stack {
         }
         self.paths().session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
 
+        if !self.cfg().steam.env.is_empty() && !steamvr::is_steamvr_running() && steamvr::is_steam_running() {
+            // shortcut: unreadable environ (other user, hidepid) skips the check, fail late as before
+            if let Some(environ) = steamvr::running_steam_environ() {
+                let bad = steamvr::env_mismatches(&environ, &self.cfg().steam.env);
+                if !bad.is_empty() {
+                    bail!("Steam is running without steam.env ({}); close Steam, then vr_start starts it with steam.env", bad.join(", "));
+                }
+            }
+        }
         self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig)));
         let hostname = headset::client_hostname()?;
         let values = setup::session_values(&self.cfg())?;
@@ -1033,7 +1042,7 @@ impl Stack {
         if !streaming {
             let mut reason = format!("headset not streaming (deadline {} s); last HUD message: {:?}", timeout.as_secs(), h.hud_message);
             if !self.state.lock().started_steam {
-                reason += "; Steam was already running, so the MCP could not set its environment (steam.env, steam.args)";
+                reason += "; Steam was already running, so the MCP could not set its environment (steam.args)";
             }
             bail!(reason);
         }
