@@ -66,8 +66,17 @@ pub fn wait_gone(names: &[&str], timeout: Duration) -> bool {
     wait_for(timeout, || names.iter().all(|n| pids_named(n).is_empty()))
 }
 
+/// `pid` as kill() takes it, when that names one process: 0 and anything above i32::MAX would
+/// signal a process group or every process.
+pub fn signalable(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|&p| p > 0)
+}
+
+/// Sends `sig` to `pid`; does nothing for a pid that is not a single process.
 pub fn terminate(pid: u32, sig: i32) {
-    unsafe { libc::kill(pid as i32, sig) };
+    if let Some(pid) = signalable(pid) {
+        unsafe { libc::kill(pid, sig) };
+    }
 }
 
 /// SIGTERM, then SIGKILL, to every SteamVR process (vrmonitor last), 5 s apart. True when none remain.
@@ -518,6 +527,14 @@ mod tests {
         assert!(!is_new_vrserver(&[10], &[]));
         assert!(is_new_vrserver(&[10], &[11]));
         assert!(is_new_vrserver(&[], &[11]));
+    }
+
+    #[test]
+    fn only_single_processes_are_signalled() {
+        assert_eq!(signalable(0), None, "0 is our own process group");
+        assert_eq!(signalable(i32::MAX as u32 + 1), None, "negative as i32: a process group");
+        assert_eq!(signalable(u32::MAX), None, "-1: every process");
+        assert_eq!(signalable(4242), Some(4242));
     }
 
     #[test]

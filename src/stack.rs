@@ -303,12 +303,14 @@ pub struct Stack {
 const RECENTER_NOT_STAGE: &str =
     "recentering_mode is not Stage: ALVR re-origins the playspace around the head's last pose on every playspace update, so poses sent are no longer absolute";
 
-/// The scene app's pid, unless the scene is SteamVR's own (Home runs as steamtours). `comm` names a pid.
+/// The scene app's pid, unless the scene is SteamVR's own (Home runs as steamtours). `comm` names a
+/// pid; one without a readable comm, or out of kill()'s single-process range, is refused.
 pub fn game_pid(scene: Option<&openvr::SceneApp>, comm: impl Fn(u32) -> Option<String>) -> Result<u32, &'static str> {
     let pid = scene.map(|a| a.pid).filter(|&pid| pid != 0).ok_or("no scene app is running")?;
-    match comm(pid) {
-        Some(name) if VR_PROCESS_NAMES.contains(&name.as_str()) => Err("no app running (scene is SteamVR Home)"),
-        _ => Ok(pid),
+    let name = comm(pid).filter(|_| steamvr::signalable(pid).is_some()).ok_or("the scene app's pid is not a running process")?;
+    match VR_PROCESS_NAMES.contains(&name.as_str()) {
+        true => Err("no app running (scene is SteamVR Home)"),
+        false => Ok(pid),
     }
 }
 
@@ -1037,7 +1039,9 @@ mod tests {
         assert_eq!(game_pid(Some(&scene(7)), comm), Err("no app running (scene is SteamVR Home)"));
         assert_eq!(game_pid(Some(&scene(0)), comm), Err("no scene app is running"));
         assert_eq!(game_pid(None, comm), Err("no scene app is running"));
-        assert_eq!(game_pid(Some(&scene(9)), |_| None), Ok(9), "a pid that just exited is not Home");
+        assert_eq!(game_pid(Some(&scene(9)), |_| None), Err("the scene app's pid is not a running process"), "unreadable comm");
+        let big = i32::MAX as u32 + 1;
+        assert_eq!(game_pid(Some(&scene(big)), comm), Err("the scene app's pid is not a running process"), "kill() would take it as a group");
     }
 
     #[test]
