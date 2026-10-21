@@ -4,6 +4,7 @@ pub mod clock;
 pub mod config;
 pub mod hand;
 pub mod headset;
+pub mod lease;
 pub mod openvr;
 pub mod rig;
 pub mod server;

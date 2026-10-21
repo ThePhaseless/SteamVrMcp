@@ -4,6 +4,7 @@ use crate::{
     clock,
     config::{Config, Paths},
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot},
+    lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
     rig::{self, AppliedStep, Rig, RigAction, SequenceReport, SequenceStep},
     setup,
@@ -27,7 +28,7 @@ use std::{
     process::Child,
     sync::{Arc, Weak},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 // client_core/src/connection.rs SERVER_RESTART_MESSAGE, shown after ServerControlPacket::Restarting
@@ -95,6 +96,8 @@ pub struct StatusReport {
     pub now_t_s: f64,
     pub now_at: String,
     pub t0_at: String,
+    /// The SteamVR lease; none when free, expired or dead.
+    pub owner: Option<Owner>,
 }
 
 /// One ALVR session value to set.
@@ -318,6 +321,8 @@ pub struct Stack {
     rig: Arc<Mutex<Rig>>,
     /// The newest LOGS_KEPT ALVR log events the supervisor saw, oldest first. Locked only briefly.
     alvr_logs: Mutex<VecDeque<LogLine>>,
+    /// The owner name and ttl the lease is taken and renewed with.
+    lease: Mutex<(String, Duration)>,
 }
 
 const RECENTER_NOT_STAGE: &str =
@@ -364,6 +369,7 @@ impl Stack {
             on_change: Mutex::new(None),
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
+            lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
         });
         stack.run_checks();
         let weak = Arc::downgrade(&stack);
@@ -446,7 +452,40 @@ impl Stack {
             alvr_api,
             streaming,
             running: ours_running || (steamvr_running && (alvr_api || steamvr::vrserver_has_alvr())),
+            leased_to: lease::blocking(lease::read(&self.paths().runtime_dir).as_ref(), std::process::id(), SystemTime::now(), lease::alive)
+                .map(lease::holder_text),
         }
+    }
+
+    /// Before a mutating tool: takes the lease, or renews ours once half the ttl is gone.
+    pub fn claim(&self) -> Result<()> {
+        let (owner, ttl) = self.lease.lock().clone();
+        let dir = self.paths().runtime_dir;
+        let ours = lease::read(&dir).is_some_and(|l| l.pid == std::process::id() && !lease::renew_due(&l, ttl, SystemTime::now()));
+        if ours {
+            return Ok(());
+        }
+        lease::acquire(&dir, &owner, ttl).map(drop)
+    }
+
+    /// vr_acquire: takes or renews the lease under `owner`, which later claims keep using.
+    pub fn acquire_lease(&self, owner: String, ttl_s: Option<u64>) -> Result<Lease> {
+        if !(1..=64).contains(&owner.chars().count()) {
+            bail!("owner must be 1 to 64 characters");
+        }
+        let ttl = match ttl_s {
+            None => lease::DEFAULT_TTL,
+            Some(s) if lease::TTL_S.contains(&s) => Duration::from_secs(s),
+            Some(s) => bail!("ttl_s {s} is outside {} to {}", lease::TTL_S.start(), lease::TTL_S.end()),
+        };
+        let taken = lease::acquire(&self.paths().runtime_dir, &owner, ttl)?;
+        *self.lease.lock() = (owner, ttl);
+        Ok(taken)
+    }
+
+    /// Whether this MCP held the lease.
+    pub fn release_lease(&self) -> Result<bool> {
+        lease::release(&self.paths().runtime_dir)
     }
 
     /// Called from the watcher thread whenever `readiness` changes.
@@ -748,6 +787,10 @@ impl Stack {
             (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
         };
         let now = clock::now_s();
+        let held = lease::read(&self.paths().runtime_dir);
+        // pid 0 is nobody, so our own live lease shows too
+        let owner = lease::blocking(held.as_ref(), 0, SystemTime::now(), lease::alive)
+            .map(|l| Owner { mine: l.pid == std::process::id(), lease: l.clone() });
         StatusReport {
             steam_running: steamvr::is_steam_running(),
             steamvr_running: steamvr::is_steamvr_running(),
@@ -759,6 +802,7 @@ impl Stack {
             now_t_s: now,
             now_at: clock::at(now),
             t0_at: clock::at(0.0),
+            owner,
         }
     }
 
@@ -1111,6 +1155,24 @@ mod tests {
             runtime_dir: "/nonexistent".into(),
         };
         Stack::new(Config::default(), paths)
+    }
+
+    #[test]
+    fn claim_takes_the_lease_and_status_shows_it() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-lease-{}", std::process::id()));
+        let stack = test_stack();
+        stack.paths.lock().runtime_dir = dir.clone();
+        assert!(stack.status().owner.is_none());
+        assert!(stack.acquire_lease(String::new(), None).is_err());
+        assert!(stack.acquire_lease("x".into(), Some(9)).is_err());
+        stack.claim().unwrap();
+        let owner = stack.status().owner.unwrap();
+        assert!(owner.mine && owner.lease.owner.starts_with("mcp-"));
+        assert_eq!(stack.readiness().leased_to, None, "ours does not block us");
+        assert_eq!(stack.acquire_lease("driver".into(), Some(60)).unwrap().owner, "driver");
+        assert!(stack.release_lease().unwrap());
+        assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn seq_step(at_s: f32, action: &str, args: Value) -> SequenceStep {

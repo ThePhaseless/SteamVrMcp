@@ -27,7 +27,12 @@ pub struct Readiness {
     pub streaming: bool,
     /// A vr_start session, Steam started by the MCP, SteamVR with ALVR, or the MCP's headset.
     pub running: bool,
+    /// `lease::holder_text` while another live MCP holds the SteamVR lease.
+    pub leased_to: Option<String>,
 }
+
+/// Tools that change nothing, so an observer without the lease keeps them.
+pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release"];
 
 /// The checks vr_start needs.
 pub const CORE: [&str; 7] =
@@ -44,8 +49,13 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
     };
     let holds = |ok: bool, missing: &str| if ok { Ok(()) } else { Err(missing.to_owned()) };
     let streaming = || holds(r.streaming, "headset is not streaming");
+    if let Some(holder) = &r.leased_to
+        && !READ_ONLY.contains(&tool)
+    {
+        return Err(holder.clone());
+    }
     match tool {
-        "vr_status" | "get_logs" => Ok(()),
+        "vr_status" | "get_logs" | "vr_acquire" | "vr_release" => Ok(()),
         "vr_start" => checks(&CORE),
         "vr_stop" => holds(r.running, "nothing to stop: no SteamVR with ALVR, headset or MCP-started Steam"),
         "vr_restore" => holds(r.restore_file, "no restore.json: nothing to restore"),
@@ -331,6 +341,26 @@ mod tests {
         let r = Readiness { streaming: false, ..all_ready() };
         assert_eq!(tool_ready("set_head_pose", &r), Err("headset is not streaming".to_owned()));
         assert_eq!(tool_ready("set_head_pose", &all_ready()), Ok(()));
+    }
+
+    #[test]
+    fn leased_tools_hidden_read_only_open() {
+        let text = "SteamVR is leased to x (pid 9) until later; read-only tools stay available";
+        let r = Readiness { leased_to: Some(text.into()), ..all_ready() };
+        for tool in ["set_head_pose", "vr_start", "vr_stop", "launch_app"] {
+            assert_eq!(tool_ready(tool, &r), Err(text.to_owned()), "{tool}");
+        }
+        for tool in READ_ONLY {
+            assert_eq!(tool_ready(tool, &r), Ok(()), "{tool}");
+        }
+    }
+
+    #[test]
+    fn read_only_names_are_tools() {
+        let names: Vec<String> = VrServer::tool_router().list_all().into_iter().map(|t| t.name.to_string()).collect();
+        for tool in READ_ONLY {
+            assert!(names.iter().any(|n| n == tool), "{tool}");
+        }
     }
 
     #[test]

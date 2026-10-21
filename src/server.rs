@@ -1,6 +1,7 @@
 use crate::{
     checks::{self, Readiness},
     headset::Eye,
+    lease::Owner,
     rig::{
         AnimateArgs, AnimateControllerArgs, AxisArgs, ButtonArgs, ControllerPoseArgs, ControllerStateArgs, FingerCurlArgs, GripArgs,
         HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, SequenceStep, TouchArgs, TrackpadArgs,
@@ -108,6 +109,15 @@ struct SequenceArgs {
     steps: Vec<SequenceStep>,
 }
 
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct AcquireArgs {
+    /// Who holds SteamVR, 1 to 64 characters; shown to an agent that finds the lease taken.
+    owner: String,
+    /// Seconds until the lease expires, 10 to 14400; default 1800. Any mutating tool renews it once half is left.
+    ttl_s: Option<u64>,
+}
+
 /// A tool result with `v` as pretty JSON text.
 fn json(v: impl Serialize) -> Result<CallToolResult> {
     Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v)?)]))
@@ -130,9 +140,19 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries owner (who holds the SteamVR lease, and whether this MCP does; absent when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
+    }
+
+    #[tool(description = "Take or renew the lease on this machine's SteamVR under a name of your choice. Every tool that changes anything takes it by itself, so call this only to pick the name or the ttl, or to take over once another agent's lease expired. Refuses while another live MCP holds it. Returns the lease.")]
+    async fn vr_acquire(&self, Parameters(args): Parameters<AcquireArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(Owner { lease: s.acquire_lease(args.owner, args.ttl_s)?, mine: true })).await.map_err(message)
+    }
+
+    #[tool(description = "Give up this MCP's lease on SteamVR so another agent can take it at once. Returns released: false when this MCP did not hold it. Leaves SteamVR running.")]
+    async fn vr_release(&self) -> Result<CallToolResult, String> {
+        self.run(|s| json(serde_json::json!({ "released": s.release_lease()? }))).await.map_err(message)
     }
 
     #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s).")]
@@ -407,6 +427,15 @@ impl ServerHandler for VrServer {
         if let Err(reason) = checks::tool_ready(&request.name, &r) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {reason}"))]).into());
         }
+        if !checks::READ_ONLY.contains(&&*request.name) {
+            let stack = Arc::clone(&self.stack);
+            let claimed = tokio::task::spawn_blocking(move || stack.claim())
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            if let Err(e) = claimed {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {e:#}"))]).into());
+            }
+        }
         self.router.call(ToolCallContext::new(self, request, context)).await
     }
 }
@@ -428,12 +457,12 @@ mod tests {
             set_head_pose move_head animate_head set_controller_pose move_controller animate_controller set_controller_state \
             press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
             set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
-            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app"
+            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release"
             .split_whitespace()
             .map(String::from)
             .collect();
         want.sort();
-        assert_eq!((names.len(), names), (33, want));
+        assert_eq!((names.len(), names), (35, want));
     }
 
     #[test]
