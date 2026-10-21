@@ -645,9 +645,10 @@ fn live_restart_relevant_setting_restarts() {
     let _reset = Reset(Arc::clone(&s));
 
     for fps in [90.0, 72.0] {
+        let started = Instant::now();
         let report = s.set_alvr_settings(preferred_fps(fps)).unwrap();
         let headset = s.status().headset;
-        println!("{fps} Hz: {report:?}; headset {headset:?}");
+        println!("{fps} Hz after {:?}: {report:?}; headset {headset:?}", started.elapsed());
         assert!(report.restarted && report.streaming, "{report:?}");
         assert_eq!(headset.map(|h| h.fps), Some(fps as f32));
     }
@@ -671,7 +672,9 @@ fn live_restart_relevant_setting_restarts() {
 #[test]
 #[ignore]
 fn live_flavour_switch() {
+    let started = Instant::now();
     let s = ensure_streaming();
+    println!("streaming after {:?}", started.elapsed());
     // later tests expect controllers in the Index flavour, also after a failed assertion
     struct Reset(Arc<Stack>);
     impl Drop for Reset {
@@ -686,8 +689,9 @@ fn live_flavour_switch() {
     }
     let reset = Reset(Arc::clone(&s));
 
+    let started = Instant::now();
     let report = s.set_hand_tracking_flavour(true).unwrap();
-    println!("skeletal tracker: {report:?}");
+    println!("skeletal tracker after {:?}: {report:?}", started.elapsed());
     assert!(report.restarted && report.streaming, "{report:?}");
     for hand in [Hand::Left, Hand::Right] {
         s.apply(RigAction::SetHandMode(HandModeArgs { hand, mode: HandMode::Hand })).unwrap();
@@ -704,8 +708,9 @@ fn live_flavour_switch() {
     assert!(found, "no posed {serials:?} with active skeletons after 60 s; scene app {:?}", s.scene_app());
 
     drop(reset); // controllers back before the switch
+    let started = Instant::now();
     let report = s.set_hand_tracking_flavour(false).unwrap();
-    println!("index: {report:?}");
+    println!("index after {:?}: {report:?}", started.elapsed());
     assert!(report.restarted && report.streaming, "{report:?}");
 }
 

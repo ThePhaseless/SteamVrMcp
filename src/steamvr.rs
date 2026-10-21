@@ -64,6 +64,24 @@ pub fn terminate(pid: u32, sig: i32) {
     unsafe { libc::kill(pid as i32, sig) };
 }
 
+/// SIGTERM, then SIGKILL, to every SteamVR process (vrmonitor last), 5 s apart. True when none remain.
+pub fn kill_vr_processes() -> bool {
+    for sig in [libc::SIGTERM, libc::SIGKILL] {
+        for name in VR_PROCESS_NAMES {
+            pids_named(name).into_iter().for_each(|pid| terminate(pid, sig));
+        }
+        if wait_gone(VR_PROCESS_NAMES, Duration::from_secs(5)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `now` holds a vrserver pid that `old` does not: SteamVR really relaunched.
+pub fn is_new_vrserver(old: &[u32], now: &[u32]) -> bool {
+    now.iter().any(|pid| !old.contains(pid))
+}
+
 /// Runs `steam <url>`. Only when Steam is not running yet does it get `steam.env` and `steam.args`,
 /// because a running Steam just forwards the URL. True if this started Steam.
 pub fn launch(cfg: &Config, url: &str) -> Result<bool> {
@@ -123,20 +141,26 @@ pub fn run_dashboard_child() -> ! {
 /// The dashboard's restart: ALVR shuts SteamVR down cleanly, then SteamVR is launched again.
 pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
+    let old = pids_named("vrserver");
     // on failure the wait and signals below still stop SteamVR, so it is always relaunched
     if let Err(e) = api.post("/api/steamvr/restart") {
         error!("{e:#}");
     }
-    let names = ["vrserver", "vrmonitor"];
-    if !wait_gone(&names, Duration::from_secs(30)) {
-        for name in names {
-            pids_named(name).into_iter().for_each(|pid| terminate(pid, libc::SIGTERM));
+    // as in Stack::stop(): ALVR's shutdown hangs on a stream thread spinning on its client's EOF
+    // (sockets/src/stream_socket/tcp.rs:137-147), so escalate to signals
+    if !wait_gone(&["vrserver", "vrmonitor"], Duration::from_secs(30)) {
+        if !kill_vr_processes() {
+            let left: Vec<_> = VR_PROCESS_NAMES.iter().filter(|n| !pids_named(n).is_empty()).collect();
+            bail!("SteamVR processes still running after SIGKILL: {left:?}");
         }
-        wait_gone(&names, Duration::from_secs(5));
+        // SteamVR has exited, so it no longer rewrites the file
+        setup::undo_safe_mode_blocks(paths)?;
     }
     setup::unblock_safe_mode(&vrsettings)?;
     launch(cfg, STEAMVR_URL)?;
-    if !wait_for(Duration::from_secs(cfg.timeouts.streaming_s), || api.ping()) {
+    // the old server can still answer ping while it hangs in shutdown
+    let relaunched = || is_new_vrserver(&old, &pids_named("vrserver")) && api.ping();
+    if !wait_for(Duration::from_secs(cfg.timeouts.streaming_s), relaunched) {
         bail!("ALVR did not come back within {} s after the SteamVR restart", cfg.timeouts.streaming_s);
     }
     Ok(())
@@ -155,6 +179,14 @@ mod tests {
         assert_eq!(log_tail(&steam, "vrserver", 9), ["a", "b", "c"]);
         assert!(log_tail(&steam, "vrmonitor", 2).is_empty(), "missing file");
         fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn relaunch_needs_a_new_vrserver() {
+        assert!(!is_new_vrserver(&[10], &[10]), "the old, wedged server still answers");
+        assert!(!is_new_vrserver(&[10], &[]));
+        assert!(is_new_vrserver(&[10], &[11]));
+        assert!(is_new_vrserver(&[], &[11]));
     }
 
     #[test]
