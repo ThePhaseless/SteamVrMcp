@@ -23,6 +23,12 @@ use std::{
 
 // client_core/src/connection.rs SERVER_RESTART_MESSAGE, shown after ServerControlPacket::Restarting
 const SERVER_RESTART_MESSAGE: &str = "The streamer is restarting\nPlease wait...";
+
+/// client_core's set_hud_message puts version, hostname and IP before the message.
+fn is_restart_hud(hud: &str) -> bool {
+    hud.ends_with(SERVER_RESTART_MESSAGE)
+}
+
 const WATCHDOG: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, Serialize)]
@@ -201,7 +207,8 @@ impl Stack {
         }
         self.check_version()?;
         let streaming = steamvr::wait_for(deadline.saturating_duration_since(Instant::now()), || {
-            self.headset_status().is_some_and(|h| h.streaming)
+            // DecoderConfig follows StreamingStarted
+            self.headset_status().is_some_and(|h| h.streaming && h.codec.is_some())
         });
         let h = self.headset_status().unwrap_or_default();
         if !streaming {
@@ -219,6 +226,10 @@ impl Stack {
         self.state.lock().managing = false;
         let _no_restart = self.restarting.lock();
         let mut report = StopReport::default();
+        // ALVR's client spins forever on a TCP stream whose server went away
+        // (sockets/src/stream_socket/tcp.rs:137-147), so disconnect it while the server is up
+        let headset = self.state.lock().headset.take();
+        drop(headset);
         if self.api.ping() {
             // on failure the signals below still stop SteamVR
             self.api.post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
@@ -236,11 +247,10 @@ impl Stack {
             report.used_signals = true;
         }
 
-        let (headset, dashboard, started_steam) = {
+        let (dashboard, started_steam) = {
             let mut state = self.state.lock();
-            (state.headset.take(), state.dashboard.take(), std::mem::take(&mut state.started_steam))
+            (state.dashboard.take(), std::mem::take(&mut state.started_steam))
         };
-        drop(headset);
         if let Some(mut child) = dashboard {
             child.kill().ok();
             child.wait().ok();
@@ -281,7 +291,16 @@ impl Stack {
         if !self.state.lock().managing {
             return;
         }
-        match steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api) {
+        // as in stop(): a client still streaming when vrserver exits never disconnects
+        // shortcut: holds the state lock while the client disconnects (about a second), fine until status calls must never wait
+        if let Some(h) = &self.state.lock().headset {
+            h.pause();
+        }
+        let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api);
+        if let Some(h) = &self.state.lock().headset {
+            h.resume();
+        }
+        match restarted {
             Ok(()) => self.state.lock().restarts += 1,
             Err(e) => error!("SteamVR restart failed: {e:#}"),
         }
@@ -335,7 +354,7 @@ fn supervise(stack: Weak<Stack>) {
         }
         let status = s.headset_status().unwrap_or_default();
         // a request sent before the events stream attached still shows on the headset's HUD
-        restart |= status.hud_message == SERVER_RESTART_MESSAGE && last_hud != SERVER_RESTART_MESSAGE;
+        restart |= is_restart_hud(&status.hud_message) && !is_restart_hud(&last_hud);
         last_hud = status.hud_message;
         if status.streaming || events.is_none() {
             quiet_since = None;
@@ -363,5 +382,13 @@ mod tests {
     fn vr_restore_refuses_while_steamvr_runs() {
         assert_eq!(restore_guard(true).unwrap_err().to_string(), "SteamVR is running; run vr_stop first");
         assert!(restore_guard(false).is_ok());
+    }
+
+    #[test]
+    fn restart_hud_matches_client_core_format() {
+        // client_core's set_hud_message prefixes every message with version, hostname and IP
+        let hud = |m: &str| format!("ALVR v21.0.0-dev14\nhostname: 1234.client.local.\nIP: 192.0.2.1\n\n{m}");
+        assert!(is_restart_hud(&hud(SERVER_RESTART_MESSAGE)));
+        assert!(!is_restart_hud(&hud("Searching for streamer...")));
     }
 }

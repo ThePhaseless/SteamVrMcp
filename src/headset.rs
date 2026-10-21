@@ -175,7 +175,16 @@ impl Headset {
     }
 
     pub fn reconnect(&self) {
+        self.pause();
+        self.resume();
+    }
+
+    /// Disconnects and stays disconnected until `resume`.
+    pub fn pause(&self) {
         self.context.pause();
+    }
+
+    pub fn resume(&self) {
         self.context.resume();
     }
 }

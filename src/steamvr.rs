@@ -13,9 +13,12 @@ use std::{
 
 pub const STEAMVR_URL: &str = "steam://rungameid/250820";
 
-/// SteamVR's processes, as `/proc/<pid>/comm` names them. vrmonitor is last: killing it first
-/// makes SteamVR's safe mode block the ALVR driver.
-pub const VR_PROCESS_NAMES: &[&str] = &["vrserver", "vrcompositor", "vrdashboard", "vrwebhelper", "vrstartup", "vrmonitor"];
+/// SteamVR's processes, as `/proc/<pid>/comm` names them (pinned from a live SteamVR 2.x run).
+/// vrmonitor is last: killing it first makes SteamVR's safe mode block the ALVR driver.
+pub const VR_PROCESS_NAMES: &[&str] = &[
+    "vrserver", "vrcompositor", "vrdashboard", "vrwebhelper", "vrstartup", "vrstartup.sh", "steamtours", "steamtours.sh",
+    "vrmonitor",
+];
 
 pub fn pids_named(name: &str) -> Vec<u32> {
     let Ok(dir) = fs::read_dir("/proc") else { return vec![] };

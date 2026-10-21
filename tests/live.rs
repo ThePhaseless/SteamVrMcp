@@ -67,6 +67,20 @@ fn live_prepare_restore_round_trip() {
 #[ignore]
 fn live_start_streams_and_stop_cleans() {
     assert!(!steamvr::is_steam_running(), "close Steam first");
+    start_streams_and_stop_cleans(false);
+}
+
+/// The same proofs with the user's Steam already running: the MCP must neither start nor close it.
+/// Needs Steam running (on a GPU that ALVR 21's direct mode supports) and SteamVR closed.
+#[test]
+#[ignore]
+fn live_start_streams_and_stop_cleans_with_steam_running() {
+    assert!(steamvr::is_steam_running() && !steamvr::is_steamvr_running(), "start Steam and close SteamVR first");
+    start_streams_and_stop_cleans(true);
+    assert!(steamvr::is_steam_running(), "the user's Steam was closed");
+}
+
+fn start_streams_and_stop_cleans(steam_was_running: bool) {
     let cfg = Config::load().unwrap();
     let paths = Paths::detect(&cfg);
     let before = Snap::take(&paths);
@@ -85,7 +99,7 @@ fn live_start_streams_and_stop_cleans() {
     let checks = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let r = s.start().unwrap();
         println!("start: {r:?}");
-        assert!(r.started_steam && !r.already_streaming && !r.adopted, "{r:?}");
+        assert!(r.started_steam != steam_was_running && !r.already_streaming && !r.adopted, "{r:?}");
         assert!(r.restarts >= 1, "a fresh session (hash 0) restarts SteamVR once: {r:?}");
         assert_eq!(r.codec.as_deref(), Some("H264"));
         assert!(!steamvr::pids_named("alvr_dashboard").is_empty(), "no alvr_dashboard child");
@@ -115,7 +129,7 @@ fn live_start_streams_and_stop_cleans() {
     }
     let stop = stopped.unwrap();
     println!("stop: {stop:?}");
-    assert!(stop.remaining_processes.is_empty() && stop.closed_steam, "{stop:?}");
+    assert!(stop.remaining_processes.is_empty() && stop.closed_steam != steam_was_running, "{stop:?}");
     restored.unwrap();
     assert_eq!(Snap::take(&paths), before);
     assert!(!paths.restore_file().exists());
