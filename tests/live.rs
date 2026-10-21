@@ -180,14 +180,20 @@ fn live_checks_without_config() {
 
 /// The shared stack of the live window: starts it when the headset is not streaming and leaves it running.
 fn ensure_streaming() -> Arc<Stack> {
+    let stack = shared_stack();
+    if !stack.status().headset.is_some_and(|h| h.streaming) {
+        stack.start().unwrap();
+    }
+    stack
+}
+
+/// The one Stack of this test process.
+fn shared_stack() -> Arc<Stack> {
     static STACK: OnceLock<Arc<Stack>> = OnceLock::new();
     let stack = STACK.get_or_init(|| {
         let cfg = Config::load().unwrap();
         Stack::new(cfg.clone(), Paths::detect(&cfg))
     });
-    if !stack.status().headset.is_some_and(|h| h.streaming) {
-        stack.start().unwrap();
-    }
     Arc::clone(stack)
 }
 
@@ -455,6 +461,15 @@ struct Row {
     undo: RigAction,
 }
 
+/// A probe value at rest: false, 0, or [0, 0].
+fn zero(v: &Value) -> Value {
+    match v {
+        Value::Bool(_) => json!(false),
+        Value::Array(a) => json!(vec![0.0; a.len()]),
+        _ => json!(0.0),
+    }
+}
+
 fn want(pairs: &[(&str, Value)]) -> Vec<(String, Value)> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
@@ -505,15 +520,15 @@ fn rows(hand: Hand) -> Vec<Row> {
         want: want(&[("trackpad", json!([-0.4, 0.3])), ("trackpad_force", json!(0.2)), ("trackpad_touch", json!(true))]),
         undo: RigAction::SetTrackpad(TrackpadArgs { hand, x: 0.0, y: 0.0, force: None, touch: Some(false) }),
     });
-    // system last: SteamVR may keep the system click for its dashboard, which takes the probe's focus
-    rows.sort_by_key(|r| r.name.contains("system"));
+    // system click last: SteamVR keeps it for its dashboard, which takes the probe's input away
+    rows.sort_by_key(|r| r.name == "press system");
     rows
 }
 
 /// Proves early risk 3: every Index input, including the trackpad and left A/B, reaches an OpenXR
 /// app through ALVR's manual button mappings and SteamVR's Index bindings, for both hands.
-/// The system click may be kept by SteamVR for its dashboard; then the probe losing focus counts
-/// as arrival, and a second press closes the dashboard. Needs Steam closed or its GPU supported,
+/// SteamVR keeps the system click for its dashboard (seen live: the probe's actions go inactive,
+/// then its session drops to VISIBLE); that counts as arrival, and a second press closes it. Needs Steam closed or its GPU supported,
 /// and SteamVR closed or streaming. Builds and runs examples/xr_probe.
 #[test]
 #[ignore]
@@ -526,19 +541,34 @@ fn live_index_inputs_reach_openxr() {
         for row in rows(hand) {
             s.apply(row.apply).unwrap();
             let (line, ok) = probe.wait(Duration::from_secs(1), |l| shows(&l[name], &row.want));
-            let dashboard = row.name == "press system" && line["state"] != "FOCUSED";
-            println!("{name} {}: {} {}", row.name, if ok { "ok" } else if dashboard { "dashboard opened" } else { "MISSING" }, line[name]);
+            // released: every key of the row back to false, 0 or [0, 0]
+            let released: Vec<_> = row.want.iter().map(|(k, v)| (k.clone(), zero(v))).collect();
+            s.apply(row.undo).unwrap();
+            let (after, let_go) = probe.wait(Duration::from_secs(1), |l| shows(&l[name], &released));
+            // SteamVR may open its dashboard on the press or on the release, so decide after both
+            let lost = |l: &Value| l[name]["active"] == false || l["state"] != "FOCUSED";
+            let dashboard = row.name == "press system" && probe.wait(Duration::from_secs(1), lost).1;
+            let verdict = match (ok, dashboard) {
+                (true, _) => "ok",
+                (false, true) => "dashboard opened",
+                (false, false) => "MISSING",
+            };
+            println!("{name} {}: {verdict}, released {let_go}; pressed {} released {}", row.name, line[name], after[name]);
             if !ok && !dashboard {
                 failures.push(format!("{name} {}: want {:?}, probe {}", row.name, row.want, line[name]));
             }
-            s.apply(row.undo).unwrap();
+            if !let_go && !dashboard {
+                failures.push(format!("{name} {}: not released, probe {}", row.name, after[name]));
+            }
             if dashboard {
+                // the dashboard is fully up once the session leaves FOCUSED; a second press closes it
+                probe.wait(Duration::from_secs(3), |l| l["state"] != "FOCUSED");
                 s.apply(RigAction::PressButton(ButtonArgs { hand, button: Button::System })).unwrap();
                 thread::sleep(Duration::from_millis(200));
                 s.apply(RigAction::ReleaseButton(ButtonArgs { hand, button: Button::System })).unwrap();
-                assert!(probe.wait(Duration::from_secs(10), |l| l["state"] == "FOCUSED").1, "probe did not get its focus back");
+                let back = probe.wait(Duration::from_secs(10), |l| l["state"] == "FOCUSED" && l[name]["active"] == true);
+                assert!(back.1, "probe did not get its focus back: {}", back.0);
             }
-            thread::sleep(Duration::from_millis(200));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
@@ -590,4 +620,19 @@ fn live_bare_hand_pinch_is_trigger() {
     let (line, opened) = probe.wait(Duration::from_secs(1), |l| (0.0..0.1).contains(&value(l)));
     println!("open: {}", line["right"]);
     assert!(opened, "open hand did not release the trigger: {}", line["right"]);
+}
+
+/// Not a check: ends a live window. Stops the stack this process started (or a SteamVR left by an
+/// earlier process) and restores SteamVR's files. Name sorts after the other live tests.
+#[test]
+#[ignore]
+fn live_zz_stop_and_restore() {
+    let paths = Paths::detect(&Config::load().unwrap());
+    let stopped = shared_stack().stop().unwrap();
+    println!("{stopped:?}");
+    assert!(stopped.remaining_processes.is_empty(), "{stopped:?}");
+    if paths.restore_file().exists() {
+        restore(&paths).unwrap();
+    }
+    assert!(!paths.restore_file().exists());
 }

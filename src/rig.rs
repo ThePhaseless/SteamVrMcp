@@ -512,8 +512,8 @@ pub struct Rig {
     controllers: [Body; 2],
     active: [bool; 2],
     hands: [HandState; 2],
-    /// Every input set so far by full path id, for a resend to a new stream.
-    buttons: BTreeMap<u64, ButtonValue>,
+    /// Per hand, every input held by full path id, for a resend to a new stream.
+    buttons: [BTreeMap<u64, ButtonValue>; 2],
     /// Inputs set since the last `take_buttons`, in order.
     pending: Vec<(u64, ButtonValue)>,
 }
@@ -531,7 +531,7 @@ impl Rig {
             controllers: [Body::at(Vec3::new(-0.2, 1.2, -0.3)), Body::at(Vec3::new(0.2, 1.2, -0.3))],
             active: [true; 2],
             hands: Default::default(),
-            buttons: BTreeMap::new(),
+            buttons: Default::default(),
             pending: vec![],
         }
     }
@@ -557,7 +557,7 @@ impl Rig {
             }
             for (suffix, value) in inputs {
                 let id = alvr_common::hash_string(&format!("/user/hand/{}/input/{suffix}", hand.name()));
-                self.buttons.insert(id, value);
+                self.buttons[i].insert(id, value);
                 self.pending.push((id, value));
             }
             return Ok(Duration::ZERO);
@@ -590,7 +590,18 @@ impl Rig {
                 c.check()?;
                 (h.curls, h.raw) = (Some(c), None);
             }
-            RigAction::SetHandMode(a) => self.hands[a.hand as usize].mode = a.mode,
+            RigAction::SetHandMode(a) => {
+                let i = a.hand as usize;
+                self.hands[i].mode = a.mode;
+                if a.mode == HandMode::Hand {
+                    // release refuses for a bare hand, so let go of what it held now, not after a reconnect
+                    let released = std::mem::take(&mut self.buttons[i]).into_iter().map(|(id, v)| match v {
+                        ButtonValue::Binary(_) => (id, ButtonValue::Binary(false)),
+                        ButtonValue::Scalar(_) => (id, ButtonValue::Scalar(0.0)),
+                    });
+                    self.pending.extend(released);
+                }
+            }
             RigAction::SetHandSkeleton(a) => {
                 if a.joints.len() != 26 {
                     return Err("joints must have 26 entries".into());
@@ -624,7 +635,7 @@ impl Rig {
 
     /// Every input set so far. A new stream needs them again: the server's mapping state starts empty.
     pub fn all_buttons(&self) -> Vec<ButtonEntry> {
-        self.buttons.iter().map(|(&path_id, &value)| ButtonEntry { path_id, value }).collect()
+        self.buttons.iter().flatten().map(|(&path_id, &value)| ButtonEntry { path_id, value }).collect()
     }
 
     /// The head plus each active hand at `now`: a controller pose, its skeleton once curls or
@@ -931,6 +942,25 @@ mod tests {
         let err = rig.apply(RigAction::SetTrigger(TriggerArgs { hand: Hand::Left, value: 0.5 }), now).unwrap_err();
         assert!(err.contains("bare hand"), "{err}");
         assert!(rig.take_buttons().is_empty());
+    }
+
+    #[test]
+    fn bare_hand_mode_releases_held_inputs() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        rig.apply(press(Hand::Right, Button::Grip), now).unwrap();
+        rig.apply(press(Hand::Left, Button::A), now).unwrap();
+        rig.take_buttons();
+        rig.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Right, mode: HandMode::Hand }), now).unwrap();
+        use ButtonValue::{Binary, Scalar};
+        let sorted = |mut v: Vec<(u64, String)>| {
+            v.sort();
+            v
+        };
+        let released = want("right", &[("squeeze/value", Scalar(0.0)), ("squeeze/force", Scalar(0.0))]);
+        assert_eq!(sorted(entries(rig.take_buttons())), sorted(released), "a held grab is let go now");
+        let held = sorted(want("left", &[("a/click", Binary(true)), ("a/touch", Binary(true))]));
+        let all = sorted(entries(rig.all_buttons()));
+        assert_eq!(all, held, "and is not resent to a new stream; the left hand keeps its press");
     }
 
     #[test]
