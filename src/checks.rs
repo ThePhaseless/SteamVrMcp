@@ -29,10 +29,12 @@ pub struct Readiness {
     pub running: bool,
     /// `lease::holder_text` while another live MCP holds the SteamVR lease.
     pub leased_to: Option<String>,
+    /// config.toml has at least one `[app_logs]` entry.
+    pub app_logs: bool,
 }
 
 /// Tools that change nothing, so an observer without the lease keeps them.
-pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release"];
+pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release", "read_app_log", "wait_for_log"];
 
 /// The checks vr_start needs.
 pub const CORE: [&str; 7] =
@@ -72,6 +74,7 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
             streaming()?;
             checks(&["h264_encoder", "screenshot_decoder"])
         }
+        "read_app_log" | "wait_for_log" => holds(r.app_logs, "no [app_logs] entry in config.toml"),
         "get_tracked_state" => {
             holds(r.steamvr_running, "SteamVR is not running")?;
             checks(&["openvr_client"])
@@ -311,7 +314,7 @@ mod tests {
     ];
 
     fn all_ready() -> Readiness {
-        Readiness { restore_file: true, steamvr_running: true, alvr_api: true, streaming: true, running: true, ..Default::default() }
+        Readiness { restore_file: true, steamvr_running: true, alvr_api: true, streaming: true, running: true, app_logs: true, ..Default::default() }
     }
 
     #[test]
@@ -352,6 +355,15 @@ mod tests {
         }
         for tool in READ_ONLY {
             assert_eq!(tool_ready(tool, &r), Ok(()), "{tool}");
+        }
+    }
+
+    #[test]
+    fn app_log_tools_need_config() {
+        let none = Readiness { app_logs: false, ..all_ready() };
+        for tool in ["read_app_log", "wait_for_log"] {
+            assert!(tool_ready(tool, &none).unwrap_err().contains("[app_logs]"), "{tool}");
+            assert_eq!(tool_ready(tool, &all_ready()), Ok(()), "{tool}");
         }
     }
 

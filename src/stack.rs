@@ -1,5 +1,6 @@
 use crate::{
     alvr_api::{self, Api},
+    applog::{self, AppLogs},
     checks::{self, Check, Readiness},
     clock,
     config::{Config, Paths},
@@ -22,6 +23,7 @@ use alvr_packets::{PathSegment, PathValuePair, parse_path, path_to_string};
 use alvr_session::{RecenteringMode, SessionConfig, Settings, settings_schema::SchemaNode};
 use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
@@ -155,6 +157,49 @@ pub struct LogQuery {
     pub min_level: Option<String>,
     /// How many of the newest matching lines to return, 1 to 1000 (default 100).
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ReadAppLogArgs {
+    /// Decimal Steam app id with an `[app_logs]` entry in config.toml.
+    pub app_id: String,
+    /// Only lines with seq at or above this (default 0); pass the next_seq of the last read.
+    pub since_seq: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct WaitForLogArgs {
+    /// Decimal Steam app id with an `[app_logs]` entry in config.toml.
+    pub app_id: String,
+    /// Regex a line must match (unanchored, Rust regex syntax).
+    pub pattern: String,
+    /// Regex that ends the wait with result "fail"; checked before `pattern` on each line.
+    pub fail_pattern: Option<String>,
+    /// First seq to look at (default: the oldest line kept, which is the first one since the last launch_app).
+    pub since_seq: Option<u64>,
+    /// Seconds to wait, 1 to 600 (default 60).
+    pub timeout_s: Option<f64>,
+}
+
+/// The checked arguments of `wait_for_log`: app id, pattern, fail pattern and timeout. Nothing waits on a bad one.
+pub fn wait_plan(a: &WaitForLogArgs, configured: impl Fn(u32) -> bool) -> Result<(u32, Regex, Option<Regex>, Duration), String> {
+    let app_id = app_id(&a.app_id).map_err(|e| e.to_string())?;
+    if !configured(app_id) {
+        return Err(format!("app {app_id} has no entry in [app_logs] of config.toml"));
+    }
+    let pattern = Regex::new(&a.pattern).map_err(|e| format!("pattern: {e}"))?;
+    let fail = a.fail_pattern.as_deref().map(Regex::new).transpose().map_err(|e| format!("fail_pattern: {e}"))?;
+    let timeout_s = a.timeout_s.unwrap_or(60.0);
+    if !(1.0..=600.0).contains(&timeout_s) {
+        return Err(format!("timeout_s must be 1 to 600, not {timeout_s}"));
+    }
+    Ok((app_id, pattern, fail, Duration::from_secs_f64(timeout_s)))
+}
+
+fn app_id(id: &str) -> Result<u32> {
+    id.trim().parse().with_context(|| format!("app_id must be a decimal Steam app id, not {id:?}"))
 }
 
 const LOG_SOURCES: [&str; 5] = ["alvr", "vrserver", "vrcompositor", "vrmonitor", "all"];
@@ -325,6 +370,8 @@ pub struct Stack {
     alvr_logs: Mutex<VecDeque<LogLine>>,
     /// The owner name and ttl the lease is taken and renewed with.
     lease: Mutex<(String, Duration)>,
+    /// The game log rings from `[app_logs]`; rebuilt when the config reloads. Locked briefly, never while sleeping.
+    app_logs: Mutex<AppLogs>,
 }
 
 const RECENTER_NOT_STAGE: &str =
@@ -358,6 +405,7 @@ pub fn restore_guard(steamvr_running: bool) -> Result<()> {
 
 impl Stack {
     pub fn new(cfg: Config, paths: Paths) -> Arc<Stack> {
+        let app_log_patterns = cfg.app_logs.clone();
         let stack = Arc::new(Stack {
             api: Mutex::new(api_for(&paths)),
             cfg: Mutex::new(cfg),
@@ -372,6 +420,7 @@ impl Stack {
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
             lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
+            app_logs: Mutex::new(AppLogs::new(&app_log_patterns)),
         });
         stack.run_checks();
         let weak = Arc::downgrade(&stack);
@@ -415,6 +464,7 @@ impl Stack {
         let paths = Paths::detect(&cfg);
         *self.api.lock() = api_for(&paths);
         *self.paths.lock() = paths;
+        *self.app_logs.lock() = AppLogs::new(&cfg.app_logs);
         *self.cfg.lock() = cfg;
         true
     }
@@ -456,6 +506,7 @@ impl Stack {
             running: ours_running || (steamvr_running && (alvr_api || steamvr::vrserver_has_alvr())),
             leased_to: lease::blocking(lease::read(&self.paths().runtime_dir).as_ref(), std::process::id(), SystemTime::now(), lease::alive)
                 .map(lease::holder_text),
+            app_logs: !self.cfg.lock().app_logs.is_empty(),
         }
     }
 
@@ -909,6 +960,7 @@ impl Stack {
         let paths = self.paths();
         let steam = paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
         let app = steamvr::find_app(steam, id)?;
+        self.app_logs.lock().reset(app.app_id, Some(steam));
         // SteamVR Home is a scene app too, so wait for a scene pid that was not there before
         // shortcut: relaunching an app that already runs times out, as Steam only focuses it; check its process if that matters
         let before = self.scene_app().map(|a| a.pid);
@@ -947,6 +999,47 @@ impl Stack {
             }
         }
         Ok(serde_json::json!({ "stopped_pid": pid }))
+    }
+
+    /// The app's log lines from `since_seq`, after reading what its files gained.
+    pub fn read_app_log(&self, a: ReadAppLogArgs) -> Result<applog::Page> {
+        let id = app_id(&a.app_id)?;
+        let steam = self.paths().steam_dir;
+        let mut logs = self.app_logs.lock();
+        logs.poll_app(id, steam.as_deref());
+        logs.page(id, a.since_seq.unwrap_or(0)).map_err(|e| anyhow!(e))
+    }
+
+    /// Polls the app's logs every 200 ms until a line matches `fail_pattern` or `pattern`, or the timeout passes.
+    pub fn wait_for_log(&self, a: WaitForLogArgs) -> Result<Value> {
+        let (id, pattern, fail, timeout) = wait_plan(&a, |id| self.app_logs.lock().has_app(id)).map_err(|e| anyhow!(e))?;
+        let deadline = Instant::now() + timeout;
+        let mut cursor = a.since_seq.unwrap_or(0);
+        loop {
+            let steam = self.paths().steam_dir;
+            let hit = {
+                let mut logs = self.app_logs.lock();
+                logs.poll_app(id, steam.as_deref());
+                loop {
+                    let page = logs.page(id, cursor).map_err(|e| anyhow!(e))?;
+                    cursor = page.next_seq;
+                    if let Some((result, line)) = applog::find_match(&page.lines, &pattern, fail.as_ref()) {
+                        break Some((result, line.clone()));
+                    }
+                    if page.lines.len() < applog::PAGE {
+                        break None;
+                    }
+                }
+            };
+            if let Some((result, line)) = hit {
+                return Ok(serde_json::json!({ "result": result, "line": line, "next_seq": line.seq + 1 }));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(serde_json::json!({ "result": "timeout", "line": null, "next_seq": cursor }));
+            }
+            thread::sleep(left.min(Duration::from_millis(200)));
+        }
     }
 
     /// The Index flavour (`steamvr_input_2_0` off) or the skeletal-tracker flavour (on).
@@ -1087,6 +1180,8 @@ fn watch(stack: Weak<Stack>) {
     loop {
         let Some(s) = stack.upgrade() else { return };
         s.pump_reader();
+        let steam = s.paths().steam_dir;
+        s.app_logs.lock().poll(steam.as_deref());
         let now = s.readiness();
         if now != last {
             if let Some(f) = &*s.on_change.lock() {
@@ -1476,6 +1571,62 @@ mod tests {
         assert!(s.now_t_s >= 0.0);
         assert!(s.t0_at.ends_with('Z') && s.now_at.ends_with('Z'));
         assert!(s.now_at >= s.t0_at);
+    }
+
+    #[test]
+    fn wait_plan_rejects_bad_args() {
+        let args = |app_id: &str, pattern: &str, fail: Option<&str>, timeout_s: Option<f64>| WaitForLogArgs {
+            app_id: app_id.into(),
+            pattern: pattern.into(),
+            fail_pattern: fail.map(String::from),
+            since_seq: None,
+            timeout_s,
+        };
+        let plan = |a: WaitForLogArgs| wait_plan(&a, |id| id == 7);
+        assert!(plan(args("7", "(", None, None)).is_err());
+        assert!(plan(args("7", "ok", Some("["), None)).is_err());
+        for bad in [0.0, 601.0, f64::NAN, -1.0] {
+            assert!(plan(args("7", "ok", None, Some(bad))).is_err(), "{bad}");
+        }
+        assert!(plan(args("7", "ok", None, Some(1.0))).is_ok() && plan(args("7", "ok", None, Some(600.0))).is_ok());
+        assert!(plan(args("8", "ok", None, None)).unwrap_err().contains("[app_logs]"));
+        assert!(plan(args("x", "ok", None, None)).is_err());
+        let (app, pattern, fail, timeout) = plan(args(" 7 ", "ok", Some("bad"), None)).unwrap();
+        assert_eq!((app, pattern.as_str(), fail.unwrap().as_str(), timeout), (7, "ok", "bad", Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn wait_for_log_sees_lines_logged_before_the_call() {
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-stack-wait-log-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let steam = root.join("steam");
+        std::fs::create_dir_all(steam.join("steamapps")).unwrap();
+        std::fs::write(steam.join("steamapps/appmanifest_42.acf"), "\"AppState\"\n{\n\t\"installdir\"\t\t\"Game\"\n}\n").unwrap();
+        std::fs::create_dir_all(steam.join("steamapps/common/Game")).unwrap();
+        let paths = Paths {
+            steam_dir: Some(steam.clone()),
+            flatpak_steam: false,
+            steamvr_dir: None,
+            streamer_dir: None,
+            state_dir: root.join("state"),
+            runtime_dir: root.join("run"),
+        };
+        let cfg = Config::parse("[app_logs]\n\"42\" = [\"${install}/game.log\"]").unwrap();
+        let stack = Stack::new(cfg, paths);
+        assert!(stack.readiness().app_logs);
+        let read = |since| stack.read_app_log(ReadAppLogArgs { app_id: "42".into(), since_seq: since }).unwrap();
+        assert!(read(None).lines.is_empty());
+        std::fs::write(steam.join("steamapps/common/Game/game.log"), "boot\nERROR x\nREADY\n").unwrap();
+        let wait = |pattern: &str, fail: Option<&str>, since| {
+            let a = WaitForLogArgs { app_id: "42".into(), pattern: pattern.into(), fail_pattern: fail.map(String::from), since_seq: since, timeout_s: Some(1.0) };
+            stack.wait_for_log(a).unwrap()
+        };
+        let hit = wait("READY", None, None);
+        assert_eq!((hit["result"].as_str(), hit["line"]["text"].as_str(), hit["next_seq"].as_u64()), (Some("match"), Some("READY"), Some(4)));
+        assert_eq!(wait("READY", Some("ERROR"), None)["result"], "fail");
+        let late = wait("READY", None, Some(4));
+        assert_eq!((late["result"].as_str(), late["next_seq"].as_u64()), (Some("timeout"), Some(4)));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn query(source: &str, contains: Option<&str>, min_level: Option<&str>, limit: Option<usize>) -> LogQuery {

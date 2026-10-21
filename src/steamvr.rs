@@ -136,6 +136,12 @@ pub struct AppInfo {
     pub name: String,
     /// Steam's CompatToolMapping entry, e.g. "proton_experimental"; none for native games and Steam's default.
     pub compat_tool: Option<String>,
+    /// `<library>/steamapps/common/<installdir>`; none for a shortcut.
+    #[serde(skip)]
+    pub install_dir: Option<PathBuf>,
+    /// `<library>/steamapps/compatdata/<app_id>`; a shortcut's library is the Steam dir.
+    #[serde(skip)]
+    pub compatdata: PathBuf,
 }
 
 /// Steam's game id for a non-Steam shortcut.
@@ -166,6 +172,18 @@ pub fn library_dirs(libraryfolders_vdf: &str) -> Vec<PathBuf> {
             _ => None,
         })
         .collect()
+}
+
+/// The Steam dir, then every library in libraryfolders.vdf, without repeats.
+pub fn libraries(steam_dir: &Path) -> Vec<PathBuf> {
+    let vdf = fs::read_to_string(steam_dir.join("steamapps/libraryfolders.vdf")).unwrap_or_default();
+    let mut libs = vec![steam_dir.to_path_buf()];
+    for lib in library_dirs(&vdf) {
+        if !libs.contains(&lib) {
+            libs.push(lib);
+        }
+    }
+    libs
 }
 
 /// The tool name under CompatToolMapping / `<app_id>` in config.vdf.
@@ -230,11 +248,12 @@ pub fn find_app(steam_dir: &Path, id: u64) -> Result<AppInfo> {
     let app_id = if id > u32::MAX as u64 { (id >> 32) as u32 } else { id as u32 };
     let compat_tool = || compat_tool(&fs::read_to_string(steam_dir.join("config/config.vdf")).unwrap_or_default(), app_id);
     if id <= u32::MAX as u64 {
-        let libraries = fs::read_to_string(steam_dir.join("steamapps/libraryfolders.vdf")).unwrap_or_default();
-        for lib in [steam_dir.to_path_buf()].into_iter().chain(library_dirs(&libraries)) {
+        for lib in libraries(steam_dir) {
             if let Ok(manifest) = fs::read_to_string(lib.join(format!("steamapps/appmanifest_{app_id}.acf"))) {
                 let name = vdf_value(&manifest, "name").unwrap_or_default().to_owned();
-                return Ok(AppInfo { app_id, game_id: id, kind: AppKind::Steam, name, compat_tool: compat_tool() });
+                let install_dir = vdf_value(&manifest, "installdir").map(|d| lib.join("steamapps/common").join(d));
+                let compatdata = lib.join("steamapps/compatdata").join(app_id.to_string());
+                return Ok(AppInfo { app_id, game_id: id, kind: AppKind::Steam, name, compat_tool: compat_tool(), install_dir, compatdata });
             }
         }
     }
@@ -243,7 +262,8 @@ pub fn find_app(steam_dir: &Path, id: u64) -> Result<AppInfo> {
         for user in fs::read_dir(steam_dir.join("userdata")).into_iter().flatten().flatten() {
             let shortcuts = fs::read(user.path().join("config/shortcuts.vdf")).unwrap_or_default();
             if let Some((_, name)) = parse_shortcuts(&shortcuts).into_iter().find(|(a, _)| *a == app_id) {
-                return Ok(AppInfo { app_id, game_id, kind: AppKind::Shortcut, name, compat_tool: compat_tool() });
+                let compatdata = steam_dir.join("steamapps/compatdata").join(app_id.to_string());
+                return Ok(AppInfo { app_id, game_id, kind: AppKind::Shortcut, name, compat_tool: compat_tool(), install_dir: None, compatdata });
             }
         }
     }
@@ -475,6 +495,15 @@ mod tests {
         assert_eq!(library_dirs(vdf), [PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 
+    #[test]
+    fn libraries_list_steam_dir_first_without_duplicates() {
+        let steam = fake_steam("libraries");
+        let vdf = format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{0}\"\n\t}}\n\t\"1\"\n\t{{\n\t\t\"path\"\t\t\"/b\"\n\t}}\n}}\n", steam.display());
+        fs::write(steam.join("steamapps/libraryfolders.vdf"), vdf).unwrap();
+        assert_eq!(libraries(&steam), [steam.clone(), PathBuf::from("/b")]);
+        fs::remove_dir_all(&steam).ok();
+    }
+
     const CONFIG_VDF: &str = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"CompatToolMapping\"\n\t\t{\n\t\t\t\"620980\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t\t\"config\"\t\t\"\"\n\t\t\t}\n\t\t\t\"0\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"proton_9\"\n\t\t\t}\n\t\t}\n\t\t\"Other\"\n\t\t{\n\t\t\t\"7\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"not_a_tool\"\n\t\t\t}\n\t\t}\n\t}\n}\n";
 
     #[test]
@@ -508,17 +537,20 @@ mod tests {
         fs::create_dir_all(steam.join("userdata/42/config")).unwrap();
         let libraries = format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n", lib.display());
         fs::write(steam.join("steamapps/libraryfolders.vdf"), libraries).unwrap();
-        fs::write(lib.join("steamapps/appmanifest_620980.acf"), "\"AppState\"\n{\n\t\"appid\"\t\t\"620980\"\n\t\"name\"\t\t\"Beat Saber\"\n}\n").unwrap();
+        fs::write(lib.join("steamapps/appmanifest_620980.acf"), "\"AppState\"\n{\n\t\"appid\"\t\t\"620980\"\n\t\"name\"\t\t\"Beat Saber\"\n\t\"installdir\"\t\t\"Beat Saber\"\n}\n").unwrap();
         fs::write(steam.join("config/config.vdf"), CONFIG_VDF).unwrap();
         fs::write(steam.join("userdata/42/config/shortcuts.vdf"), shortcuts_vdf(&[(3000000000, "Probe")])).unwrap();
 
         let steam_app = find_app(&steam, 620980).unwrap();
         assert_eq!((steam_app.app_id, steam_app.game_id, steam_app.kind), (620980, 620980, AppKind::Steam));
         assert_eq!((steam_app.name.as_str(), steam_app.compat_tool.as_deref()), ("Beat Saber", Some("proton_experimental")));
+        assert_eq!(steam_app.install_dir, Some(lib.join("steamapps/common/Beat Saber")));
+        assert_eq!(steam_app.compatdata, lib.join("steamapps/compatdata/620980"));
         for id in [3000000000, 12884901888033554432] {
             let shortcut = find_app(&steam, id).unwrap();
             assert_eq!((shortcut.app_id, shortcut.game_id, shortcut.kind), (3000000000, 12884901888033554432, AppKind::Shortcut), "{id}");
             assert_eq!((shortcut.name.as_str(), shortcut.compat_tool.as_deref()), ("Probe", None));
+            assert_eq!((shortcut.install_dir, shortcut.compatdata), (None, steam.join("steamapps/compatdata/3000000000")));
         }
         assert!(find_app(&steam, (620980u64 << 32) | 1).is_err(), "a 64-bit id must be a shortcut game id");
         fs::remove_dir_all(&steam).ok();

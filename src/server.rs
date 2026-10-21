@@ -7,7 +7,7 @@ use crate::{
         HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, SequenceStep, TouchArgs, TrackpadArgs,
         TriggerArgs,
     },
-    stack::{LogQuery, SettingValue, Stack},
+    stack::{LogQuery, ReadAppLogArgs, SettingValue, Stack, WaitForLogArgs},
 };
 use alvr_common::anyhow::{self, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -333,6 +333,16 @@ impl VrServer {
         self.run(move |s| json(s.logs(args)?)).await.map_err(message)
     }
 
+    #[tool(description = "Lines of a game's own log files, tailed as config.toml's [app_logs] table says for this app id: {app_id, files (matched now), lines (seq, t_s, at, file, text; seq >= since_seq, oldest first, at most 500), next_seq}. t_s and at give the moment the MCP read the line. Each app keeps its newest 5000 lines; launch_app clears them. Pass the last next_seq as since_seq to read on.")]
+    async fn read_app_log(&self, Parameters(args): Parameters<ReadAppLogArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.read_app_log(args)?)).await.map_err(message)
+    }
+
+    #[tool(description = "Wait until a line of the app's [app_logs] files matches pattern (a regex) or fail_pattern, whichever line comes first, fail_pattern checked first on each line. Returns {result: \"match\" | \"fail\" | \"timeout\", line, next_seq}. Starts at since_seq (default: the oldest line kept, the first since launch_app), so lines logged before the call count. Bad arguments fail at once. Can take minutes (timeout_s, up to 600).")]
+    async fn wait_for_log(&self, Parameters(args): Parameters<WaitForLogArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.wait_for_log(args)?)).await.map_err(message)
+    }
+
     #[tool(description = "Launch a Steam app or non-Steam shortcut through Steam after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version) and scene_pid. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines. Can take minutes (up to timeouts.app_s, default 180 s).")]
     async fn launch_app(&self, Parameters(args): Parameters<LaunchArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.launch_app(&args.app_id)?)).await.map_err(message)
@@ -457,18 +467,19 @@ mod tests {
             set_head_pose move_head animate_head set_controller_pose move_controller animate_controller set_controller_state \
             press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
             set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
-            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release"
+            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release \
+            read_app_log wait_for_log"
             .split_whitespace()
             .map(String::from)
             .collect();
         want.sort();
-        assert_eq!((names.len(), names), (35, want));
+        assert_eq!((names.len(), names), (37, want));
     }
 
     #[test]
     fn slow_tools_say_so() {
         for tool in VrServer::tool_router().list_all() {
-            let slow = ["vr_start", "vr_stop", "set_alvr_settings", "set_hand_tracking_flavour", "launch_app", "run_sequence"];
+            let slow = ["vr_start", "vr_stop", "set_alvr_settings", "set_hand_tracking_flavour", "launch_app", "run_sequence", "wait_for_log"];
             let says = tool.description.as_deref().unwrap_or_default().contains("minutes");
             assert_eq!(says, slow.contains(&tool.name.as_ref()), "{}", tool.name);
         }

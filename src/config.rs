@@ -1,3 +1,4 @@
+use crate::applog;
 use alvr_common::anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
@@ -12,6 +13,8 @@ pub struct Config {
     /// ALVR session path -> value, applied after the built-in defaults.
     pub alvr_settings: BTreeMap<String, serde_json::Value>,
     pub timeouts: Timeouts,
+    /// Steam app id -> glob patterns of its log files; see `applog::expand` for the variables.
+    pub app_logs: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -45,11 +48,23 @@ impl Config {
         fs::read_to_string(Config::file().ok()?).ok()
     }
 
+    /// The config in `text`, with `app_logs` ids and patterns checked.
+    pub fn parse(text: &str) -> Result<Config> {
+        let cfg: Config = toml::from_str(text)?;
+        for (id, patterns) in &cfg.app_logs {
+            id.parse::<u32>().with_context(|| format!("app_logs key {id:?} is not a decimal app id"))?;
+            for p in patterns {
+                applog::expand(p, Path::new(""), None).map_err(alvr_common::anyhow::Error::msg).with_context(|| format!("app_logs {id:?}"))?;
+            }
+        }
+        Ok(cfg)
+    }
+
     /// Reads `$XDG_CONFIG_HOME/vr-test-mcp/config.toml`; a missing file gives the defaults.
     pub fn load() -> Result<Config> {
         let path = Config::file()?;
         match fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
+            Ok(text) => Config::parse(&text).with_context(|| format!("{}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("{}", path.display())),
         }
@@ -159,5 +174,19 @@ mod tests {
     fn config_reads_steam_env() {
         let c: Config = toml::from_str("[steam]\nenv = { A = \"b\" }").unwrap();
         assert_eq!(c.steam.env["A"], "b");
+    }
+
+    #[test]
+    fn config_reads_app_logs() {
+        let c = Config::parse("[app_logs]\n\"620980\" = [\"${install}/BepInEx/LogOutput.log\"]").unwrap();
+        assert_eq!(c.app_logs["620980"], ["${install}/BepInEx/LogOutput.log"]);
+    }
+
+    #[test]
+    fn config_rejects_bad_app_logs() {
+        let key = format!("{:#}", Config::parse("[app_logs]\nabc = []").unwrap_err());
+        assert!(key.contains("abc"), "{key}");
+        let var = format!("{:#}", Config::parse("[app_logs]\n\"7\" = [\"${home}/x\"]").unwrap_err());
+        assert!(var.contains("home"), "{var}");
     }
 }
