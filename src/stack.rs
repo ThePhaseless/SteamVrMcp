@@ -381,6 +381,8 @@ impl Stack {
                 }
             }
             report.used_signals = true;
+            // SteamVR has exited, so it no longer rewrites the file
+            setup::undo_safe_mode_blocks(&self.paths).map_err(|e| error!("{e:#}")).ok();
         }
 
         let (dashboard, started_steam) = {

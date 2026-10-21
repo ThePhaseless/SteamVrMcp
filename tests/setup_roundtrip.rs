@@ -126,3 +126,56 @@ fn null_external_drivers_round_trips() {
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
+
+#[test]
+fn restore_puts_back_whole_vrsettings() {
+    let f = fixture("wholefile", |v20| json!([v20]));
+    let file = f.paths.vrsettings_file().unwrap();
+    let original = fs::read(&file).unwrap();
+    let values = session_values(&Config::default()).unwrap();
+    prepare(&f.paths, &values, HOST).unwrap();
+    // what SteamVR does on a signalled exit
+    let mut v: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    v["driver_gamepad"] = json!({"blocked_by_safe_mode": true});
+    v["steamvr"]["ipd"] = json!(0.0634);
+    fs::write(&file, v.to_string()).unwrap();
+
+    restore(&f.paths).unwrap();
+    assert_eq!(fs::read(&file).unwrap(), original);
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn absent_vrsettings_is_deleted_on_restore() {
+    let f = fixture("absentfile", |v20| json!([v20]));
+    let file = f.paths.vrsettings_file().unwrap();
+    let values = session_values(&Config::default()).unwrap();
+    prepare(&f.paths, &values, HOST).unwrap();
+    let mut state: Value = serde_json::from_slice(&fs::read(f.paths.restore_file()).unwrap()).unwrap();
+    state["vrsettings_file"] = json!("Absent");
+    fs::write(f.paths.restore_file(), state.to_string()).unwrap();
+    restore(&f.paths).unwrap();
+    assert!(!file.exists());
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn old_restore_json_still_restores() {
+    let f = fixture("oldjson", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    let values = session_values(&Config::default()).unwrap();
+    prepare(&f.paths, &values, HOST).unwrap();
+    // a restore.json from before vrsettings_file existed: per-key map only
+    let mut state: Value = serde_json::from_slice(&fs::read(f.paths.restore_file()).unwrap()).unwrap();
+    let obj = state.as_object_mut().unwrap();
+    obj.remove("vrsettings_file");
+    obj.insert(
+        "vrsettings".into(),
+        json!({"steamvr/forcedDriver": null, "driver_alvr_server/blocked_by_safe_mode": null}),
+    );
+    fs::write(f.paths.restore_file(), state.to_string()).unwrap();
+
+    restore(&f.paths).unwrap();
+    assert_eq!(Snap::take(&f.paths), before);
+    fs::remove_dir_all(&f.root).ok();
+}

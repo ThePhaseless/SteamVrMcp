@@ -22,8 +22,10 @@ const NO_STREAMER: &str = "ALVR streamer not found; set streamer_dir in config.t
 pub struct RestoreState {
     /// The original `external_drivers` value, written back verbatim (null included).
     pub external_drivers: Value,
-    /// "section/key" -> original (None = absent)
+    /// "section/key" -> original (None = absent). Only an old restore.json has it.
     pub vrsettings: BTreeMap<String, Option<Value>>,
+    /// The whole original steamvr.vrsettings. None in an old restore.json.
+    pub vrsettings_file: Option<FileState>,
     pub session: Option<FileState>,
     pub created_files: Vec<PathBuf>,
     /// Some only if it was wrapped
@@ -113,6 +115,41 @@ pub fn unblock_safe_mode(vrsettings: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Sets each `driver_*` section's `blocked_by_safe_mode` to its value in `snapshot`, which SteamVR
+/// sets on other drivers after a signalled exit. `driver_alvr_server` is left alone unless the
+/// snapshot had it blocked: the next start clears it.
+pub fn reset_safe_mode_blocks(current: &mut Value, snapshot: &Value) {
+    let key = VRSETTINGS_KEYS[1].1;
+    let drivers: BTreeSet<String> = [&*current, snapshot]
+        .into_iter()
+        .flat_map(|v| v.as_object().into_iter().flat_map(|o| o.keys()))
+        .filter(|name| name.starts_with("driver_"))
+        .cloned()
+        .collect();
+    for name in drivers {
+        let original = snapshot.get(&name).and_then(|s| s.get(key)).cloned();
+        if name == VRSETTINGS_KEYS[1].0 && original != Some(json!(true)) {
+            continue;
+        }
+        put(current, &name, key, original);
+    }
+}
+
+/// After a signalled stop: undoes the safe-mode blocks SteamVR added, if restore.json recorded the file.
+pub fn undo_safe_mode_blocks(paths: &Paths) -> Result<()> {
+    let Ok(text) = fs::read_to_string(paths.restore_file()) else { return Ok(()) };
+    let state: RestoreState = serde_json::from_str(&text).context("parsing restore.json")?;
+    let Some(FileState::Contents(original)) = state.vrsettings_file else { return Ok(()) };
+    let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
+    let mut settings = read_json(&path)?;
+    let before = settings.clone();
+    reset_safe_mode_blocks(&mut settings, &serde_json::from_str(&original).context("original steamvr.vrsettings")?);
+    if settings != before {
+        write_json(&path, &settings)?;
+    }
+    Ok(())
+}
+
 fn remove_file(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e).with_context(|| path.display().to_string()),
@@ -149,16 +186,13 @@ pub fn snapshot(paths: &Paths) -> Result<Option<RestoreState>> {
     let session_file = paths.session_file().context(NO_STREAMER)?;
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
     let compositor = paths.vrcompositor().context("SteamVR not found; set steamvr_dir in config.toml")?;
-    let settings = read_json(&vrsettings)?;
     let state = RestoreState {
         external_drivers: alvr_server_io::load_openvr_paths_json()?
             .get("external_drivers")
             .cloned()
             .unwrap_or(Value::Null),
-        vrsettings: VRSETTINGS_KEYS
-            .iter()
-            .map(|(s, k)| (format!("{s}/{k}"), settings.get(s).and_then(|s| s.get(k)).cloned()))
-            .collect(),
+        vrsettings: BTreeMap::new(),
+        vrsettings_file: Some(FileState::Contents(fs::read_to_string(&vrsettings)?)),
         session: Some(match session_file.exists() {
             true => FileState::Contents(fs::read_to_string(&session_file)?),
             false => FileState::Absent,
@@ -244,7 +278,13 @@ pub fn restore(paths: &Paths) -> Result<()> {
         .insert("external_drivers".into(), state.external_drivers.clone());
     alvr_server_io::save_openvr_paths_json(&json)?;
 
-    if !state.vrsettings.is_empty() {
+    if let Some(original) = &state.vrsettings_file {
+        let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
+        match original {
+            FileState::Contents(text) => fs::write(&path, text)?,
+            FileState::Absent => remove_file(&path)?,
+        }
+    } else if !state.vrsettings.is_empty() {
         let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
         let mut settings = read_json(&path)?;
         for (name, original) in &state.vrsettings {
@@ -333,5 +373,32 @@ mod tests {
         assert_eq!(v["driver_alvr_server"]["blocked_by_safe_mode"], false);
         assert!(!unblock_safe_mode(&path).unwrap());
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reset_safe_mode_blocks_follows_snapshot() {
+        let snapshot = json!({
+            "driver_alvr_server": {"blocked_by_safe_mode": false},
+            "driver_a": {"blocked_by_safe_mode": true},
+            "driver_prism": {"keep": 1},
+            "steamvr": {"ipd": 0.063}
+        });
+        let mut current = json!({
+            "driver_alvr_server": {"blocked_by_safe_mode": true},
+            "driver_a": {"blocked_by_safe_mode": false},
+            "driver_gamepad": {"blocked_by_safe_mode": true},
+            "driver_prism": {"blocked_by_safe_mode": true, "keep": 1},
+            "steamvr": {"ipd": 0.07}
+        });
+        reset_safe_mode_blocks(&mut current, &snapshot);
+        assert_eq!(
+            current,
+            json!({
+                "driver_alvr_server": {"blocked_by_safe_mode": true},
+                "driver_a": {"blocked_by_safe_mode": true},
+                "driver_prism": {"keep": 1},
+                "steamvr": {"ipd": 0.07}
+            })
+        );
     }
 }
