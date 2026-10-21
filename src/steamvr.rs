@@ -147,8 +147,10 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
         error!("{e:#}");
     }
     // as in Stack::stop(): ALVR's shutdown hangs on a stream thread spinning on its client's EOF
-    // (sockets/src/stream_socket/tcp.rs:137-147), so escalate to signals
-    if !wait_gone(&["vrserver", "vrmonitor"], Duration::from_secs(30)) {
+    // (sockets/src/stream_socket/tcp.rs:137-147), so escalate to signals. Every SteamVR process
+    // must be gone: a steamtours that outlives vrserver keeps Steam's AppID 250820 running, and
+    // Steam then refuses the relaunch (console_log: WaitingPrevProcess, AppError_16)
+    if !wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
         if !kill_vr_processes() {
             let left: Vec<_> = VR_PROCESS_NAMES.iter().filter(|n| !pids_named(n).is_empty()).collect();
             bail!("SteamVR processes still running after SIGKILL: {left:?}");
