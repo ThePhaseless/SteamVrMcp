@@ -1,10 +1,11 @@
 mod common;
 
 use common::Snap;
-use std::{fs, panic, path::Path, thread, time::Duration};
+use std::{fs, panic, path::Path, sync::{Arc, OnceLock}, thread, time::{Duration, Instant}};
 use vr_test_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
+    headset::Eye,
     setup::{prepare, restore, session_values},
     stack::Stack,
     steamvr,
@@ -157,4 +158,45 @@ fn live_checks_without_config() {
     let configured = startup_checks(&cfg, &Paths::detect(&cfg));
     println!("with config: {configured:#?}");
     assert!(configured.iter().all(|c| c.ok), "{configured:#?}");
+}
+
+/// The shared stack of the live window: starts it when the headset is not streaming and leaves it running.
+fn ensure_streaming() -> Arc<Stack> {
+    static STACK: OnceLock<Arc<Stack>> = OnceLock::new();
+    let stack = STACK.get_or_init(|| {
+        let cfg = Config::load().unwrap();
+        Stack::new(cfg.clone(), Paths::detect(&cfg))
+    });
+    if !stack.status().headset.is_some_and(|h| h.streaming) {
+        stack.start().unwrap();
+    }
+    Arc::clone(stack)
+}
+
+/// Proves the screenshot path (spec "Screenshots" decoder choice) on a real ALVR 21 VAAPI stream;
+/// part of done-when 2. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_screenshot_png() {
+    let s = ensure_streaming();
+    let [view_w, view_h] = s.status().headset.unwrap().view_resolution;
+    let decode = |png: &[u8]| {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+        let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut rgb).unwrap();
+        (info.width, info.height, rgb)
+    };
+    for (eye, width) in [(Eye::Both, 2 * view_w), (Eye::Left, view_w)] {
+        let started = Instant::now();
+        let shot = s.screenshot(eye).unwrap();
+        let took = started.elapsed();
+        println!("{eye:?}: {}x{} in {took:?}, frame at {} ms", shot.width, shot.height, shot.frame_timestamp_ms);
+        assert!(took < Duration::from_secs(3), "{eye:?} took {took:?}");
+        let (w, h, rgb) = decode(&shot.png);
+        assert_eq!((w, h, shot.width, shot.height), (width, view_h, width, view_h), "{eye:?}");
+        let mean = rgb.iter().map(|&b| b as f64).sum::<f64>() / rgb.len() as f64;
+        let stddev = (rgb.iter().map(|&b| (b as f64 - mean).powi(2)).sum::<f64>() / rgb.len() as f64).sqrt();
+        println!("{eye:?}: pixel stddev {stddev:.2}");
+        assert!(stddev > 0.0, "{eye:?} image is uniform");
+    }
 }

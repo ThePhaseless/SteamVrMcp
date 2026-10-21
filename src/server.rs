@@ -1,8 +1,9 @@
-use crate::{checks::{self, Readiness}, stack::Stack};
+use crate::{checks::{self, Readiness}, headset::Eye, stack::Stack};
 use alvr_common::anyhow::{self, Result};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, tool::ToolCallContext},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerConfig, SubscriptionFilter,
@@ -10,7 +11,7 @@ use rmcp::{
     service::{NotificationContext, RequestContext, SubscriptionContext},
     tool, tool_router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Client names of hosts that ignore `notifications/tools/list_changed`. They get every tool
@@ -25,6 +26,14 @@ pub struct VrServer {
 /// The client name: from `initialize` on a legacy connection, from each request's `_meta` on a 2026-07-28 one.
 fn client_name(context: &RequestContext<RoleServer>) -> String {
     context.client_info().map(|c| c.name).unwrap_or_default()
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct ScreenshotArgs {
+    /// Which eye to show; "both" is the side-by-side frame ALVR streams.
+    #[serde(default)]
+    eye: Eye,
 }
 
 /// A tool result with `v` as pretty JSON text.
@@ -62,6 +71,19 @@ impl VrServer {
     #[tool(description = "Shut SteamVR down through ALVR and disconnect the headset. Closes Steam only if vr_start started it.")]
     async fn vr_stop(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.stop()?)).await.map_err(message)
+    }
+
+    #[tool(description = "A PNG screenshot of what the headset streams, from a fresh keyframe: both eyes side by side, or one eye.")]
+    async fn screenshot(&self, Parameters(args): Parameters<ScreenshotArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| {
+            let shot = s.screenshot(args.eye)?;
+            Ok(CallToolResult::success(vec![
+                ContentBlock::image(STANDARD.encode(&shot.png), "image/png"),
+                ContentBlock::text(serde_json::to_string(&shot)?),
+            ]))
+        })
+        .await
+        .map_err(message)
     }
 
     #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs.")]

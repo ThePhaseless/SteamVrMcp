@@ -99,6 +99,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         let lib = dir.join("bin/linux64/libopenvr_api.so");
         unsafe { libloading::Library::new(&lib) }.map(|_| lib.display().to_string()).map_err(|e| e.to_string())
     });
+    let decoder = openh264::decoder::Decoder::new().map(|_| "OpenH264 decoder".to_owned()).map_err(|e| e.to_string());
     let (gpu, vendor) = gpu_verdict(&gpu_vendors(), cfg.steam.env.is_empty());
     let encoder = vendor
         .ok_or_else(|| "no AMD or Intel GPU".to_owned())
@@ -121,6 +122,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         ),
         check("h264_encoder", encoder, "install VA-API drivers with H.264 encoding"),
         check("openvr_client", openvr, "reinstall SteamVR"),
+        check("screenshot_decoder", decoder, "rebuild with the openh264 crate"),
     ]
 }
 
@@ -347,6 +349,7 @@ mod tests {
         let streamer = checks.iter().find(|c| c.name == "alvr_streamer").unwrap();
         assert!(!streamer.ok && streamer.fix.contains("streamer_dir"), "{streamer:?}");
         assert!(checks.iter().all(|c| !c.fix.is_empty()));
+        assert!(checks.iter().find(|c| c.name == "screenshot_decoder").unwrap().ok);
     }
 
     #[test]

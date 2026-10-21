@@ -2,7 +2,7 @@ use crate::{
     alvr_api::{self, Api},
     checks::{self, Check, Readiness},
     config::{Config, Paths},
-    headset::{self, Headset, HeadsetStatus},
+    headset::{self, Eye, Headset, HeadsetStatus, Screenshot},
     setup,
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
@@ -172,6 +172,12 @@ impl Stack {
     pub fn restore(&self) -> Result<()> {
         restore_guard(steamvr::is_steamvr_running())?;
         setup::restore(&self.paths)
+    }
+
+    /// A screenshot of the headset's stream. The wait for the frame runs outside the state lock.
+    pub fn screenshot(&self, eye: Eye) -> Result<Screenshot> {
+        let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
+        grabber.screenshot(&self.api, eye)
     }
 
     fn headset_status(&self) -> Option<HeadsetStatus> {
