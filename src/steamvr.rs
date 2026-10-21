@@ -78,10 +78,11 @@ pub fn wait_gone(names: &[&str], timeout: Duration) -> bool {
     wait_for(timeout, || names.iter().all(|n| pids_named(n).is_empty()))
 }
 
-/// `pid` as kill() takes it, when that names one process: 0 and anything above i32::MAX would
-/// signal a process group or every process.
+/// `pid` as kill() takes it, when that names one process the MCP may signal: 0 and anything above
+/// i32::MAX would signal a process group or every process, and init, this MCP and the leader of its
+/// process group (often the agent that started it) are never signalled.
 pub fn signalable(pid: u32) -> Option<i32> {
-    i32::try_from(pid).ok().filter(|&p| p > 0)
+    i32::try_from(pid).ok().filter(|&p| p > 1 && pid != std::process::id() && p != unsafe { libc::getpgrp() })
 }
 
 /// Sends `sig` to `pid`; does nothing for a pid that is not a single process.
@@ -156,7 +157,7 @@ fn tokens(line: &str) -> Vec<&str> {
 }
 
 /// The first `"key" "value"` pair's value with this key.
-fn vdf_value<'a>(vdf: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn vdf_value<'a>(vdf: &'a str, key: &str) -> Option<&'a str> {
     vdf.lines().find_map(|l| match tokens(l)[..] {
         [k, v] if k == key => Some(v),
         _ => None,
@@ -186,22 +187,26 @@ pub fn libraries(steam_dir: &Path) -> Vec<PathBuf> {
     libs
 }
 
-/// The tool name under CompatToolMapping / `<app_id>` in config.vdf.
-pub fn compat_tool(config_vdf: &str, app_id: u32) -> Option<String> {
-    let id = app_id.to_string();
-    let lines = config_vdf.lines().skip_while(|l| tokens(l) != ["CompatToolMapping"]).skip(1);
-    let (mut depth, mut in_app) = (0, false);
+/// The `key` value in `"<section>" { "<entry>" { "<key>" "value" } }` of a text VDF.
+pub(crate) fn entry_value<'a>(vdf: &'a str, section: &str, entry: &str, key: &str) -> Option<&'a str> {
+    let lines = vdf.lines().skip_while(|l| tokens(l) != [section]).skip(1);
+    let (mut depth, mut in_entry) = (0, false);
     for line in lines {
         match (line.trim(), &tokens(line)[..]) {
             ("{", _) => depth += 1,
             ("}", _) if depth == 1 => return None,
-            ("}", _) => (depth, in_app) = (depth - 1, false),
-            (_, [k]) if depth == 1 => in_app = *k == id,
-            (_, ["name", v]) if depth == 2 && in_app => return Some(v.to_string()),
+            ("}", _) => (depth, in_entry) = (depth - 1, false),
+            (_, [k]) if depth == 1 => in_entry = *k == entry,
+            (_, [k, v]) if depth == 2 && in_entry && *k == key => return Some(v),
             _ => (),
         }
     }
     None
+}
+
+/// The tool name under CompatToolMapping / `<app_id>` in config.vdf; app id 0 is Steam's default.
+pub fn compat_tool(config_vdf: &str, app_id: u32) -> Option<String> {
+    entry_value(config_vdf, "CompatToolMapping", &app_id.to_string(), "name").map(str::to_owned)
 }
 
 /// The (appid, AppName) of each entry in Steam's binary shortcuts.vdf; a truncated file yields what came before.
@@ -511,6 +516,7 @@ mod tests {
         assert_eq!(compat_tool(CONFIG_VDF, 620980).as_deref(), Some("proton_experimental"));
         assert_eq!(compat_tool(CONFIG_VDF, 1), None);
         assert_eq!(compat_tool(CONFIG_VDF, 7), None, "outside CompatToolMapping");
+        assert_eq!(compat_tool(CONFIG_VDF, 0).as_deref(), Some("proton_9"), "Steam's default");
     }
 
     fn fake_steam(name: &str) -> PathBuf {
@@ -624,6 +630,9 @@ mod tests {
         assert_eq!(signalable(i32::MAX as u32 + 1), None, "negative as i32: a process group");
         assert_eq!(signalable(u32::MAX), None, "-1: every process");
         assert_eq!(signalable(4242), Some(4242));
+        assert_eq!(signalable(1), None, "init");
+        assert_eq!(signalable(std::process::id()), None, "this MCP");
+        assert_eq!(signalable(unsafe { libc::getpgrp() } as u32), None, "our group's leader, e.g. the agent that started the MCP");
     }
 
     #[test]

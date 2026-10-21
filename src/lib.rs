@@ -7,6 +7,7 @@ pub mod hand;
 pub mod headset;
 pub mod lease;
 pub mod openvr;
+pub mod proton;
 pub mod rig;
 pub mod server;
 pub mod setup;

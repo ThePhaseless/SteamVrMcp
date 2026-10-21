@@ -7,6 +7,7 @@ use crate::{
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot, Source},
     lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
+    proton,
     rig::{self, AppliedStep, Rig, RigAction, SequenceReport, SequenceStep},
     setup,
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
@@ -26,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use regex::Regex;
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
-    path::Path,
+    collections::{BTreeMap, VecDeque},
+    path::{Path, PathBuf},
     process::Child,
     sync::{Arc, Weak},
     thread,
@@ -128,10 +129,56 @@ pub struct SettingValue {
     pub value: Value,
 }
 
+/// How launch_app starts an app.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum Via {
+    /// steam://rungameid/ through Steam, with the user's Steam launch options.
+    #[default]
+    Steam,
+    /// The app's compatibility tool, run directly with `exe`, `args` and `env`; Steam apps only.
+    Proton,
+}
+
+#[derive(Debug, Default, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LaunchArgs {
+    /// Decimal: a Steam app id (e.g. "620980"), a non-Steam shortcut's 32-bit app id or its 64-bit game id.
+    pub app_id: String,
+    /// "steam" (default) or "proton".
+    #[serde(default)]
+    pub via: Via,
+    /// Proton only, required: the exe relative to the app's install dir, e.g. "Game.exe" or "bin\\Game.exe".
+    pub exe: Option<String>,
+    /// Proton only: the exe's arguments, passed as given (no shell).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Proton only: env vars over the desktop session's, e.g. GPU selection. They cannot change the STEAM_COMPAT_* paths the MCP sets.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// launch_app's argument rules, checked before anything starts.
+pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
+    match a.via {
+        Via::Steam if a.exe.is_some() || !a.args.is_empty() || !a.env.is_empty() => return Err("exe, args and env need via \"proton\"".into()),
+        Via::Proton if a.exe.is_none() => return Err("via \"proton\" needs exe, relative to the app's install dir".into()),
+        _ => (),
+    }
+    match a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
+        Some((k, _)) => Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL")),
+        None => Ok(()),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AppReport {
     pub app: steamvr::AppInfo,
     pub scene_pid: u32,
+    pub via: Via,
+    /// The Proton launcher's stdout and stderr; none via Steam.
+    pub run_log: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -357,6 +404,8 @@ struct State {
     managing: bool,
     /// When and why the last SteamVR restart failed.
     last_restart_error: Option<(Instant, String)>,
+    /// The last `launch_app via proton` run, until stop_app ends it.
+    launched: Option<proton::Launched>,
 }
 
 /// Steam, SteamVR with ALVR, and the headset, plus the dashboard role ALVR expects.
@@ -1045,10 +1094,11 @@ impl Stack {
         Ok(SettingsReport { restarted: restarts > 0, restarts, streaming })
     }
 
-    /// Launches a Steam app or non-Steam shortcut (`id` in decimal) through Steam and returns once
-    /// SteamVR reports a new scene app running.
-    pub fn launch_app(&self, id: &str) -> Result<AppReport> {
-        let id: u64 = id.trim().parse().with_context(|| format!("app_id must be a decimal number, not {id:?}"))?;
+    /// Launches a Steam app or non-Steam shortcut through Steam, or a Steam app through its Proton,
+    /// and returns once SteamVR reports a new scene app running.
+    pub fn launch_app(&self, a: LaunchArgs) -> Result<AppReport> {
+        check_launch(&a).map_err(|e| anyhow!(e))?;
+        let id: u64 = a.app_id.trim().parse().with_context(|| format!("app_id must be a decimal number, not {:?}", a.app_id))?;
         let paths = self.paths();
         let steam = paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
         let app = steamvr::find_app(steam, id)?;
@@ -1057,14 +1107,43 @@ impl Stack {
         // shortcut: relaunching an app that already runs times out, as Steam only focuses it; check its process if that matters
         let before = self.scene_app().map(|a| a.pid);
         let log_from = steamvr::console_log_len(steam);
-        steamvr::launch(&self.cfg(), &format!("steam://rungameid/{}", app.game_id))?;
+        let (mut run_log, mut exited) = (None, None);
+        match a.via {
+            Via::Steam => {
+                steamvr::launch(&self.cfg(), &format!("steam://rungameid/{}", app.game_id))?;
+            }
+            Via::Proton => {
+                // shortcut: no non-Steam shortcuts in proton mode, upgrade by extending parse_shortcuts
+                if app.kind != steamvr::AppKind::Steam {
+                    bail!("via \"proton\" takes Steam apps only; {} is a non-Steam shortcut", app.name);
+                }
+                std::fs::create_dir_all(&app.compatdata).with_context(|| app.compatdata.display().to_string())?;
+                let base = steamvr::steam_env(std::env::vars_os(), &self.cfg().steam.env);
+                let l = proton::plan(steam, &app, a.exe.as_deref().unwrap_or_default(), &a.args, base, &a.env)?;
+                let runs = paths.state_dir.join("runs");
+                steamvr::private_dir(&runs)?;
+                let log = runs.join(format!("{}.log", app.app_id));
+                let launched = proton::spawn(&l, &log)?;
+                exited = Some(launched.exited.clone());
+                self.state.lock().launched = Some(launched);
+                run_log = Some(log);
+            }
+        }
         let timeout = Duration::from_secs(self.cfg().timeouts.app_s);
         let mut scene_pid = 0;
-        let running = steamvr::wait_launched(Some(steam), log_from, timeout, || {
+        let launcher_exited = || exited.as_ref().and_then(|e| *e.lock());
+        let started = || {
             let scene = self.scene_app().filter(|a| a.state == "running" && Some(a.pid) != before);
             scene_pid = game_pid(scene.as_ref(), steamvr::comm).unwrap_or(0);
-            scene_pid != 0
-        })?;
+            scene_pid != 0 || launcher_exited().is_some()
+        };
+        let running = match a.via {
+            Via::Steam => steamvr::wait_launched(Some(steam), log_from, timeout, started)?,
+            Via::Proton => steamvr::wait_for(timeout, started),
+        };
+        if let (0, Some(status), Some(log)) = (scene_pid, launcher_exited(), &run_log) {
+            bail!("{}: the Proton launcher exited with {status} before a VR scene ran; output in {}", app.name, log.display());
+        }
         if !running {
             bail!(
                 "{} ({}) has no running VR scene after {} s; compatibility tool: {}; last vrserver log lines:\n{}",
@@ -1075,22 +1154,20 @@ impl Stack {
                 steamvr::log_tail(steam, "vrserver", 20).join("\n")
             );
         }
-        Ok(AppReport { app, scene_pid })
+        Ok(AppReport { app, scene_pid, via: a.via, run_log })
     }
 
-    /// Stops the scene app: SIGTERM, then SIGKILL after 15 s.
-    // shortcut: kills only the pid SteamVR reports, never by pattern; a Proton game's wine process tree may outlive it, kill the tree if a stray process blocks the next launch
+    /// Stops the app: SIGTERM to the scene pid, to the group launch_app started, and to every
+    /// process with the game's STEAM_COMPAT_DATA_PATH (wine processes leave the group); SIGKILL after 15 s.
     pub fn stop_app(&self) -> Result<Value> {
-        let pid = game_pid(self.scene_app().as_ref(), steamvr::comm).map_err(|e| anyhow!(e))?;
-        let gone = || !std::path::Path::new(&format!("/proc/{pid}")).exists();
-        steamvr::terminate(pid, libc::SIGTERM);
-        if !steamvr::wait_for(Duration::from_secs(15), gone) {
-            steamvr::terminate(pid, libc::SIGKILL);
-            if !steamvr::wait_for(Duration::from_secs(5), gone) {
-                bail!("scene app {pid} still runs 5 s after SIGKILL");
-            }
+        let scene = game_pid(self.scene_app().as_ref(), steamvr::comm).ok();
+        let launched = self.state.lock().launched.clone();
+        let stopped = proton::stop(scene, launched.as_ref())?; // fails only while something still runs: keep tracking it
+        self.state.lock().launched = None;
+        if stopped.is_empty() {
+            bail!("no app running");
         }
-        Ok(serde_json::json!({ "stopped_pid": pid }))
+        Ok(serde_json::json!({ "stopped_pid": scene, "stopped": stopped }))
     }
 
     /// The app's log lines from `since_seq`, after reading what its files gained.
@@ -1350,6 +1427,30 @@ fn supervise(stack: Weak<Stack>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn check_launch_rules() {
+        let a = |via, exe: Option<&str>, args: &[&str], env: &[(&str, &str)]| LaunchArgs {
+            app_id: "1".into(),
+            via,
+            exe: exe.map(Into::into),
+            args: args.iter().map(|&a| a.into()).collect(),
+            env: env.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+        };
+        assert_eq!(check_launch(&a(Via::Steam, None, &[], &[])), Ok(()));
+        for steam in [a(Via::Steam, Some("x.exe"), &[], &[]), a(Via::Steam, None, &["-a"], &[]), a(Via::Steam, None, &[], &[("A", "1")])] {
+            assert!(check_launch(&steam).unwrap_err().contains("need via \"proton\""), "{steam:?}");
+        }
+        assert!(check_launch(&a(Via::Proton, None, &[], &[])).unwrap_err().contains("exe"));
+        for env in [("A=B", "1"), ("", "1"), ("A\0", "1"), ("A", "1\0")] {
+            assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[env])).is_err(), "{env:?}");
+        }
+        assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &[("DRI_PRIME", "1")])), Ok(()));
+        let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1"})).unwrap();
+        assert_eq!((parsed.via, parsed.exe, parsed.args.len(), parsed.env.len()), (Via::Steam, None, 0, 0));
+        let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1", "via": "proton", "exe": "a.exe"})).unwrap();
+        assert_eq!(parsed.via, Via::Proton);
+    }
 
     #[test]
     fn frame_timing_rejects_bad_window() {

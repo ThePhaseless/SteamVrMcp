@@ -7,7 +7,7 @@ use crate::{
         HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, SequenceStep, TouchArgs, TrackpadArgs,
         TriggerArgs,
     },
-    stack::{LogQuery, ReadAppLogArgs, SettingValue, Stack, WaitForLogArgs},
+    stack::{LaunchArgs, LogQuery, ReadAppLogArgs, SettingValue, Stack, WaitForLogArgs},
 };
 use alvr_common::anyhow::{self, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -85,13 +85,6 @@ struct HapticsArgs {
 #[schemars(crate = "rmcp::schemars")]
 struct SettingsArgs {
     values: Vec<SettingValue>,
-}
-
-#[derive(Deserialize, rmcp::schemars::JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-struct LaunchArgs {
-    /// Decimal: a Steam app id (e.g. "620980"), a non-Steam shortcut's 32-bit app id or its 64-bit game id.
-    app_id: String,
 }
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
@@ -372,12 +365,12 @@ impl VrServer {
         self.run(move |s| json(s.wait_for_log(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Launch a Steam app or non-Steam shortcut through Steam after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version) and scene_pid. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines. Can take minutes (up to timeouts.app_s, default 180 s).")]
+    #[tool(description = "Launch an app after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version), scene_pid, via and run_log. via \"steam\" (default) starts a Steam app or non-Steam shortcut through Steam; exe, args and env are refused. via \"proton\" runs a Steam app's compatibility tool directly, as Steam would (the app's tool, else Steam's default; through the Steam Linux Runtime when the tool requires it), with exe (required, relative to the install dir, \\ allowed, must stay inside it), args (passed as given) and env (over the desktop session's, e.g. GPU selection; it cannot change the STEAM_COMPAT_* paths the MCP sets). The user's Steam launch options do not apply in proton mode, and Steam shows no dialogs; the launcher's output goes to run_log, and the call fails at once if the launcher exits first. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines. Can take minutes (up to timeouts.app_s, default 180 s).")]
     async fn launch_app(&self, Parameters(args): Parameters<LaunchArgs>) -> Result<CallToolResult, String> {
-        self.run(move |s| json(s.launch_app(&args.app_id)?)).await.map_err(message)
+        self.run(move |s| json(s.launch_app(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Stop the scene app SteamVR reports: SIGTERM to its pid, SIGKILL after 15 s. Refuses when the scene is SteamVR Home. Returns stopped_pid. A Proton game's other wine processes may outlive it.")]
+    #[tool(description = "Stop the app: SIGTERM to the scene app SteamVR reports (not SteamVR Home), to the process group of a launch_app via \"proton\", and to every process of this user with the game's STEAM_COMPAT_DATA_PATH (its wine processes); SIGKILL after 15 s. Never signals the MCP's own process group or pid 0 or 1. Returns stopped_pid (the scene app's, or null) and stopped (every pid and group signalled).")]
     async fn stop_app(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.stop_app()?)).await.map_err(message)
     }

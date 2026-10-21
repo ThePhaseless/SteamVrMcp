@@ -25,7 +25,7 @@ use vr_test_mcp::{
         PoseArgs, RigAction, SequenceStep, TouchArgs, TrackpadArgs, TriggerArgs,
     },
     setup::{prepare, restore, session_values},
-    stack::{LogQuery, SettingValue, Stack},
+    stack::{LaunchArgs, LogQuery, SettingValue, Stack},
     steamvr,
 };
 
@@ -394,7 +394,7 @@ fn live_beat_saber_menu_fps() {
 fn live_launch_app_reaches_menu() {
     let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
     let s = ensure_streaming();
-    let report = s.launch_app(&id).unwrap();
+    let report = s.launch_app(LaunchArgs { app_id: id.clone(), ..Default::default() }).unwrap();
     println!("{report:?}");
     assert!(report.scene_pid > 0);
     let comm = steamvr::comm(report.scene_pid);
@@ -432,7 +432,7 @@ fn live_swing_with_trigger() {
     };
     let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
     let s = ensure_streaming();
-    let app = s.launch_app(&id).unwrap();
+    let app = s.launch_app(LaunchArgs { app_id: id.clone(), ..Default::default() }).unwrap();
     thread::sleep(Duration::from_secs(15)); // the menu
     let a = rgb(&s.screenshot(Source::Headset, Eye::Left).unwrap().png);
     thread::sleep(Duration::from_secs(1));
