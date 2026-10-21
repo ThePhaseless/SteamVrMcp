@@ -9,6 +9,7 @@ use alvr_common::{
 use libloading::Library;
 use serde::Serialize;
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     ffi::{CStr, CString, c_char},
     fs,
@@ -62,7 +63,7 @@ pub struct Device {
     pub quat: [f32; 4],
     pub linear_velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
-    /// Only for the hmd: whether SteamVR sees it worn.
+    /// Only for the hmd: the last worn (true) or removed (false) event SteamVR sent, None before any.
     pub head_proximity: Option<bool>,
 }
 
@@ -124,6 +125,8 @@ pub struct OpenVr {
     compositor: *const VR_IVRCompositor_FnTable,
     set: VRActionSetHandle_t,
     skeletons: [VRActionHandle_t; 2],
+    // shortcut: whether SteamVR delivers these events to a Background app is unverified live, check once and fall back to None
+    head_proximity: Cell<Option<bool>>,
 }
 
 // SAFETY: the function tables are process-global in vrclient and take no thread-local state
@@ -158,6 +161,7 @@ impl OpenVr {
             compositor: ptr::null(),
             set: 0,
             skeletons: [0; 2],
+            head_proximity: Cell::new(None),
         };
         vr.attach(state_dir)?; // on error, dropping vr shuts the client down
         Ok(vr)
@@ -288,14 +292,7 @@ impl OpenVr {
             quat,
             linear_velocity: p.vVelocity.v,
             angular_velocity: p.vAngularVelocity.v,
-            // the vendored OpenVR has no Prop_UserHeadProximity_Bool; SteamVR derives this activity level from the /proximity input
-            // shortcut: Timeout (worn but still) counts as worn, check live and tighten if SteamVR reports it after removal
-            head_proximity: (class == "hmd").then(|| {
-                matches!(
-                    call!(self.system, GetTrackedDeviceActivityLevel, index),
-                    EDeviceActivityLevel_k_EDeviceActivityLevel_UserInteraction | EDeviceActivityLevel_k_EDeviceActivityLevel_UserInteraction_Timeout
-                )
-            }),
+            head_proximity: if class == "hmd" { self.head_proximity.get() } else { None },
         })
     }
 
@@ -307,6 +304,7 @@ impl OpenVr {
         let mut quit = false;
         while call!(self.system, PollNextEvent, &mut event, size_of::<VREvent_t>() as u32) {
             quit |= event.eventType == EVREventType_VREvent_Quit;
+            self.head_proximity.set(proximity(self.head_proximity.get(), event.eventType, event.trackedDeviceIndex));
         }
         if quit {
             call!(self.system, AcknowledgeQuit_Exiting);
@@ -336,6 +334,15 @@ impl OpenVr {
     }
 }
 
+/// The hmd's worn state after an event; SteamVR derives these from the driver's /proximity input.
+fn proximity(current: Option<bool>, event_type: u32, device: u32) -> Option<bool> {
+    match event_type {
+        EVREventType_VREvent_TrackedDeviceUserInteractionStarted if device == 0 => Some(true),
+        EVREventType_VREvent_TrackedDeviceUserInteractionEnded if device == 0 => Some(false),
+        _ => current,
+    }
+}
+
 impl Drop for OpenVr {
     fn drop(&mut self) {
         if let Ok(shutdown) = unsafe { self.lib.get::<ShutdownFn>(b"VR_ShutdownInternal") } {
@@ -348,6 +355,15 @@ mod tests {
     use super::*;
     use alvr_common::glam::Quat;
     use std::f32::consts::FRAC_PI_2;
+
+    #[test]
+    fn proximity_follows_hmd_events_only() {
+        let (started, ended) = (EVREventType_VREvent_TrackedDeviceUserInteractionStarted, EVREventType_VREvent_TrackedDeviceUserInteractionEnded);
+        assert_eq!(proximity(None, started, 0), Some(true));
+        assert_eq!(proximity(Some(true), ended, 0), Some(false));
+        assert_eq!(proximity(Some(true), ended, 3), Some(true), "not the hmd");
+        assert_eq!(proximity(None, EVREventType_VREvent_Quit, 0), None, "unrelated event");
+    }
 
     #[test]
     fn matrix34_to_pose() {

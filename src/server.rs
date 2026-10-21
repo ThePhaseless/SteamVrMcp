@@ -314,7 +314,7 @@ impl VrServer {
         json(self.stack.recenter()).map_err(message)
     }
 
-    #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows it as the hmd's head_proximity. Limit: after a SteamVR restart the headset is \"on head\" again, so send it again.")]
+    #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows SteamVR's last worn or removed event as the hmd's head_proximity (null before any). Limit: after a SteamVR restart the headset is \"on head\" again, so send it again.")]
     async fn set_proximity(&self, Parameters(args): Parameters<ProximityArgs>) -> Result<CallToolResult, String> {
         self.stack.set_proximity(args.on_head).map_err(message)?;
         json(serde_json::json!({ "ok": true, "on_head": args.on_head })).map_err(message)
