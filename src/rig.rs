@@ -595,6 +595,8 @@ pub struct Rig {
     playspace: Vec2,
     /// Set until the tracking thread sends it.
     playspace_pending: bool,
+    /// What the headset reports as worn at every stream start; here because the rig outlives headsets.
+    pub on_head: bool,
 }
 
 impl Default for Rig {
@@ -614,6 +616,7 @@ impl Rig {
             pending: vec![],
             playspace: Vec2::ONE,
             playspace_pending: false,
+            on_head: true,
         }
     }
 
@@ -780,6 +783,12 @@ mod tests {
 
     fn motion(rig: &mut Rig, now: Instant, id: u64) -> Option<DeviceMotion> {
         rig.tracking(now, Duration::ZERO).device_motions.into_iter().find(|(d, _)| *d == id).map(|(_, m)| m)
+    }
+
+    #[test]
+    fn worn_by_default() {
+        // the rig outlives headsets, so what set_proximity stores here survives a recreated one
+        assert!(Rig::new().on_head);
     }
 
     #[test]

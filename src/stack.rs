@@ -134,6 +134,8 @@ pub struct StatusReport {
     pub steamvr_running: bool,
     pub alvr_version: Option<String>,
     pub headset: Option<HeadsetStatus>,
+    /// The proximity the headset reports at every stream start; true until set_proximity says otherwise.
+    pub on_head: bool,
     /// Only while the OpenVR reader is connected, so vr_status never connects one.
     pub scene_app: Option<openvr::SceneApp>,
     pub warning: Option<&'static str>,
@@ -766,11 +768,15 @@ impl Stack {
     }
 
     /// Tells SteamVR the headset is worn or removed.
-    // shortcut: a SteamVR restart puts the headset "on head" again, keep the value in the rig and resend it at StreamingStarted
     pub fn set_proximity(&self, on_head: bool) -> Result<()> {
         // the reader sees proximity only as events, so connect it before the event is sent
         self.read(|_| Ok(())).ok();
-        self.state.lock().headset.as_ref().context("no headset")?.set_proximity(on_head);
+        let state = self.state.lock();
+        let headset = state.headset.as_ref().context("no headset")?;
+        // rig lock across the send: see the StreamingStarted arm
+        let mut rig = self.rig.lock();
+        rig.on_head = on_head;
+        headset.set_proximity(on_head);
         Ok(())
     }
 
@@ -1174,6 +1180,7 @@ impl Stack {
             steamvr_running: steamvr::is_steamvr_running(),
             alvr_version: self.api().quick_version().ok().map(|v| v.trim().to_owned()),
             headset: self.headset_status(),
+            on_head: self.rig.lock().on_head,
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
             warning: leaked.then_some(LEAKED),
             last_restart_error,
