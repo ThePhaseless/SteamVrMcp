@@ -135,12 +135,12 @@ impl VrServer {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
 
-    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped.")]
+    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s).")]
     async fn vr_start(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.start()?)).await.map_err(message)
     }
 
-    #[tool(description = "Shut SteamVR down through ALVR and disconnect the headset. Closes Steam only if vr_start started it.")]
+    #[tool(description = "Shut SteamVR down through ALVR (with signals if ALVR hangs) and disconnect the headset. Closes Steam only if vr_start started it. Refuses a SteamVR that runs without ALVR. Can take minutes.")]
     async fn vr_stop(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.stop()?)).await.map_err(message)
     }
@@ -287,7 +287,7 @@ impl VrServer {
         json(self.stack.recenter()).map_err(message)
     }
 
-    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: per step at_s, action, applied_s, ok and error, plus total_s.")]
+    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: per step at_s, action, applied_s, ok and error, plus total_s. Can take minutes: it lasts as long as its steps.")]
     async fn run_sequence(&self, Parameters(args): Parameters<SequenceArgs>) -> Result<CallToolResult, String> {
         json(self.stack.run_sequence(args.steps).await.map_err(message)?).map_err(message)
     }
@@ -297,12 +297,12 @@ impl VrServer {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
 
-    #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). A bad path or value fails before any restart.")]
+    #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). A bad path or value fails before any restart. With a restart the call can take minutes.")]
     async fn set_alvr_settings(&self, Parameters(args): Parameters<SettingsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.set_alvr_settings(args.values)?)).await.map_err(message)
     }
 
-    #[tool(description = "How a bare tracked hand appears in SteamVR: \"index\" (ALVR's default; it drives the Index controller and pinches act as buttons) or \"skeletal_tracker\" (a separate full-skeleton hand tracker per hand). Sets ALVR's steamvr_input_2_0 through set_alvr_settings, so SteamVR restarts.")]
+    #[tool(description = "How a bare tracked hand appears in SteamVR: \"index\" (ALVR's default; it drives the Index controller and pinches act as buttons) or \"skeletal_tracker\" (a separate full-skeleton hand tracker per hand). Sets ALVR's steamvr_input_2_0 through set_alvr_settings, so SteamVR restarts and the call can take minutes.")]
     async fn set_hand_tracking_flavour(&self, Parameters(args): Parameters<FlavourArgs>) -> Result<CallToolResult, String> {
         let skeletal = matches!(args.flavour, Flavour::SkeletalTracker);
         self.run(move |s| json(s.set_hand_tracking_flavour(skeletal)?)).await.map_err(message)
@@ -313,7 +313,7 @@ impl VrServer {
         self.run(move |s| json(s.logs(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Launch a Steam app or non-Steam shortcut through Steam after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version) and scene_pid. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines.")]
+    #[tool(description = "Launch a Steam app or non-Steam shortcut through Steam after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version) and scene_pid. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines. Can take minutes (up to timeouts.app_s, default 180 s).")]
     async fn launch_app(&self, Parameters(args): Parameters<LaunchArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.launch_app(&args.app_id)?)).await.map_err(message)
     }
@@ -434,5 +434,14 @@ mod tests {
             .collect();
         want.sort();
         assert_eq!((names.len(), names), (33, want));
+    }
+
+    #[test]
+    fn slow_tools_say_so() {
+        for tool in VrServer::tool_router().list_all() {
+            let slow = ["vr_start", "vr_stop", "set_alvr_settings", "set_hand_tracking_flavour", "launch_app", "run_sequence"];
+            let says = tool.description.as_deref().unwrap_or_default().contains("minutes");
+            assert_eq!(says, slow.contains(&tool.name.as_ref()), "{}", tool.name);
+        }
     }
 }

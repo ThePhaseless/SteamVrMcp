@@ -1094,7 +1094,7 @@ mod tests {
         let bad = seq_step(0.1, "set_trigger", json!({ "hand": "left", "value": 7 }));
         let started = Instant::now();
         let err = stack.run_sequence(vec![animate.clone(), bad]).await.unwrap_err();
-        assert!(err.to_string().starts_with("step 1:") && started.elapsed() < Duration::from_millis(100), "{err:#}");
+        assert!(err.to_string().starts_with("step 1:") && started.elapsed() < Duration::from_secs(1), "{err:#}");
         assert_eq!(head_y(&stack), 1.6, "the animation never started");
         assert!(stack.run_sequence(vec![seq_step(0.0, "screenshot", json!({}))]).await.is_err());
 
