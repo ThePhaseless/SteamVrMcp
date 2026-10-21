@@ -26,9 +26,14 @@ pub fn pids_named(name: &str) -> Vec<u32> {
     dir.flatten()
         .filter_map(|e| {
             let pid = e.file_name().to_str()?.parse().ok()?;
-            (fs::read_to_string(e.path().join("comm")).ok()?.trim_end() == name).then_some(pid)
+            (comm(pid)? == name).then_some(pid)
         })
         .collect()
+}
+
+/// `/proc/<pid>/comm`: the process name.
+pub fn comm(pid: u32) -> Option<String> {
+    Some(fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim_end().to_owned())
 }
 
 pub fn exe_of(pid: u32) -> Option<PathBuf> {
@@ -235,27 +240,38 @@ pub fn console_log_len(steam_dir: &Path) -> u64 {
 
 /// What Steam wrote to its console log after `from`; all of it when the log is now shorter (rotated).
 pub fn console_log_since(steam_dir: &Path, from: u64) -> String {
-    let Ok(bytes) = fs::read(console_log(steam_dir)) else { return String::new() };
-    let from = if (bytes.len() as u64) < from { 0 } else { from as usize };
-    String::from_utf8_lossy(&bytes[from..]).into_owned()
+    use std::io::{Read, Seek, SeekFrom};
+    let mut bytes = vec![];
+    if let Ok(mut file) = fs::File::open(console_log(steam_dir)) {
+        let len = file.metadata().map_or(0, |m| m.len());
+        let from = if len < from { 0 } else { from };
+        file.seek(SeekFrom::Start(from)).and_then(|_| file.read_to_end(&mut bytes)).ok();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// The AppID of a launch Steam holds at a desktop dialog: a ShowInterstitials wait with no
-/// "continues" after it. Steam logs that wait for every launch and continues at once when no dialog shows.
-pub fn pending_interstitial(console_log: &str) -> Option<u32> {
-    let mut pending: Vec<&str> = vec![];
+/// Launch steps at which Steam can wait on a desktop dialog.
+const DIALOG_STEPS: [&str; 2] = ["ShowInterstitials", "ShowLaunchOption"];
+
+/// The AppID and step of a launch Steam holds at a desktop dialog: a wait at a DIALOG_STEPS step with
+/// no "continues" after it. Steam logs a ShowInterstitials wait for every launch and continues at once when no dialog shows.
+pub fn pending_interstitial(console_log: &str) -> Option<(u32, &'static str)> {
+    let mut pending: Vec<(&str, &'static str)> = vec![];
     for line in console_log.lines() {
         let Some((action, rest)) = line.split_once("GameAction [").and_then(|(_, r)| r.split_once(']')) else { continue };
-        if rest.contains("LaunchApp waiting for user response to ShowInterstitials") {
-            pending.push(action);
-        } else if rest.contains("LaunchApp continues with user response \"ShowInterstitials\"") {
-            pending.retain(|a| *a != action);
+        for step in DIALOG_STEPS {
+            if rest.contains(&format!("LaunchApp waiting for user response to {step} ")) {
+                pending.push((action, step));
+            } else if rest.contains(&format!("LaunchApp continues with user response \"{step}\"")) {
+                pending.retain(|p| *p != (action, step));
+            }
         }
     }
-    pending.last()?.strip_prefix("AppID ")?.split(',').next()?.parse().ok()
+    let (action, step) = pending.last()?;
+    Some((action.strip_prefix("AppID ")?.split(',').next()?.parse().ok()?, step))
 }
 
-/// How long a ShowInterstitials wait may last before it counts as a dialog: seen live, Steam continued after up to 5 s.
+/// How long a dialog-step wait may last before it counts as a dialog: seen live, Steam continued after up to 5 s.
 const DIALOG_GRACE: Duration = Duration::from_secs(10);
 
 /// wait_for for a launch through Steam, which fails fast once Steam waits on a desktop dialog
@@ -274,8 +290,8 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, timeout: Duration,
         blocked = pending.filter(|_| started.elapsed() >= DIALOG_GRACE);
         blocked.is_some()
     });
-    if let Some(id) = blocked {
-        bail!("Steam is waiting for a dialog on the desktop (ShowInterstitials for AppID {id}); dismiss it and retry");
+    if let Some((id, step)) = blocked {
+        bail!("Steam is waiting for a dialog on the desktop ({step} for AppID {id}); dismiss it and retry");
     }
     Ok(finished)
 }
@@ -457,7 +473,9 @@ mod tests {
         let waiting = "[2026-10-21 07:04:37] GameAction [AppID 620980, ActionID 70] : LaunchApp waiting for user response to ShowInterstitials \"\"\n";
         let continues = "[2026-10-21 07:04:37] GameAction [AppID 620980, ActionID 70] : LaunchApp continues with user response \"ShowInterstitials\"\n";
         let other = "[2026-10-21 07:04:38] GameAction [AppID 250820, ActionID 71] : LaunchApp waiting for user response to CreatingProcess \"\"\n";
-        assert_eq!(pending_interstitial(waiting), Some(620980));
+        assert_eq!(pending_interstitial(waiting), Some((620980, "ShowInterstitials")));
+        let option = "[2026-10-17 09:17:28] GameAction [AppID 1574820, ActionID 4] : LaunchApp waiting for user response to ShowLaunchOption \"\"\n";
+        assert_eq!(pending_interstitial(&[waiting, continues, option].concat()), Some((1574820, "ShowLaunchOption")));
         assert_eq!(pending_interstitial(&[waiting, continues].concat()), None, "Steam logs every launch's interstitial step, and continues at once");
         assert_eq!(pending_interstitial(other), None);
         assert_eq!(pending_interstitial(""), None);

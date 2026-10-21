@@ -300,6 +300,15 @@ pub struct Stack {
     alvr_logs: Mutex<VecDeque<LogLine>>,
 }
 
+/// The scene app's pid, unless the scene is SteamVR's own (Home runs as steamtours). `comm` names a pid.
+pub fn game_pid(scene: Option<&openvr::SceneApp>, comm: impl Fn(u32) -> Option<String>) -> Result<u32, &'static str> {
+    let pid = scene.map(|a| a.pid).filter(|&pid| pid != 0).ok_or("no scene app is running")?;
+    match comm(pid) {
+        Some(name) if VR_PROCESS_NAMES.contains(&name.as_str()) => Err("no app running (scene is SteamVR Home)"),
+        _ => Ok(pid),
+    }
+}
+
 pub fn restore_guard(steamvr_running: bool) -> Result<()> {
     if steamvr_running {
         bail!("SteamVR is running; run vr_stop first");
@@ -684,8 +693,8 @@ impl Stack {
         let timeout = Duration::from_secs(self.cfg.timeouts.app_s);
         let mut scene_pid = 0;
         let running = steamvr::wait_launched(Some(steam), log_from, timeout, || {
-            let scene = self.scene_app().filter(|a| a.state == "running" && a.pid != 0 && Some(a.pid) != before);
-            scene_pid = scene.map_or(0, |a| a.pid);
+            let scene = self.scene_app().filter(|a| a.state == "running" && Some(a.pid) != before);
+            scene_pid = game_pid(scene.as_ref(), steamvr::comm).unwrap_or(0);
             scene_pid != 0
         })?;
         if !running {
@@ -704,7 +713,7 @@ impl Stack {
     /// Stops the scene app: SIGTERM, then SIGKILL after 15 s.
     // shortcut: kills only the pid SteamVR reports, never by pattern; a Proton game's wine process tree may outlive it, kill the tree if a stray process blocks the next launch
     pub fn stop_app(&self) -> Result<Value> {
-        let pid = self.scene_app().map(|a| a.pid).filter(|&pid| pid != 0).context("no scene app is running")?;
+        let pid = game_pid(self.scene_app().as_ref(), steamvr::comm).map_err(|e| anyhow!(e))?;
         let gone = || !std::path::Path::new(&format!("/proc/{pid}")).exists();
         steamvr::terminate(pid, libc::SIGTERM);
         if !steamvr::wait_for(Duration::from_secs(15), gone) {
@@ -926,6 +935,17 @@ mod tests {
         assert!(!client_stuck(&session, "h"));
         session.client_connections.insert("h".into(), entry(ConnectionState::Disconnecting));
         assert!(client_stuck(&session, "h"));
+    }
+
+    #[test]
+    fn steamvr_home_is_not_the_app() {
+        let scene = |pid| openvr::SceneApp { pid, state: "running".into() };
+        let comm = |pid| Some(if pid == 7 { "steamtours" } else { "Beat Saber.exe" }.to_owned());
+        assert_eq!(game_pid(Some(&scene(9)), comm), Ok(9));
+        assert_eq!(game_pid(Some(&scene(7)), comm), Err("no app running (scene is SteamVR Home)"));
+        assert_eq!(game_pid(Some(&scene(0)), comm), Err("no scene app is running"));
+        assert_eq!(game_pid(None, comm), Err("no scene app is running"));
+        assert_eq!(game_pid(Some(&scene(9)), |_| None), Ok(9), "a pid that just exited is not Home");
     }
 
     #[test]

@@ -287,7 +287,7 @@ impl VrServer {
         self.run(move |s| json(s.launch_app(&args.app_id)?)).await.map_err(message)
     }
 
-    #[tool(description = "Stop the scene app SteamVR reports: SIGTERM to its pid, SIGKILL after 15 s. Returns stopped_pid. A Proton game's other wine processes may outlive it.")]
+    #[tool(description = "Stop the scene app SteamVR reports: SIGTERM to its pid, SIGKILL after 15 s. Refuses when the scene is SteamVR Home. Returns stopped_pid. A Proton game's other wine processes may outlive it.")]
     async fn stop_app(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.stop_app()?)).await.map_err(message)
     }

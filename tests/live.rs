@@ -397,6 +397,8 @@ fn live_launch_app_reaches_menu() {
     let report = s.launch_app(&id).unwrap();
     println!("{report:?}");
     assert!(report.scene_pid > 0);
+    let comm = steamvr::comm(report.scene_pid);
+    assert!(comm.as_deref().is_some_and(|c| !steamvr::VR_PROCESS_NAMES.contains(&c)), "scene pid is SteamVR's own: {comm:?}");
     // Beat Saber is a Windows game; this needs an explicit CompatToolMapping entry, as a shortcut has
     assert!(report.app.compat_tool.is_some(), "no compatibility tool reported: {report:?}");
     thread::sleep(Duration::from_secs(15));
