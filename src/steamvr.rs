@@ -341,20 +341,30 @@ pub fn find_app(steam_dir: &Path, id: u64) -> Result<AppInfo> {
     bail!("no Steam app or non-Steam shortcut with id {id}")
 }
 
-fn console_log(steam_dir: &Path) -> PathBuf {
-    steam_dir.join("logs/console_log.txt")
+fn log_file(steam_dir: &Path, name: &str) -> PathBuf {
+    steam_dir.join("logs").join(format!("{name}.txt"))
 }
 
 /// Where Steam's console log ends now; read from here after a launch.
 pub fn console_log_len(steam_dir: &Path) -> u64 {
-    fs::metadata(console_log(steam_dir)).map_or(0, |m| m.len())
+    log_len(steam_dir, "console_log")
 }
 
 /// What Steam wrote to its console log after `from`; all of it when the log is now shorter (rotated).
 pub fn console_log_since(steam_dir: &Path, from: u64) -> String {
+    log_since(steam_dir, "console_log", from)
+}
+
+/// Where `<steam>/logs/<name>.txt` ends now.
+pub fn log_len(steam_dir: &Path, name: &str) -> u64 {
+    fs::metadata(log_file(steam_dir, name)).map_or(0, |m| m.len())
+}
+
+/// What `<steam>/logs/<name>.txt` got after `from`; all of it when the log is now shorter (rotated).
+pub fn log_since(steam_dir: &Path, name: &str, from: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let mut bytes = vec![];
-    if let Ok(mut file) = fs::File::open(console_log(steam_dir)) {
+    if let Ok(mut file) = fs::File::open(log_file(steam_dir, name)) {
         let len = file.metadata().map_or(0, |m| m.len());
         let from = if len < from { 0 } else { from };
         file.seek(SeekFrom::Start(from)).and_then(|_| file.read_to_end(&mut bytes)).ok();

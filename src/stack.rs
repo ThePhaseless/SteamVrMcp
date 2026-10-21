@@ -51,6 +51,9 @@ const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a cold vr_start waits for vrserver to log ALVR's HMD activation before it resumes the headset.
+const HMD_ACTIVATION_WAIT: Duration = Duration::from_secs(30);
+
 /// Bound on each OpenVR call, connect and disconnect: a stale connection must not hang a tool.
 const OPENVR_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -112,6 +115,7 @@ pub struct StartReport {
     pub view_resolution: [u32; 2],
     pub fps: f32,
     pub codec: Option<String>,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -982,12 +986,15 @@ impl Stack {
         }
         let steamvr_running = steamvr::is_steamvr_running();
         let up = headset_up(steamvr_running);
+        // ClientCoreContext::new writes the client session.json that client_hostname reads, so a client exists first
         if up == HeadsetUp::BeforeLaunch {
-            self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig)));
+            // resume: a failed cold start can leave its client paused
+            self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig))).resume();
         } else {
-            // as in restart_steamvr: a client left from an earlier start stays paused until ALVR answers
+            // as in restart_steamvr: the client stays paused until ALVR's HMD is active
             let taken = self.state.lock().headset.take(); // own statement: the guard must not outlive it
-            if let Some(h) = taken.and_then(|h| self.paused(h)) {
+            let h = taken.unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
+            if let Some(h) = self.paused(h) {
                 self.state.lock().headset.get_or_insert(h);
             }
         }
@@ -1027,6 +1034,7 @@ impl Stack {
         let paths = self.paths();
         let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
+        let vrserver_from = steam_dir.map_or(0, |d| steamvr::log_len(d, "vrserver"));
         let mut handed = None;
         if !steamvr_running {
             report.started_steam = steamvr::launch(&self.cfg(), STEAMVR_URL)?;
@@ -1059,10 +1067,29 @@ impl Stack {
         foreign_alvr_guard(steamvr::is_steamvr_running(), || true, self.api().port)?;
         self.check_version()?;
         if up == HeadsetUp::AfterAlvrAnswers {
-            let mut state = self.state.lock();
-            match &state.headset {
-                Some(h) => h.resume(),
-                None => state.headset = Some(Headset::start(Arc::clone(&self.rig))),
+            // ALVR answers from inside DriverProvider::Init, before Hmd::activate, so wait for vrserver to log the activation
+            let activated = steam_dir.is_some_and(|d| {
+                let deadline = Instant::now() + HMD_ACTIVATION_WAIT;
+                // shortcut: a rotated vrserver.txt that already outgrew the old one's length hides its start, so the wait runs to the deadline; compare inodes if that shows up
+                while !hmd_activated(&steamvr::log_since(d, "vrserver", vrserver_from)) {
+                    if stopped() || Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                true
+            });
+            if !activated && !stopped() {
+                report.notes.push(format!(
+                    "vrserver.txt showed no ALVR HMD activation within {} s; resumed the headset anyway, so it may stream 0 frames",
+                    HMD_ACTIVATION_WAIT.as_secs()
+                ));
+            }
+            let mut state = self.state.lock(); // managing is read under the same lock as the resume, so vr_stop cannot leave a client behind
+            match headset_step(state.managing, state.headset.is_some()) {
+                HeadsetStep::Resume => state.headset.iter().for_each(Headset::resume),
+                HeadsetStep::StartNew => state.headset = Some(Headset::start(Arc::clone(&self.rig))),
+                HeadsetStep::Skip => (),
             }
         }
         let streaming = self.wait_streaming(began, deadline.saturating_duration_since(Instant::now()), 0)?;
@@ -1593,6 +1620,30 @@ fn headset_up(steamvr_running: bool) -> HeadsetUp {
         HeadsetUp::BeforeLaunch
     } else {
         HeadsetUp::AfterAlvrAnswers
+    }
+}
+
+/// Whether `vrserver_log` (vrserver.txt since the launch) shows ALVR's HMD activated: the active HMD
+/// set to alvr_server, then ALVR's driver done adding that device.
+fn hmd_activated(vrserver_log: &str) -> bool {
+    vrserver_log
+        .split_once("Active HMD set to alvr_server")
+        .is_some_and(|(_, after)| after.contains("Driver 'alvr_server' finished adding tracked device"))
+}
+
+/// What vr_start does with the headset client once SteamVR is up.
+#[derive(Debug, PartialEq)]
+enum HeadsetStep {
+    Resume,
+    StartNew,
+    Skip,
+}
+
+fn headset_step(managing: bool, has_client: bool) -> HeadsetStep {
+    match (managing, has_client) {
+        (false, _) => HeadsetStep::Skip,
+        (true, true) => HeadsetStep::Resume,
+        (true, false) => HeadsetStep::StartNew,
     }
 }
 
@@ -2249,6 +2300,24 @@ mod tests {
     fn cold_start_brings_the_headset_up_after_alvr_answers() {
         assert_eq!(headset_up(false), HeadsetUp::AfterAlvrAnswers, "a client listening while vrserver starts races Hmd::activate");
         assert_eq!(headset_up(true), HeadsetUp::BeforeLaunch, "an adopted SteamVR activated its HMD long ago");
+    }
+
+    #[test]
+    fn hmd_activation_needs_the_active_hmd_then_the_added_device() {
+        let active = "Wed Oct 21 2026 20:11:52.675 - Active HMD set to alvr_server.1WMHH000X00000\n";
+        let added = "Wed Oct 21 2026 20:11:52.816 - Driver 'alvr_server' finished adding tracked device with serial number '1WMHH000X00000'\n";
+        assert!(hmd_activated(&format!("x\n{active}y\n{added}")), "activated");
+        assert!(!hmd_activated(""), "nothing logged yet");
+        assert!(!hmd_activated(active), "active HMD set, device not added yet");
+        assert!(!hmd_activated(&format!("{added}{active}")), "the device line must follow the active HMD");
+    }
+
+    #[test]
+    fn headset_comes_up_only_while_managing() {
+        assert_eq!(headset_step(true, true), HeadsetStep::Resume, "the paused client");
+        assert_eq!(headset_step(true, false), HeadsetStep::StartNew, "its pause leaked it, or none was kept");
+        assert_eq!(headset_step(false, true), HeadsetStep::Skip, "vr_stop ended the session; it disposes the client");
+        assert_eq!(headset_step(false, false), HeadsetStep::Skip, "vr_stop took the client; a new one would outlive it");
     }
 
     #[test]
