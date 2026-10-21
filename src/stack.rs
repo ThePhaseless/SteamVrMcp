@@ -980,10 +980,19 @@ impl Stack {
                 }
             }
         }
-        self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig)));
+        let steamvr_running = steamvr::is_steamvr_running();
+        let up = headset_up(steamvr_running);
+        if up == HeadsetUp::BeforeLaunch {
+            self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig)));
+        } else {
+            // as in restart_steamvr: a client left from an earlier start stays paused until ALVR answers
+            let taken = self.state.lock().headset.take(); // own statement: the guard must not outlive it
+            if let Some(h) = taken.and_then(|h| self.paused(h)) {
+                self.state.lock().headset.get_or_insert(h);
+            }
+        }
         let hostname = headset::client_hostname()?;
         let values = setup::session_values(&self.cfg())?;
-        let steamvr_running = steamvr::is_steamvr_running();
         let mut restart_adopted = false;
         if !steamvr_running {
             foreign_alvr_guard(false, || self.api().ping(), self.api().port)?;
@@ -1049,6 +1058,13 @@ impl Stack {
         // a foreign ALVR that came up during the wait answers before ours could
         foreign_alvr_guard(steamvr::is_steamvr_running(), || true, self.api().port)?;
         self.check_version()?;
+        if up == HeadsetUp::AfterAlvrAnswers {
+            let mut state = self.state.lock();
+            match &state.headset {
+                Some(h) => h.resume(),
+                None => state.headset = Some(Headset::start(Arc::clone(&self.rig))),
+            }
+        }
         let streaming = self.wait_streaming(began, deadline.saturating_duration_since(Instant::now()), 0)?;
         let h = self.headset_status().unwrap_or_default();
         if !streaming {
@@ -1451,6 +1467,18 @@ impl Stack {
         self.state.lock().leaked = true;
     }
 
+    /// Pauses a headset taken out of the state; one whose pause does not return in time is leaked.
+    fn paused(&self, headset: Headset) -> Option<Headset> {
+        let paused = within(HEADSET_TIMEOUT, move || {
+            headset.pause();
+            headset
+        });
+        if paused.is_none() {
+            self.mark_leaked();
+        }
+        paused
+    }
+
     /// Restarts SteamVR around the headset, or with a new headset if `fresh_headset`. A failure is
     /// kept for vr_status and for the streaming waits.
     fn restart_steamvr(&self, fresh_headset: bool) -> Result<()> {
@@ -1464,16 +1492,7 @@ impl Stack {
         if fresh_headset && let Some(old) = taken.take() {
             self.dispose(old); // the old client must stop listening on 9943 before the new one starts
         }
-        let headset = taken.and_then(|h| {
-            let paused = within(HEADSET_TIMEOUT, move || {
-                h.pause();
-                h
-            });
-            if paused.is_none() {
-                self.mark_leaked();
-            }
-            paused
-        });
+        let headset = taken.and_then(|h| self.paused(h));
         self.drop_reader();
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
@@ -1558,6 +1577,22 @@ fn watch(stack: Weak<Stack>) {
         }
         drop(s);
         thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// When vr_start brings up the headset client: before it launches SteamVR, or only once ALVR answers.
+#[derive(Debug, PartialEq)]
+enum HeadsetUp {
+    BeforeLaunch,
+    AfterAlvrAnswers,
+}
+
+fn headset_up(steamvr_running: bool) -> HeadsetUp {
+    // a client listening as vrserver starts handshakes during DriverProvider::Init, before Hmd::activate; InitializeStreaming (ALVR alvr_server.cpp) then skips RequestEncoderReset and the encoder stays Idle
+    if steamvr_running {
+        HeadsetUp::BeforeLaunch
+    } else {
+        HeadsetUp::AfterAlvrAnswers
     }
 }
 
@@ -2207,6 +2242,13 @@ mod tests {
         let alvr = vec![alvr_at(base - 1.0, "info", "a"), alvr_at(base + 1.0, "warning", "c")];
         let merged = filter_logs([alvr, steam].concat(), &LogQuery::default()).unwrap();
         assert_eq!(merged.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["a", "b", "continuation", "c", "d"]);
+    }
+
+    // shortcut: pins the decision, not start_inner's wiring of it (that needs SteamVR); add a launch seam if the order regresses again
+    #[test]
+    fn cold_start_brings_the_headset_up_after_alvr_answers() {
+        assert_eq!(headset_up(false), HeadsetUp::AfterAlvrAnswers, "a client listening while vrserver starts races Hmd::activate");
+        assert_eq!(headset_up(true), HeadsetUp::BeforeLaunch, "an adopted SteamVR activated its HMD long ago");
     }
 
     #[test]
