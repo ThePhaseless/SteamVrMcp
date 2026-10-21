@@ -5,6 +5,8 @@ use alvr_common::{
 };
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -305,13 +307,30 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, timeout: Duration,
     Ok(finished)
 }
 
-/// Runs `steam <url>`. Only when Steam is not running yet does it get `steam.env` and `steam.args`,
-/// because a running Steam just forwards the URL. True if this started Steam.
+/// Host variables a desktop Steam needs; the rest of the MCP's environment (API keys and other
+/// secrets of the agent host) never reaches Steam or the games it starts.
+const DESKTOP_ENV: [&str; 12] = [
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "LANG", "LANGUAGE", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS", "PULSE_SERVER",
+];
+
+/// Steam's environment: the desktop-session variables of `host`, then `extra` (steam.env) over them.
+pub fn steam_env(host: impl IntoIterator<Item = (OsString, OsString)>, extra: &BTreeMap<String, String>) -> Vec<(OsString, OsString)> {
+    let desktop = |k: &str| DESKTOP_ENV.contains(&k) || k.starts_with("LC_") || k.starts_with("XDG_");
+    let mut env: BTreeMap<OsString, OsString> = host.into_iter().filter(|(k, _)| k.to_str().is_some_and(desktop)).collect();
+    env.extend(extra.iter().map(|(k, v)| (k.into(), v.into())));
+    env.into_iter().collect()
+}
+
+/// Runs `steam <url>` with only the desktop-session environment. Only when Steam is not running yet
+/// does it get `steam.env` and `steam.args`, because a running Steam just forwards the URL. True if this started Steam.
 pub fn launch(cfg: &Config, url: &str) -> Result<bool> {
     let start_steam = !is_steam_running();
+    let no_extra = BTreeMap::new();
     let mut command = Command::new("steam");
+    command.env_clear().envs(steam_env(std::env::vars_os(), if start_steam { &cfg.steam.env } else { &no_extra }));
     if start_steam {
-        command.envs(&cfg.steam.env).args(&cfg.steam.args);
+        command.args(&cfg.steam.args);
     }
     let mut child = command
         .arg(url)
@@ -527,6 +546,16 @@ mod tests {
         assert!(!is_new_vrserver(&[10], &[]));
         assert!(is_new_vrserver(&[10], &[11]));
         assert!(is_new_vrserver(&[], &[11]));
+    }
+
+    #[test]
+    fn steam_gets_only_desktop_session_env() {
+        let host = [("HOME", "/h"), ("LC_ALL", "C"), ("XDG_RUNTIME_DIR", "/r"), ("DISPLAY", ":0"), ("ANTHROPIC_API_KEY", "secret"), ("GH_TOKEN", "t"), ("PATH", "/bin")]
+            .map(|(k, v)| (k.into(), v.into()));
+        let extra = [("MESA_VK_DEVICE_SELECT".to_owned(), "x!".to_owned()), ("PATH".to_owned(), "/steam".to_owned())].into();
+        let env: BTreeMap<_, _> = steam_env(host, &extra).into_iter().collect();
+        let want = [("DISPLAY", ":0"), ("HOME", "/h"), ("LC_ALL", "C"), ("MESA_VK_DEVICE_SELECT", "x!"), ("PATH", "/steam"), ("XDG_RUNTIME_DIR", "/r")];
+        assert_eq!(env, want.map(|(k, v)| (k.into(), v.into())).into(), "steam.env wins over the host");
     }
 
     #[test]
