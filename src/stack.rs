@@ -959,17 +959,24 @@ impl Stack {
         }
         let mut state = self.state.lock();
         state.started_steam |= started_steam;
-        match restarted.context("SteamVR restart failed") {
-            Ok(()) => {
-                state.restarts += 1;
-                Ok(())
+        record_restart(&mut state, restarted)
+    }
+}
+
+/// Counts a restart that worked and forgets an older failure; keeps one that failed for vr_status
+/// and the streaming waits, unless vr_stop caused it.
+fn record_restart(state: &mut State, restarted: Result<()>) -> Result<()> {
+    match restarted.context("SteamVR restart failed") {
+        Ok(()) => {
+            state.restarts += 1;
+            state.last_restart_error = None;
+            Ok(())
+        }
+        Err(e) => {
+            if state.managing {
+                state.last_restart_error = Some((Instant::now(), format!("{e:#}")));
             }
-            Err(e) => {
-                if state.managing {
-                    state.last_restart_error = Some((Instant::now(), format!("{e:#}")));
-                }
-                Err(e)
-            }
+            Err(e)
         }
     }
 }
@@ -1150,6 +1157,15 @@ mod tests {
             assert!(stack.reload(cfg(7)));
             assert_eq!(stack.cfg().timeouts.streaming_s, 7);
         }
+    }
+
+    #[test]
+    fn a_successful_restart_clears_the_last_failure() {
+        let mut state = State { managing: true, ..Default::default() };
+        assert!(record_restart(&mut state, Err(anyhow!("boom"))).is_err());
+        assert!(state.last_restart_error.as_ref().is_some_and(|(_, e)| e.contains("boom")), "kept for vr_status");
+        record_restart(&mut state, Ok(())).unwrap();
+        assert_eq!((state.last_restart_error.is_none(), state.restarts), (true, 1));
     }
 
     #[test]

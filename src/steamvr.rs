@@ -363,13 +363,13 @@ pub fn log_tail(steam_dir: &Path, name: &str, lines: usize) -> Vec<String> {
 }
 
 /// Creates `dir` (mode 0700) if absent, then requires a real directory owned by this user that no
-/// one else can write: the runtime dir may fall back to the shared temp dir.
+/// one else can write (an older build made it 0755): the runtime dir may fall back to the shared temp dir.
 pub fn private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).with_context(|| dir.display().to_string())?;
     let meta = fs::symlink_metadata(dir).with_context(|| dir.display().to_string())?;
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-        bail!("{} must be a directory of this user with mode 0700, not {:o}; remove it", dir.display(), meta.mode() & 0o7777);
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+        bail!("{} must be a directory of this user that only it can write, not mode {:o}; remove it", dir.display(), meta.mode() & 0o7777);
     }
     Ok(())
 }
@@ -603,7 +603,11 @@ mod tests {
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         private_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(private_dir(&dir).unwrap_err().to_string().contains("755"), "others could swap the link");
+        private_dir(&dir).expect("an older build made it 0755: ours, and no one else can write it");
+        for mode in [0o775, 0o757] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(private_dir(&dir).unwrap_err().to_string().contains(&format!("{mode:o}")), "others could swap the link");
+        }
         symlink(&root, root.join("link")).unwrap();
         assert!(private_dir(&root.join("link")).is_err(), "a symlink is not ours to trust");
         fs::remove_dir_all(&root).ok();
