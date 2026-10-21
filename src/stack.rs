@@ -7,12 +7,14 @@ use crate::{
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
 use alvr_common::{
+    ConnectionState,
     anyhow::{Context, Result, bail},
     error,
     parking_lot::Mutex,
     warn,
 };
 use alvr_events::{Event, EventType};
+use alvr_session::SessionConfig;
 use serde::Serialize;
 use std::{
     process::Child,
@@ -30,6 +32,12 @@ fn is_restart_hud(hud: &str) -> bool {
 }
 
 const WATCHDOG: Duration = Duration::from_secs(30);
+
+/// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
+/// connects only to Disconnected entries (server_core/src/connection.rs:395-405).
+fn client_stuck(session: &SessionConfig, hostname: &str) -> bool {
+    session.client_connections.get(hostname).is_some_and(|c| c.connection_state != ConnectionState::Disconnected)
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct StartReport {
@@ -174,6 +182,7 @@ impl Stack {
         let hostname = headset::client_hostname()?;
         let values = setup::session_values(&self.cfg)?;
         let steamvr_running = steamvr::is_steamvr_running();
+        let mut restart_adopted = false;
         if !steamvr_running {
             report.unblocked_safe_mode = setup::prepare(&self.paths, &values, &hostname)?.unblocked_safe_mode;
         } else if self.api.ping() {
@@ -184,6 +193,8 @@ impl Stack {
                 self.api.post_json("/api/session/client-connections", &(&hostname, action))?;
             }
             report.adopted = true;
+            // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
+            restart_adopted = client_stuck(&self.session()?, &hostname);
         } else {
             bail!("SteamVR is running without the ALVR driver; close SteamVR and retry");
         }
@@ -200,6 +211,9 @@ impl Stack {
         }
 
         self.state.lock().managing = true;
+        if restart_adopted {
+            self.restart_steamvr();
+        }
         let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
         let deadline = Instant::now() + timeout;
         if !steamvr::wait_for(timeout, || self.api.ping()) {
@@ -279,11 +293,27 @@ impl Stack {
     }
 
     /// Replaces the headset with a fresh one, as a new MCP process would connect.
+    /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
     pub fn recreate_headset(&self) {
         let old = self.state.lock().headset.take();
         drop(old); // the old client must stop listening on 9943 before the new one starts
         let new = Headset::start();
         self.state.lock().headset = Some(new);
+        // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
+        self.restart_steamvr();
+    }
+
+    /// The server's session, which ALVR sends as an event in reply to GET /api/session.
+    fn session(&self) -> Result<SessionConfig> {
+        let mut events = self.api.events()?;
+        self.api.get("/api/session")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Some(Event { event_type: EventType::Session(session), .. }) = events.next(Duration::from_millis(500))? {
+                return Ok(*session);
+            }
+        }
+        bail!("ALVR sent no session within 5 s")
     }
 
     fn restart_steamvr(&self) {
@@ -368,8 +398,9 @@ fn supervise(stack: Weak<Stack>) {
             last_hud = s.headset_status().map(|h| h.hud_message).unwrap_or_default();
         } else if quiet_since.is_some_and(|t| t.elapsed() > WATCHDOG) {
             // seen in the spike: an old client stops listening after a restart
-            s.recreate_headset();
-            quiet_since = None;
+            // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
+            s.recreate_headset(); // restarts SteamVR too
+            (events, quiet_since) = (None, None);
         }
     }
 }
@@ -382,6 +413,23 @@ mod tests {
     fn vr_restore_refuses_while_steamvr_runs() {
         assert_eq!(restore_guard(true).unwrap_err().to_string(), "SteamVR is running; run vr_stop first");
         assert!(restore_guard(false).is_ok());
+    }
+
+    #[test]
+    fn adoption_restarts_only_for_a_stuck_entry() {
+        let mut session = alvr_session::SessionConfig::default();
+        assert!(!client_stuck(&session, "h"), "no entry: nothing to unstick");
+        let entry = |state| alvr_session::ClientConnectionConfig {
+            display_name: String::new(),
+            current_ip: None,
+            manual_ips: Default::default(),
+            trusted: true,
+            connection_state: state,
+        };
+        session.client_connections.insert("h".into(), entry(ConnectionState::Disconnected));
+        assert!(!client_stuck(&session, "h"));
+        session.client_connections.insert("h".into(), entry(ConnectionState::Disconnecting));
+        assert!(client_stuck(&session, "h"));
     }
 
     #[test]
