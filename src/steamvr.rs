@@ -27,12 +27,17 @@ pub const VR_PROCESS_NAMES: &[&str] = &[
 /// Every pid in /proc whose real uid is this user's: another user's Steam or SteamVR (a second account) is not ours to see or stop.
 /// The /proc dir owner would hide our non-dumpable file-capability helpers (vrcompositor-launcher), which show as root.
 pub fn all_pids() -> Vec<u32> {
-    let Ok(dir) = fs::read_dir("/proc") else { return vec![] };
-    let me = unsafe { libc::getuid() };
-    dir.flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse().ok())
-        .filter(|pid| fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| real_uid(&s)) == Some(me))
-        .collect()
+    proc_pids().filter(|&pid| ours(pid)).collect()
+}
+
+/// Every pid in /proc, of any user.
+fn proc_pids() -> impl Iterator<Item = u32> {
+    fs::read_dir("/proc").into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok())
+}
+
+/// Whether `pid`'s real uid is this user's; an unreadable status is not ours.
+fn ours(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| real_uid(&s)) == Some(unsafe { libc::getuid() })
 }
 
 /// The real uid: the first field of the `Uid:` line of `/proc/<pid>/status`.
@@ -40,8 +45,15 @@ fn real_uid(status: &str) -> Option<u32> {
     status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse().ok()
 }
 
+// comm before uid: the status read is the costly part, and few pids match the name
 pub fn pids_named(name: &str) -> Vec<u32> {
-    all_pids().into_iter().filter(|&pid| comm(pid).is_some_and(|c| c == name)).collect()
+    proc_pids().filter(|&pid| comm(pid).is_some_and(|c| c == name) && ours(pid)).collect()
+}
+
+/// The `names` (in their order) with a process of this user, from one /proc pass.
+pub fn running<'a>(names: &[&'a str]) -> Vec<&'a str> {
+    let up: Vec<String> = proc_pids().filter_map(|pid| comm(pid).filter(|c| names.contains(&c.as_str()) && ours(pid))).collect();
+    names.iter().copied().filter(|n| up.iter().any(|u| u == n)).collect()
 }
 
 /// `/proc/<pid>/comm`: the process name.
@@ -108,7 +120,7 @@ pub fn wait_for(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
 }
 
 pub fn wait_gone(names: &[&str], timeout: Duration) -> bool {
-    wait_for(timeout, || names.iter().all(|n| pids_named(n).is_empty()))
+    wait_for(timeout, || running(names).is_empty())
 }
 
 /// The first key seen on an earlier poll that is no longer `alive`. `seen` carries the keys across
@@ -125,7 +137,7 @@ pub fn gone_after_seen<K: Copy + PartialEq>(seen: &mut Vec<K>, appeared: impl In
 /// vrserver or vrmonitor once it ran during this wait (`seen`) and is gone: SteamVR quit or crashed.
 pub fn vr_exited(seen: &mut Vec<&'static str>) -> Option<&'static str> {
     // one /proc pass for both names: this runs on every poll of a minutes-long wait
-    let up: Vec<&'static str> = all_pids().into_iter().filter_map(comm).filter_map(|c| ["vrserver", "vrmonitor"].into_iter().find(|n| *n == c)).collect();
+    let up = running(&["vrserver", "vrmonitor"]);
     gone_after_seen(seen, up.iter().copied(), |n| up.contains(&n))
 }
 
@@ -172,7 +184,7 @@ pub fn has_leftovers(alive: &[&str]) -> bool {
 
 /// The VR_PROCESS_NAMES with a running process.
 pub fn alive_vr_processes() -> Vec<&'static str> {
-    VR_PROCESS_NAMES.iter().copied().filter(|n| !pids_named(n).is_empty()).collect()
+    running(VR_PROCESS_NAMES)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -533,7 +545,7 @@ pub fn run_dashboard_child() -> ! {
 pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn() -> bool, started_steam: &mut bool) -> Result<()> {
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
     let old = pids_named("vrserver");
-    // on failure the wait and signals below still stop SteamVR, so it is always relaunched
+    // on failure (also when Api refuses a foreign ALVR) the wait and signals below still stop our SteamVR, so it is always relaunched
     if let Err(e) = api.post("/api/steamvr/restart") {
         error!("{e:#}");
     }
@@ -543,8 +555,7 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
     // Steam then refuses the relaunch (console_log: WaitingPrevProcess, AppError_16)
     if !wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
         if !kill_vr_processes() {
-            let left: Vec<_> = VR_PROCESS_NAMES.iter().filter(|n| !pids_named(n).is_empty()).collect();
-            bail!("SteamVR processes still running after SIGKILL: {left:?} (deadline {} s)", KILL_WAIT.as_secs());
+            bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", alive_vr_processes(), KILL_WAIT.as_secs());
         }
     }
     // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
@@ -592,9 +603,20 @@ mod tests {
     fn all_pids_lists_only_this_users_processes() {
         let pids = all_pids();
         assert!(pids.contains(&std::process::id()));
-        if unsafe { libc::getuid() } != 0 {
-            assert!(!pids.contains(&1), "pid 1 belongs to root, another user's Steam or SteamVR must not count");
+        let me = unsafe { libc::getuid() };
+        for pid in pids {
+            // a pid that exited since the scan has no status left
+            if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+                assert_eq!(real_uid(&status), Some(me), "pid {pid}: another user's Steam or SteamVR must not count");
+            }
         }
+    }
+
+    #[test]
+    fn running_scans_proc_once_for_all_names() {
+        let me = comm(std::process::id()).unwrap();
+        assert_eq!(running(&["no-such-process", me.as_str()]), vec![me.as_str()]);
+        assert!(running(&["no-such-process"]).is_empty());
     }
 
     #[test]

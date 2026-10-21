@@ -38,6 +38,7 @@ impl Api {
 
     // shortcut: no chunked decoding; axum answers these routes with Content-Length, switch to a client crate if a route streams
     fn request(&self, method: &str, path: &str, body: Option<&str>, timeout: Duration) -> Result<String> {
+        refuse_foreign(method, self.port, crate::steamvr::vrserver_has_alvr)?;
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
         let mut stream = TcpStream::connect_timeout(&addr, timeout.min(Duration::from_secs(1)))
             .with_context(|| format!("ALVR API not reachable on port {}", self.port))?;
@@ -113,6 +114,16 @@ impl EventStream {
             }
         }
     }
+}
+
+/// Refuses a mutating call unless this user's vrserver hosts ALVR (`ours`): another user's SteamVR
+/// can hold the port, and a POST would restart, shut down or reconfigure it.
+// shortcut: point-in-time; a foreign ALVR holding the port while ours failed to bind still passes, check the server pid if that shows up
+fn refuse_foreign(method: &str, port: u16, ours: impl FnOnce() -> bool) -> Result<()> {
+    if method != "GET" && !ours() {
+        bail!("not ours: the ALVR on port {port} does not belong to this user's SteamVR");
+    }
+    Ok(())
 }
 
 pub fn build_request(method: &str, path: &str, body: Option<&str>) -> String {
@@ -210,6 +221,16 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(api.events().is_err());
         assert!(started.elapsed() < HANDSHAKE + Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn only_our_alvr_takes_posts() {
+        assert_eq!(
+            refuse_foreign("POST", 8082, || false).unwrap_err().to_string(),
+            "not ours: the ALVR on port 8082 does not belong to this user's SteamVR"
+        );
+        assert!(refuse_foreign("POST", 8082, || true).is_ok());
+        assert!(refuse_foreign("GET", 8082, || panic!("reads go to any ALVR")).is_ok());
     }
 
     #[test]

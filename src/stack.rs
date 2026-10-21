@@ -995,7 +995,7 @@ impl Stack {
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
             setup::undo_safe_mode_blocks(&self.paths())?;
             report.unblocked_safe_mode = setup::prepare(&self.paths(), &values, &hostname)?.unblocked_safe_mode;
-        } else if self.api().ping() {
+        } else if steamvr::vrserver_has_alvr() && self.api().ping() {
             self.check_version()?;
             setup::snapshot(&self.paths())?;
             self.api().post_json("/api/session/values", &values)?;
@@ -1079,8 +1079,7 @@ impl Stack {
         if let Some(h) = headset {
             self.dispose(h);
         }
-        // only our vrserver hosts our ALVR: an answer on the port otherwise is another user's, never shut down
-        if steamvr::vrserver_has_alvr() && self.api().ping() {
+        if self.api().ping() {
             // on failure the signals below still stop SteamVR
             self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
