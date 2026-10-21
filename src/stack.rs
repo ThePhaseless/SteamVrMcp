@@ -648,9 +648,11 @@ impl Stack {
         let paths = self.paths();
         let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
+        let mut handed = None;
         if !steamvr_running {
             report.started_steam = steamvr::launch(&self.cfg(), STEAMVR_URL)?;
             self.state.lock().started_steam |= report.started_steam;
+            handed = (!report.started_steam).then_some(STEAMVR_URL);
         }
 
         self.state.lock().managing = true;
@@ -660,7 +662,7 @@ impl Stack {
         let timeout = Duration::from_secs(self.cfg().timeouts.streaming_s);
         let deadline = Instant::now() + timeout;
         let stopped = || !self.state.lock().managing;
-        if !steamvr::wait_launched(steam_dir, log_from, timeout, || stopped() || self.api().ping())? {
+        if !steamvr::wait_launched(steam_dir, log_from, handed, timeout, || stopped() || self.api().ping())? {
             bail!("ALVR server did not answer on port {} within {} s", self.api().port, timeout.as_secs());
         }
         if stopped() {
@@ -835,10 +837,11 @@ impl Stack {
         // shortcut: relaunching an app that already runs times out, as Steam only focuses it; check its process if that matters
         let before = self.scene_app().map(|a| a.pid);
         let log_from = steamvr::console_log_len(steam);
-        steamvr::launch(&self.cfg(), &format!("steam://rungameid/{}", app.game_id))?;
+        let url = format!("steam://rungameid/{}", app.game_id);
+        let started = steamvr::launch(&self.cfg(), &url)?;
         let timeout = Duration::from_secs(self.cfg().timeouts.app_s);
         let mut scene_pid = 0;
-        let running = steamvr::wait_launched(Some(steam), log_from, timeout, || {
+        let running = steamvr::wait_launched(Some(steam), log_from, (!started).then_some(url.as_str()), timeout, || {
             let scene = self.scene_app().filter(|a| a.state == "running" && Some(a.pid) != before);
             scene_pid = game_pid(scene.as_ref(), steamvr::comm).unwrap_or(0);
             scene_pid != 0
