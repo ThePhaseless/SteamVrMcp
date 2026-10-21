@@ -1,6 +1,7 @@
 //! The virtual body: head and controller poses, moves and animations, sampled by the headset's
 //! tracking thread. Poses are SteamVR standing space (the default session recenters in Stage).
 
+use crate::hand::{self, Curls, Gesture};
 use alvr_common::{
     DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose,
     glam::{EulerRot, Quat, Vec3, Vec4},
@@ -135,6 +136,53 @@ impl ControllerStateArgs {
     }
 }
 
+/// Holding a controller, or a bare tracked hand.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum HandMode {
+    #[default]
+    Controller,
+    Hand,
+}
+
+/// Each 0 (straight) to 1 (curled); splay 0 (together) to 1 (spread). An unset finger keeps its value.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct FingerCurlArgs {
+    pub hand: Hand,
+    pub thumb: Option<f32>,
+    pub index: Option<f32>,
+    pub middle: Option<f32>,
+    pub ring: Option<f32>,
+    pub pinky: Option<f32>,
+    pub splay: Option<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct HandModeArgs {
+    pub hand: Hand,
+    pub mode: HandMode,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct HandSkeletonArgs {
+    pub hand: Hand,
+    /// 26 joints in OpenXR XR_EXT_hand_tracking order, in the playspace: px, py, pz, qx, qy, qz, qw.
+    pub joints: Vec<[f32; 7]>,
+}
+
+/// Exactly one of `gesture` or `curls` (custom curls).
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct HandGestureArgs {
+    pub hand: Hand,
+    pub gesture: Option<Gesture>,
+    pub curls: Option<Curls>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "action", content = "args", rename_all = "snake_case")]
 pub enum RigAction {
@@ -145,6 +193,10 @@ pub enum RigAction {
     MoveController(MoveControllerArgs),
     AnimateController(AnimateControllerArgs),
     SetControllerState(ControllerStateArgs),
+    SetFingerCurl(FingerCurlArgs),
+    SetHandMode(HandModeArgs),
+    SetHandSkeleton(HandSkeletonArgs),
+    SetHandGesture(HandGestureArgs),
 }
 
 impl PoseArgs {
@@ -279,11 +331,22 @@ impl Body {
     }
 }
 
+/// What a hand sends besides its pose.
+#[derive(Default)]
+struct HandState {
+    mode: HandMode,
+    /// Set by the last curl or gesture call; kept under a raw skeleton for the next partial curl call.
+    curls: Option<Curls>,
+    /// Joints in the playspace from `set_hand_skeleton`, until the next curl or gesture call.
+    raw: Option<[Pose; 26]>,
+}
+
 pub struct Rig {
     head: Body,
-    /// left, right
+    /// left, right; a bare hand's palm follows its controller's pose too
     controllers: [Body; 2],
     active: [bool; 2],
+    hands: [HandState; 2],
 }
 
 impl Default for Rig {
@@ -298,6 +361,7 @@ impl Rig {
             head: Body::at(Vec3::new(0.0, 1.6, 0.0)),
             controllers: [Body::at(Vec3::new(-0.2, 1.2, -0.3)), Body::at(Vec3::new(0.2, 1.2, -0.3))],
             active: [true; 2],
+            hands: Default::default(),
         }
     }
 
@@ -327,19 +391,66 @@ impl Rig {
             RigAction::SetControllerState(c) => {
                 self.active[c.hand as usize] = c.active().ok_or("give connected or tracked")?;
             }
+            RigAction::SetFingerCurl(a) => {
+                let h = &mut self.hands[a.hand as usize];
+                let mut c = h.curls.unwrap_or_default();
+                let fields = [(&mut c.thumb, a.thumb), (&mut c.index, a.index), (&mut c.middle, a.middle)]
+                    .into_iter()
+                    .chain([(&mut c.ring, a.ring), (&mut c.pinky, a.pinky), (&mut c.splay, a.splay)]);
+                for (v, set) in fields {
+                    *v = set.unwrap_or(*v);
+                }
+                c.check()?;
+                (h.curls, h.raw) = (Some(c), None);
+            }
+            RigAction::SetHandMode(a) => self.hands[a.hand as usize].mode = a.mode,
+            RigAction::SetHandSkeleton(a) => {
+                if a.joints.len() != 26 {
+                    return Err("joints must have 26 entries".into());
+                }
+                let pose = |(i, j): (usize, &[f32; 7])| {
+                    let args = PoseArgs { position: [j[0], j[1], j[2]], quat: Some([j[3], j[4], j[5], j[6]]), ..Default::default() };
+                    args.to_pose().map_err(|e| format!("joint {i}: {e}"))
+                };
+                let joints = a.joints.iter().enumerate().map(pose).collect::<Result<Vec<_>, _>>()?;
+                self.hands[a.hand as usize].raw = Some(joints.try_into().unwrap());
+            }
+            RigAction::SetHandGesture(a) => {
+                let c = match (a.gesture, a.curls) {
+                    (Some(g), None) => hand::gesture_curls(g),
+                    (None, Some(c)) => c,
+                    _ => return Err("give exactly one of gesture or curls".into()),
+                };
+                c.check()?;
+                let h = &mut self.hands[a.hand as usize];
+                (h.curls, h.raw) = (Some(c), None);
+            }
         }
         Ok(Duration::ZERO)
     }
 
-    /// The head plus each active controller at `now`.
+    /// The head plus each active hand at `now`: a controller pose, its skeleton once curls or
+    /// joints were set, or for a bare hand only a skeleton (ALVR picks the device from what the
+    /// packet holds, server_openvr/src/lib.rs:403-434). Both go out in this one packet, so they share
+    /// the poll_timestamp ALVR pairs them on (server_core/src/tracking/mod.rs:250-258).
     pub fn tracking(&mut self, now: Instant, poll_timestamp: Duration) -> TrackingData {
         let mut device_motions = vec![(*HEAD_ID, self.head.motion(now))];
+        let mut hand_skeletons = [None, None];
         for hand in [Hand::Left, Hand::Right] {
-            if self.active[hand as usize] {
-                device_motions.push((hand.device_id(), self.controllers[hand as usize].motion(now)));
+            let i = hand as usize;
+            if !self.active[i] {
+                continue;
             }
+            let (motion, h) = (self.controllers[i].motion(now), &self.hands[i]);
+            if h.mode == HandMode::Controller {
+                device_motions.push((hand.device_id(), motion));
+            }
+            // without a skeleton ALVR derives a controller's curls from trigger and grip
+            let curls = h.curls.or((h.mode == HandMode::Hand).then(Curls::default));
+            // shortcut: no grip-to-palm offset; add one if apps show the hand off the controller
+            hand_skeletons[i] = h.raw.or_else(|| curls.map(|c| hand::skeleton(hand, motion.pose, &c)));
         }
-        TrackingData { poll_timestamp, device_motions, hand_skeletons: [None, None], face: FaceData::default(), body: None }
+        TrackingData { poll_timestamp, device_motions, hand_skeletons, face: FaceData::default(), body: None }
     }
 }
 
@@ -469,6 +580,91 @@ mod tests {
         assert!(matches!(data.hand_skeletons, [None, None]) && data.body.is_none());
     }
 
+    fn finger_curl(hand: Hand) -> FingerCurlArgs {
+        FingerCurlArgs { hand, thumb: None, index: None, middle: None, ring: None, pinky: None, splay: None }
+    }
+
+    #[test]
+    fn curl_args_reject_out_of_range() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        for bad in [1.2, -0.1, f32::NAN] {
+            let args = FingerCurlArgs { index: Some(bad), ..finger_curl(Hand::Right) };
+            assert!(rig.apply(RigAction::SetFingerCurl(args), now).is_err(), "{bad}");
+        }
+        assert!(rig.tracking(now, Duration::ZERO).hand_skeletons[1].is_none(), "a rejected call changes nothing");
+        let args = FingerCurlArgs { index: Some(1.0), splay: Some(0.0), ..finger_curl(Hand::Right) };
+        assert!(rig.apply(RigAction::SetFingerCurl(args), now).is_ok());
+    }
+
+    #[test]
+    fn finger_curl_keeps_unset_fingers() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        let palm = motion(&mut rig, now, *HAND_RIGHT_ID).unwrap().pose;
+        rig.apply(RigAction::SetFingerCurl(FingerCurlArgs { index: Some(1.0), ..finger_curl(Hand::Right) }), now).unwrap();
+        rig.apply(RigAction::SetFingerCurl(FingerCurlArgs { ring: Some(0.5), ..finger_curl(Hand::Right) }), now).unwrap();
+        let want = hand::skeleton(Hand::Right, palm, &Curls { index: 1.0, ring: 0.5, ..Default::default() });
+        let got = rig.tracking(now, Duration::ZERO).hand_skeletons[1].unwrap();
+        assert!(got.iter().zip(&want).all(|(g, w)| g.position.abs_diff_eq(w.position, 1e-6)));
+    }
+
+    #[test]
+    fn skeleton_rides_with_controller_pose() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        assert!(rig.tracking(now, Duration::ZERO).hand_skeletons[1].is_none(), "no skeleton before curls are set");
+        rig.apply(RigAction::SetFingerCurl(FingerCurlArgs { index: Some(1.0), ..finger_curl(Hand::Right) }), now).unwrap();
+        let data = rig.tracking(now, Duration::from_millis(5));
+        let pose = data.device_motions.iter().find(|(d, _)| *d == *HAND_RIGHT_ID).expect("controller motion").1.pose;
+        let joints = data.hand_skeletons[1].expect("skeleton");
+        assert!(joints[0].position.abs_diff_eq(pose.position, 1e-6), "palm at the controller pose");
+        assert!(data.hand_skeletons[0].is_none(), "the left hand had no curls set");
+    }
+
+    #[test]
+    fn bare_hand_sends_skeleton_only() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        rig.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Right, mode: HandMode::Hand }), now).unwrap();
+        let data = rig.tracking(now, Duration::ZERO);
+        assert!(!data.device_motions.iter().any(|(d, _)| *d == *HAND_RIGHT_ID), "{:?}", data.device_motions);
+        assert!(data.device_motions.iter().any(|(d, _)| *d == *HAND_LEFT_ID));
+        let open = hand::skeleton(Hand::Right, Pose { orientation: Quat::IDENTITY, position: Vec3::new(0.2, 1.2, -0.3) }, &Curls::default());
+        let joints = data.hand_skeletons[1].expect("an open hand by default");
+        assert!(joints[10].position.abs_diff_eq(open[10].position, 1e-6));
+        rig.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Right, mode: HandMode::Controller }), now).unwrap();
+        let data = rig.tracking(now, Duration::ZERO);
+        assert!(data.device_motions.iter().any(|(d, _)| *d == *HAND_RIGHT_ID) && data.hand_skeletons[1].is_none());
+    }
+
+    #[test]
+    fn hand_skeleton_needs_26_joints() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        let joint = |i: usize| [0.0, 1.0, -(i as f32) * 0.01, 0.0, 0.0, 0.0, 1.0];
+        let args = |n: usize| RigAction::SetHandSkeleton(HandSkeletonArgs { hand: Hand::Left, joints: (0..n).map(joint).collect() });
+        assert_eq!(rig.apply(args(25), now).unwrap_err(), "joints must have 26 entries");
+        let mut bad = HandSkeletonArgs { hand: Hand::Left, joints: (0..26).map(joint).collect() };
+        bad.joints[3][6] = f32::NAN;
+        assert!(rig.apply(RigAction::SetHandSkeleton(bad), now).is_err());
+        rig.apply(args(26), now).unwrap();
+        let joints = rig.tracking(now, Duration::ZERO).hand_skeletons[0].expect("raw skeleton");
+        assert_eq!(joints[25].position, Vec3::new(0.0, 1.0, -0.25));
+        // the next curl call goes back to the hand model
+        rig.apply(RigAction::SetFingerCurl(finger_curl(Hand::Left)), now).unwrap();
+        let joints = rig.tracking(now, Duration::ZERO).hand_skeletons[0].unwrap();
+        assert_ne!(joints[25].position, Vec3::new(0.0, 1.0, -0.25));
+    }
+
+    #[test]
+    fn hand_gesture_requires_exactly_one() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        let args = |gesture, curls| RigAction::SetHandGesture(HandGestureArgs { hand: Hand::Right, gesture, curls });
+        assert!(rig.apply(args(None, None), now).is_err());
+        assert!(rig.apply(args(Some(Gesture::Fist), Some(Curls::default())), now).is_err());
+        assert!(rig.apply(args(None, Some(Curls { index: 2.0, ..Default::default() })), now).is_err(), "custom curls are checked");
+        assert!(rig.tracking(now, Duration::ZERO).hand_skeletons[1].is_none(), "rejected calls change nothing");
+        rig.apply(args(Some(Gesture::Fist), None), now).unwrap();
+        assert!(rig.tracking(now, Duration::ZERO).hand_skeletons[1].is_some());
+        rig.apply(args(None, Some(Curls { index: 0.5, ..Default::default() })), now).unwrap();
+    }
+
     #[test]
     fn rig_action_json_shape() {
         let a: RigAction = serde_json::from_str(
@@ -478,5 +674,10 @@ mod tests {
         assert!(matches!(a, RigAction::SetControllerPose(ControllerPoseArgs { hand: Hand::Left, relative_to: RelativeTo::Head, .. })));
         let a: RigAction = serde_json::from_str(r#"{"action":"move_controller","args":{"hand":"right","yaw":5}}"#).unwrap();
         assert!(matches!(a, RigAction::MoveController(MoveControllerArgs { mv: MoveArgs { frame: Frame::Playspace, .. }, .. })));
+        let a: RigAction =
+            serde_json::from_str(r#"{"action":"set_hand_gesture","args":{"hand":"left","gesture":"thumbs_up"}}"#).unwrap();
+        assert!(matches!(a, RigAction::SetHandGesture(HandGestureArgs { gesture: Some(Gesture::ThumbsUp), curls: None, .. })));
+        let a: RigAction = serde_json::from_str(r#"{"action":"set_hand_gesture","args":{"hand":"left","curls":{"index":0.5}}}"#).unwrap();
+        assert!(matches!(a, RigAction::SetHandGesture(HandGestureArgs { curls: Some(Curls { index: 0.5, thumb: 0.0, .. }), .. })));
     }
 }

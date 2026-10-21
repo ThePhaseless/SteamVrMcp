@@ -7,7 +7,7 @@ use vr_test_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
     headset::Eye,
-    rig::{AnimateArgs, PoseArgs, RigAction},
+    rig::{AnimateArgs, FingerCurlArgs, Hand, PoseArgs, RigAction},
     setup::{prepare, restore, session_values},
     stack::Stack,
     steamvr,
@@ -282,6 +282,54 @@ fn live_head_move_tracked() {
     thread::sleep(done_after.saturating_sub(started.elapsed()) + Duration::from_millis(300));
     let d = hmd();
     assert!(Vec3::from_array(d.position).distance(Vec3::new(0.3, 1.6, 0.0)) < 0.01, "{d:?}");
+}
+
+/// Proves early risk 2 and done-when 5: Index finger curls, sent as a hand-model skeleton with the
+/// controller pose, show in SteamVR's skeleton per finger independently, for both hands; index to
+/// pinky also as ALVR's /input/finger/* components (device_curls). Needs Steam closed or its GPU
+/// supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_finger_curls_per_finger() {
+    let s = ensure_streaming();
+    /// One finger at 1, the rest at 0; None opens the hand.
+    fn curl(s: &Stack, hand: Hand, f: Option<usize>) -> Result<Duration, impl std::fmt::Debug> {
+        let v = |k| Some(if f == Some(k) { 1.0 } else { 0.0 });
+        let args = FingerCurlArgs { hand, thumb: v(0), index: v(1), middle: v(2), ring: v(3), pinky: v(4), splay: Some(0.0) };
+        s.apply(RigAction::SetFingerCurl(args))
+    }
+    // later tests in this process expect open hands, also after a failed assertion
+    struct Reset(Arc<Stack>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            curl(&self.0, Hand::Left, None).ok();
+            curl(&self.0, Hand::Right, None).ok();
+        }
+    }
+    let _reset = Reset(Arc::clone(&s));
+
+    let mut failures = vec![];
+    for (hand, name) in [(Hand::Left, "left"), (Hand::Right, "right")] {
+        for f in 0..5 {
+            curl(&s, hand, Some(f)).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let state = s.tracked_state(false).unwrap();
+            let sk = &state.skeletons[name];
+            println!("{name} finger {f} at 1: active {} curls {:?} device_curls {:?}", sk.active, sk.curls, sk.device_curls);
+            let follows = |k: usize, v: f32| if k == f { v >= 0.7 } else { v <= 0.3 };
+            if !sk.active {
+                failures.push(format!("{name} finger {f}: skeleton action inactive"));
+            }
+            if let Some(k) = (0..5).find(|&k| !follows(k, sk.curls[k])) {
+                failures.push(format!("{name} finger {f}: SteamVR curl {k} is {}: {:?}", sk.curls[k], sk.curls));
+            }
+            // ALVR sends index to pinky only, no thumb component (Controller.cpp:329-340)
+            if let Some(k) = (1..5).find(|&k| !follows(k, sk.device_curls[k])) {
+                failures.push(format!("{name} finger {f}: device curl {k} is {}: {:?}", sk.device_curls[k], sk.device_curls));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// Proves early risk 5 (Beat Saber runs on the integrated GPU at the MCP's default resolution). Needs env

@@ -1,7 +1,10 @@
 use crate::{
     checks::{self, Readiness},
     headset::Eye,
-    rig::{AnimateArgs, AnimateControllerArgs, ControllerPoseArgs, ControllerStateArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction},
+    rig::{
+        AnimateArgs, AnimateControllerArgs, ControllerPoseArgs, ControllerStateArgs, FingerCurlArgs, HandGestureArgs, HandModeArgs,
+        HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction,
+    },
     stack::Stack,
 };
 use alvr_common::anyhow::{self, Result};
@@ -161,6 +164,26 @@ impl VrServer {
             "note": "ALVR 21 sets connected and tracked from one flag per hand (Controller.cpp:187-205)",
         }))
         .map_err(message)
+    }
+
+    #[tool(description = "Curl the thumb, index, middle, ring and pinky fingers (0 straight to 1 curled) and set the splay (0 together to 1 spread); an unset value keeps its last value. The hand model turns them into a 26-joint skeleton sent with the controller pose. SteamVR gets index to pinky also as /input/finger/* and the thumb through the skeleton only.")]
+    async fn set_finger_curl(&self, Parameters(args): Parameters<FingerCurlArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetFingerCurl(args)).await
+    }
+
+    #[tool(description = "Per hand: hold a Valve Index controller (\"controller\") or be a bare tracked hand (\"hand\"), which sends only a skeleton, open unless set. With ALVR's default Index flavour a bare hand drives the Index controller device, and ALVR's gesture mapping turns pinches into buttons. Immediate.")]
+    async fn set_hand_mode(&self, Parameters(args): Parameters<HandModeArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetHandMode(args)).await
+    }
+
+    #[tool(description = "Send raw hand joints: 26 entries in OpenXR XR_EXT_hand_tracking order (palm, wrist, thumb metacarpal..tip, index..little metacarpal..tip), each px, py, pz in meters in the playspace and qx, qy, qz, qw (-Z along the bone toward the tip, +Y the back of the hand). Holds until the next curl or gesture call.")]
+    async fn set_hand_skeleton(&self, Parameters(args): Parameters<HandSkeletonArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetHandSkeleton(args)).await
+    }
+
+    #[tool(description = "Pose a hand through the hand model: give either gesture (open, fist, point, pinch, thumbs_up) or custom curls (thumb, index, middle, ring, pinky, splay, each 0 to 1, unset 0), not both. A bare hand's pinch meets ALVR's pinch distance, so it acts as the trigger.")]
+    async fn set_hand_gesture(&self, Parameters(args): Parameters<HandGestureArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetHandGesture(args)).await
     }
 
     #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs.")]

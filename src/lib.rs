@@ -1,6 +1,7 @@
 pub mod alvr_api;
 pub mod checks;
 pub mod config;
+pub mod hand;
 pub mod headset;
 pub mod openvr;
 pub mod rig;
