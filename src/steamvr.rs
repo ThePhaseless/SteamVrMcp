@@ -318,16 +318,45 @@ pub fn pending_interstitial(console_log: &str) -> Option<(u32, &'static str)> {
     Some((action.strip_prefix("AppID ")?.split(',').next()?.parse().ok()?, step))
 }
 
+/// How long Steam may take to log `ExecuteSteamURL` for a URL handed to it while it runs.
+const URL_TAKEN_WAIT: Duration = Duration::from_secs(20);
+
+/// None when `since` (the console log after the hand-off) shows Steam took `url`; else the failure
+/// message, naming the cause when `tail` (the log's last lines) shows the runtime launch service failing.
+// shortcut: fails fast instead of recovering; restart Steam automatically only if a later report shows the user wants that
+pub fn url_not_taken(since: &str, tail: &str, url: &str) -> Option<String> {
+    if since.contains(&format!("ExecuteSteamURL: \"{url}\"")) {
+        return None;
+    }
+    let mut msg = format!("Steam did not take {url} (no ExecuteSteamURL in console_log.txt within {} s); restart Steam and retry", URL_TAKEN_WAIT.as_secs());
+    // seen live with a Flatpak Steam running: both compete for the service's D-Bus name, and this Steam stops taking URLs
+    let exits = tail.lines().filter(|l| l.contains("steam-runtime-launcher-service pid") && l.ends_with(" exited")).count();
+    if exits >= 3 || tail.contains("steam-runtime-launcher-service process exited too many times, disabling") {
+        msg += "; Steam's runtime launch service keeps failing (another Steam, e.g. Flatpak, may hold it: close that one, or start this Steam first)";
+    }
+    Some(msg)
+}
+
 /// How long a dialog-step wait may last before it counts as a dialog: seen live, Steam continued after up to 5 s.
 const DIALOG_GRACE: Duration = Duration::from_secs(10);
 
 /// wait_for for a launch through Steam, which fails fast once Steam waits on a desktop dialog
-/// (console log lines after `log_from`).
-pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, timeout: Duration, mut done: impl FnMut() -> bool) -> Result<bool> {
+/// (console log lines after `log_from`). `handed_url` is the URL launch() gave an already running Steam:
+/// it also fails fast when Steam logs no ExecuteSteamURL for it within URL_TAKEN_WAIT.
+pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option<&str>, timeout: Duration, mut done: impl FnMut() -> bool) -> Result<bool> {
     let (mut since, mut blocked) = (None, None);
+    let (began, mut not_taken) = (Instant::now(), None);
     let finished = wait_for(timeout, || {
         if done() {
             return true;
+        }
+        if let (Some(d), Some(url)) = (steam_dir, handed_url) {
+            if began.elapsed() >= URL_TAKEN_WAIT {
+                not_taken = url_not_taken(&console_log_since(d, log_from), &log_tail(d, "console_log", 200).join("\n"), url);
+                if not_taken.is_some() {
+                    return true;
+                }
+            }
         }
         let pending = steam_dir.and_then(|d| pending_interstitial(&console_log_since(d, log_from)));
         let started = *since.get_or_insert_with(Instant::now);
@@ -337,6 +366,9 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, timeout: Duration,
         blocked = pending.filter(|_| started.elapsed() >= DIALOG_GRACE);
         blocked.is_some()
     });
+    if let Some(msg) = not_taken {
+        bail!(msg);
+    }
     if let Some((id, step)) = blocked {
         bail!("Steam is waiting for a dialog on the desktop ({step} for AppID {id}); dismiss it and retry");
     }
@@ -454,9 +486,10 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
     setup::unblock_safe_mode(&vrsettings)?;
     let log_from = paths.steam_dir.as_deref().map_or(0, console_log_len);
     *started_steam = launch(cfg, STEAMVR_URL)?;
+    let handed = (!*started_steam).then_some(STEAMVR_URL);
     // the old server can still answer ping while it hangs in shutdown
     let relaunched = || stopped() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping());
-    if !wait_launched(paths.steam_dir.as_deref(), log_from, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
+    if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
         bail!("ALVR did not come back within {} s after the SteamVR restart", cfg.timeouts.streaming_s);
     }
     if stopped() {
@@ -479,6 +512,23 @@ mod tests {
         }
         b.extend(b"\x08\x08");
         b
+    }
+
+    #[test]
+    fn url_not_taken_scans_log() {
+        let url = "steam://rungameid/250820";
+        let taken = format!("[x] ExecCommandLine: \"{url}\"\n[x] ExecuteSteamURL: \"{url}\"\n");
+        assert_eq!(url_not_taken(&taken, "", url), None);
+        let msg = url_not_taken("[x] something else\nExecuteSteamURL: \"steam://rungameid/1\"\n", "", url).unwrap();
+        assert_eq!(msg, format!("Steam did not take {url} (no ExecuteSteamURL in console_log.txt within 20 s); restart Steam and retry"));
+        let cause = "; Steam's runtime launch service keeps failing (another Steam, e.g. Flatpak, may hold it: close that one, or start this Steam first)";
+        let off = "Steam Runtime Launch Service: steam-runtime-launcher-service process exited too many times, disabling\n";
+        assert!(url_not_taken("", off, url).unwrap().ends_with(cause));
+        // seen live: the loop ran before the hand-off and Steam then stopped logging, so only the tail shows it
+        let looping = "Steam Runtime Launch Service: steam-runtime-launcher-service pid 7 exited\n".repeat(3);
+        assert!(url_not_taken("", &looping, url).unwrap().ends_with(cause));
+        let once = "Steam Runtime Launch Service: steam-runtime-launcher-service pid 7 exited\n";
+        assert!(!url_not_taken("", once, url).unwrap().contains("keeps failing"), "one exit is a normal SteamVR stop");
     }
 
     #[test]

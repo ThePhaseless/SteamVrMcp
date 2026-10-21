@@ -967,9 +967,11 @@ impl Stack {
         let paths = self.paths();
         let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
+        let mut handed = None;
         if !steamvr_running {
             report.started_steam = steamvr::launch(&self.cfg(), STEAMVR_URL)?;
             self.state.lock().started_steam |= report.started_steam;
+            handed = (!report.started_steam).then_some(STEAMVR_URL);
         }
 
         self.state.lock().managing = true;
@@ -979,7 +981,7 @@ impl Stack {
         let timeout = Duration::from_secs(self.cfg().timeouts.streaming_s);
         let deadline = Instant::now() + timeout;
         let stopped = || !self.state.lock().managing;
-        if !steamvr::wait_launched(steam_dir, log_from, timeout, || stopped() || self.api().ping())? {
+        if !steamvr::wait_launched(steam_dir, log_from, handed, timeout, || stopped() || self.api().ping())? {
             bail!("ALVR server did not answer on port {} within {} s", self.api().port, timeout.as_secs());
         }
         if stopped() {
@@ -1169,12 +1171,15 @@ impl Stack {
         // shortcut: relaunching an app that already runs times out, as Steam only focuses it; check its process if that matters
         let before = self.scene_app().map(|a| a.pid);
         let log_from = steamvr::console_log_len(steam);
-        let (mut run_log, mut exited) = (None, None);
+        let (mut run_log, mut exited, mut handed) = (None, None, None);
         // shortcut: a new launch forgets the last proton run's group, which stop_app then reaches only while it is the scene; refuse while it runs if one lingers
         self.state.lock().launched = None;
         match a.via {
             Via::Steam => {
-                steamvr::launch(&self.cfg(), &format!("steam://rungameid/{}", app.game_id))?;
+                let url = format!("steam://rungameid/{}", app.game_id);
+                if !steamvr::launch(&self.cfg(), &url)? {
+                    handed = Some(url);
+                }
             }
             Via::Proton => {
                 // shortcut: no non-Steam shortcuts in proton mode, upgrade by extending parse_shortcuts
@@ -1202,7 +1207,7 @@ impl Stack {
             scene_pid != 0 || launcher_exited().is_some()
         };
         let running = match a.via {
-            Via::Steam => steamvr::wait_launched(Some(steam), log_from, timeout, started)?,
+            Via::Steam => steamvr::wait_launched(Some(steam), log_from, handed.as_deref(), timeout, started)?,
             Via::Proton => steamvr::wait_for(timeout, started),
         };
         if let (0, Some(status), Some(log)) = (scene_pid, launcher_exited(), &run_log) {
