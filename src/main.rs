@@ -14,7 +14,11 @@ fn main() -> Result<()> {
     }
     alvr_client_core::init_logging();
 
-    let cfg = Config::load()?;
+    // a malformed config.toml fails the `config` check instead, so vr_status stays available
+    let cfg = Config::load().unwrap_or_else(|e| {
+        alvr_common::error!("{e:#}");
+        Config::default()
+    });
     let stack = Stack::new(cfg.clone(), Paths::detect(&cfg));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let served = runtime.block_on(server::serve(stack));

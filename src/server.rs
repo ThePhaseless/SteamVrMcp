@@ -401,7 +401,8 @@ impl ServerHandler for VrServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        // static checks run again at each vr_start, so a fixed problem does not need an MCP restart
+        // at each vr_start config.toml is re-read (applied while nothing runs) and the static checks run
+        // again, so a fixed problem does not need an MCP restart
         let r = self.readiness(request.name == "vr_start").await?;
         if let Err(reason) = checks::tool_ready(&request.name, &r) {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {reason}"))]).into());

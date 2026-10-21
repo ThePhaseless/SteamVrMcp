@@ -29,8 +29,8 @@ pub struct Readiness {
     pub running: bool,
 }
 
-const CORE: [&str; 6] =
-    ["steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input", "gpu_direct_mode"];
+const CORE: [&str; 7] =
+    ["config", "steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input", "gpu_direct_mode"];
 const AMD: u32 = 0x1002;
 const INTEL: u32 = 0x8086;
 const NVIDIA: u32 = 0x10de;
@@ -79,6 +79,16 @@ fn check(name: &'static str, result: Result<String, String>, fix: impl Into<Stri
     Check { name, ok, reason, fix: fix.into() }
 }
 
+/// Whether config.toml parses. A malformed one leaves the server running on the last good config (the
+/// defaults at MCP start) and keeps vr_start hidden.
+pub fn config_check(loaded: &alvr_common::anyhow::Result<Config>) -> Check {
+    let result = match loaded {
+        Ok(_) => Ok("config.toml parses, or is absent".to_owned()),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    check("config", result, "fix $XDG_CONFIG_HOME/vr-test-mcp/config.toml; vr_start reads it again while nothing runs (vr_stop first)")
+}
+
 /// Quick prerequisite checks without side effects.
 pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
     let steam = match (&paths.steam_dir, paths.flatpak_steam) {
@@ -106,6 +116,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         .and_then(|v| render_node(v).ok_or_else(|| format!("no render node for GPU vendor {v:#06x}")))
         .and_then(|node| va_h264(&node));
     vec![
+        config_check(&Config::load()),
         check("steam_native", steam, "install native Steam or set steam_dir in config.toml"),
         check("steamvr_installed", steamvr, "install SteamVR (app 250820) and run it once, or set steamvr_dir"),
         check(
@@ -283,8 +294,8 @@ mod tests {
     use super::*;
     use crate::{config::{Config, Paths}, server::VrServer};
 
-    const ALL_CHECKS: [&str; 9] = [
-        "steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input",
+    const ALL_CHECKS: [&str; 10] = [
+        "config", "steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input",
         "gpu_direct_mode", "h264_encoder", "openvr_client", "screenshot_decoder",
     ];
 
@@ -350,6 +361,15 @@ mod tests {
         assert!(!streamer.ok && streamer.fix.contains("streamer_dir"), "{streamer:?}");
         assert!(checks.iter().all(|c| !c.fix.is_empty()));
         assert!(checks.iter().find(|c| c.name == "screenshot_decoder").unwrap().ok);
+    }
+
+    #[test]
+    fn malformed_config_fails_the_config_check() {
+        let bad = config_check(&toml::from_str::<Config>("bogus = 1").map_err(alvr_common::anyhow::Error::from));
+        assert!(!bad.ok && bad.reason.contains("bogus") && bad.fix.contains("config.toml"), "{bad:?}");
+        assert!(config_check(&Ok(Config::default())).ok);
+        let r = Readiness { failed: [("config", "bad".to_owned())].into(), ..all_ready() };
+        assert!(tool_ready("vr_start", &r).unwrap_err().contains("config"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTl
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The ALVR server's REST and events API on 127.0.0.1.
+#[derive(Clone, Copy)]
 pub struct Api {
     pub port: u16,
 }

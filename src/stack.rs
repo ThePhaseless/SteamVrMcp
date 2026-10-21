@@ -286,9 +286,10 @@ struct State {
 
 /// Steam, SteamVR with ALVR, and the headset, plus the dashboard role ALVR expects.
 pub struct Stack {
-    cfg: Config,
-    paths: Paths,
-    api: Api,
+    /// Config, Paths and the API port: reloaded by `recheck` while nothing runs. Locked only briefly.
+    cfg: Mutex<Config>,
+    paths: Mutex<Paths>,
+    api: Mutex<Api>,
     state: Mutex<State>,
     /// Held for a whole SteamVR restart, so stop() never races one.
     restarting: Mutex<()>,
@@ -337,12 +338,10 @@ pub fn restore_guard(steamvr_running: bool) -> Result<()> {
 
 impl Stack {
     pub fn new(cfg: Config, paths: Paths) -> Arc<Stack> {
-        // shortcut: port read once here, re-read after prepare if web_server_port overrides must apply to a first start
-        let api = paths.session_file().map_or(Api { port: 8082 }, |f| Api::from_session_file(&f));
         let stack = Arc::new(Stack {
-            cfg,
-            paths,
-            api,
+            api: Mutex::new(api_for(&paths)),
+            cfg: Mutex::new(cfg),
+            paths: Mutex::new(paths),
             state: Mutex::default(),
             restarting: Mutex::new(()),
             starting: Mutex::new(()),
@@ -352,7 +351,7 @@ impl Stack {
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
         });
-        stack.recheck();
+        stack.run_checks();
         let weak = Arc::downgrade(&stack);
         thread::spawn(move || supervise(weak));
         let weak = Arc::downgrade(&stack);
@@ -360,17 +359,55 @@ impl Stack {
         stack
     }
 
-    /// Runs all startup checks again and keeps their results for `readiness`. Only at `new` and vr_start:
-    /// some checks are slow.
-    pub fn recheck(&self) {
-        *self.checks.lock() = checks::startup_checks(&self.cfg, &self.paths);
+    fn cfg(&self) -> Config {
+        self.cfg.lock().clone()
     }
 
-    /// The kept check results, with `alvr_dashboard_absent` re-run, so closing a dashboard un-hides vr_start.
+    fn paths(&self) -> Paths {
+        self.paths.lock().clone()
+    }
+
+    fn api(&self) -> Api {
+        *self.api.lock()
+    }
+
+    /// Re-reads config.toml, applies it while nothing runs, and runs all startup checks again. Only at
+    /// vr_start: some checks are slow.
+    pub fn recheck(&self) {
+        if let Ok(cfg) = Config::load() {
+            self.reload(cfg);
+        }
+        self.run_checks();
+    }
+
+    /// Applies `cfg` with freshly detected Paths, unless a vr_start, its session, an MCP-started Steam or SteamVR runs.
+    fn reload(&self, cfg: Config) -> bool {
+        let busy = {
+            let state = self.state.lock();
+            state.managing || state.headset.is_some() || state.dashboard.is_some() || state.started_steam
+        };
+        if busy || self.starting.is_locked() || steamvr::is_steamvr_running() {
+            return false;
+        }
+        let paths = Paths::detect(&cfg);
+        *self.api.lock() = api_for(&paths);
+        *self.paths.lock() = paths;
+        *self.cfg.lock() = cfg;
+        true
+    }
+
+    fn run_checks(&self) {
+        *self.checks.lock() = checks::startup_checks(&self.cfg(), &self.paths());
+    }
+
+    /// The kept check results, with `alvr_dashboard_absent` and `config` re-run, so closing a dashboard
+    /// or fixing config.toml un-hides vr_start.
     pub fn checks(&self) -> Vec<Check> {
+        let fresh = [checks::dashboard_check(), checks::config_check(&Config::load())];
         let mut checks = self.checks.lock();
-        let dashboard = checks::dashboard_check();
-        checks.iter_mut().filter(|c| c.name == dashboard.name).for_each(|c| *c = dashboard.clone());
+        for check in fresh {
+            checks.iter_mut().filter(|c| c.name == check.name).for_each(|c| *c = check.clone());
+        }
         checks.clone()
     }
 
@@ -382,10 +419,10 @@ impl Stack {
             (streaming, state.managing || state.headset.is_some() || state.dashboard.is_some() || state.started_steam)
         };
         let steamvr_running = steamvr::is_steamvr_running();
-        let alvr_api = self.api.ping();
+        let alvr_api = self.api().ping();
         Readiness {
             failed: self.checks.lock().iter().filter(|c| !c.ok).map(|c| (c.name, c.reason.clone())).collect(),
-            restore_file: self.paths.restore_file().exists(),
+            restore_file: self.paths().restore_file().exists(),
             steamvr_running,
             alvr_api,
             streaming,
@@ -400,13 +437,13 @@ impl Stack {
 
     pub fn restore(&self) -> Result<()> {
         restore_guard(steamvr::is_steamvr_running())?;
-        setup::restore(&self.paths)
+        setup::restore(&self.paths())
     }
 
     /// A screenshot of the headset's stream. The wait for the frame runs outside the state lock.
     pub fn screenshot(&self, eye: Eye) -> Result<Screenshot> {
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
-        grabber.screenshot(&self.api, eye)
+        grabber.screenshot(&self.api(), eye)
     }
 
     /// Changes the head or a controller; returns how long until an animation is done.
@@ -491,8 +528,8 @@ impl Stack {
             None => None,
         };
         let pid = vrserver.context("SteamVR is not running")?;
-        let steamvr_dir = self.paths.steamvr_dir.clone().context("SteamVR not found; set steamvr_dir in config.toml")?;
-        let state_dir = self.paths.state_dir.clone();
+        let steamvr_dir = self.paths().steamvr_dir.clone().context("SteamVR not found; set steamvr_dir in config.toml")?;
+        let state_dir = self.paths().state_dir.clone();
         let (reader, result) = within(OPENVR_TIMEOUT, move || -> Result<_> {
             let reader = match reader {
                 Some(r) => r,
@@ -533,7 +570,7 @@ impl Stack {
     }
 
     fn check_version(&self) -> Result<()> {
-        let version = self.api.version()?;
+        let version = self.api().version()?;
         if !alvr_api::compatible(&version) {
             bail!("ALVR server {} is not compatible with {}", version.trim(), *alvr_common::ALVR_VERSION);
         }
@@ -564,11 +601,11 @@ impl Stack {
             };
             return Ok(StartReport { already_streaming: true, restarts, view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report });
         }
-        self.paths.session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
+        self.paths().session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
 
         self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig)));
         let hostname = headset::client_hostname()?;
-        let values = setup::session_values(&self.cfg)?;
+        let values = setup::session_values(&self.cfg())?;
         let steamvr_running = steamvr::is_steamvr_running();
         let mut restart_adopted = false;
         if !steamvr_running {
@@ -577,15 +614,15 @@ impl Stack {
                     bail!("SteamVR processes still running after SIGKILL: {:?}", steamvr::alive_vr_processes());
                 }
                 // SteamVR has exited, so it no longer rewrites the file
-                setup::undo_safe_mode_blocks(&self.paths)?;
+                setup::undo_safe_mode_blocks(&self.paths())?;
             }
-            report.unblocked_safe_mode = setup::prepare(&self.paths, &values, &hostname)?.unblocked_safe_mode;
-        } else if self.api.ping() {
+            report.unblocked_safe_mode = setup::prepare(&self.paths(), &values, &hostname)?.unblocked_safe_mode;
+        } else if self.api().ping() {
             self.check_version()?;
-            setup::snapshot(&self.paths)?;
-            self.api.post_json("/api/session/values", &values)?;
+            setup::snapshot(&self.paths())?;
+            self.api().post_json("/api/session/values", &values)?;
             for action in setup::client_actions() {
-                self.api.post_json("/api/session/client-connections", &(&hostname, action))?;
+                self.api().post_json("/api/session/client-connections", &(&hostname, action))?;
             }
             report.adopted = true;
             // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
@@ -597,13 +634,14 @@ impl Stack {
         {
             let mut state = self.state.lock();
             if state.dashboard.is_none() {
-                state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths.runtime_dir)?);
+                state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths().runtime_dir)?);
             }
         }
-        let steam_dir = self.paths.steam_dir.as_deref();
+        let paths = self.paths();
+        let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
         if !steamvr_running {
-            report.started_steam = steamvr::launch(&self.cfg, STEAMVR_URL)?;
+            report.started_steam = steamvr::launch(&self.cfg(), STEAMVR_URL)?;
             self.state.lock().started_steam |= report.started_steam;
         }
 
@@ -611,11 +649,11 @@ impl Stack {
         if restart_adopted {
             self.restart_steamvr(false)?;
         }
-        let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
+        let timeout = Duration::from_secs(self.cfg().timeouts.streaming_s);
         let deadline = Instant::now() + timeout;
         let stopped = || !self.state.lock().managing;
-        if !steamvr::wait_launched(steam_dir, log_from, timeout, || stopped() || self.api.ping())? {
-            bail!("ALVR server did not answer on port {} within {} s", self.api.port, timeout.as_secs());
+        if !steamvr::wait_launched(steam_dir, log_from, timeout, || stopped() || self.api().ping())? {
+            bail!("ALVR server did not answer on port {} within {} s", self.api().port, timeout.as_secs());
         }
         if stopped() {
             bail!("vr_stop ended the session");
@@ -639,7 +677,7 @@ impl Stack {
             let state = self.state.lock();
             state.managing || state.started_steam
         };
-        stop_guard(steamvr::is_steamvr_running(), || ours || self.api.ping() || steamvr::vrserver_has_alvr())?;
+        stop_guard(steamvr::is_steamvr_running(), || ours || self.api().ping() || steamvr::vrserver_has_alvr())?;
         self.state.lock().managing = false;
         let _no_restart = self.restarting.lock();
         self.drop_reader();
@@ -650,16 +688,16 @@ impl Stack {
         if let Some(h) = headset {
             self.dispose(h);
         }
-        if self.api.ping() {
+        if self.api().ping() {
             // on failure the signals below still stop SteamVR
-            self.api.post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
+            self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
         if !steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
             // the next start clears the safe-mode block this causes
             steamvr::kill_vr_processes();
             report.used_signals = true;
             // SteamVR has exited, so it no longer rewrites the file
-            setup::undo_safe_mode_blocks(&self.paths).map_err(|e| error!("{e:#}")).ok();
+            setup::undo_safe_mode_blocks(&self.paths()).map_err(|e| error!("{e:#}")).ok();
         }
 
         let (dashboard, started_steam) = {
@@ -672,7 +710,7 @@ impl Stack {
         }
         if started_steam {
             if steamvr::is_steam_running() {
-                steamvr::launch(&self.cfg, "-shutdown")?; // Steam is running, so this only forwards -shutdown
+                steamvr::launch(&self.cfg(), "-shutdown")?; // Steam is running, so this only forwards -shutdown
             }
             report.closed_steam = steamvr::wait_gone(&["steam"], Duration::from_secs(60));
         }
@@ -693,7 +731,7 @@ impl Stack {
         StatusReport {
             steam_running: steamvr::is_steam_running(),
             steamvr_running: steamvr::is_steamvr_running(),
-            alvr_version: self.api.version().ok().map(|v| v.trim().to_owned()),
+            alvr_version: self.api().version().ok().map(|v| v.trim().to_owned()),
             headset: self.headset_status(),
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
             warning: leaked.then_some(LEAKED),
@@ -734,8 +772,8 @@ impl Stack {
         if restart && !self.state.lock().managing {
             bail!("these settings need a SteamVR restart, which only a vr_start session does; run vr_start first");
         }
-        let mut events = self.api.events()?;
-        self.api.post_json("/api/session/values", &values)?;
+        let mut events = self.api().events()?;
+        self.api().post_json("/api/session/values", &values)?;
         // ALVR answers 200 even when it rejects the values: it logs why and sends no new session
         // (server_core web_server.rs:181-185, server_io lib.rs:156-187)
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -769,7 +807,7 @@ impl Stack {
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147): on loopback a headset reconnect strands the server, so restart SteamVR instead of reconnecting for ALVR's handshake check; drop when fixed upstream
         self.restart_steamvr(false).context(STORED)?;
         // a restart ALVR asks for once the headset negotiates (e.g. a new fps) is the supervisor's
-        let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
+        let timeout = Duration::from_secs(self.cfg().timeouts.streaming_s);
         let streaming = self.wait_streaming(began, timeout, generation).context(STORED)?;
         if !streaming {
             bail!("headset not streaming {} s after the SteamVR restart; last HUD message: {:?}", timeout.as_secs(), status().hud_message);
@@ -782,14 +820,15 @@ impl Stack {
     /// SteamVR reports a new scene app running.
     pub fn launch_app(&self, id: &str) -> Result<AppReport> {
         let id: u64 = id.trim().parse().with_context(|| format!("app_id must be a decimal number, not {id:?}"))?;
-        let steam = self.paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
+        let paths = self.paths();
+        let steam = paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
         let app = steamvr::find_app(steam, id)?;
         // SteamVR Home is a scene app too, so wait for a scene pid that was not there before
         // shortcut: relaunching an app that already runs times out, as Steam only focuses it; check its process if that matters
         let before = self.scene_app().map(|a| a.pid);
         let log_from = steamvr::console_log_len(steam);
-        steamvr::launch(&self.cfg, &format!("steam://rungameid/{}", app.game_id))?;
-        let timeout = Duration::from_secs(self.cfg.timeouts.app_s);
+        steamvr::launch(&self.cfg(), &format!("steam://rungameid/{}", app.game_id))?;
+        let timeout = Duration::from_secs(self.cfg().timeouts.app_s);
         let mut scene_pid = 0;
         let running = steamvr::wait_launched(Some(steam), log_from, timeout, || {
             let scene = self.scene_app().filter(|a| a.state == "running" && Some(a.pid) != before);
@@ -832,7 +871,7 @@ impl Stack {
     /// ALVR log events the supervisor kept, merged with the tails of SteamVR's own logs, filtered.
     pub fn logs(&self, q: LogQuery) -> Result<Vec<LogLine>> {
         let mut lines: Vec<LogLine> = self.alvr_logs.lock().iter().cloned().collect();
-        if let Some(steam) = &self.paths.steam_dir {
+        if let Some(steam) = &self.paths().steam_dir {
             for name in STEAMVR_LOGS {
                 lines.extend(steamvr_log_lines(name, steamvr::log_tail(steam, name, LOGS_KEPT)));
             }
@@ -856,8 +895,8 @@ impl Stack {
 
     /// The server's session, which ALVR sends as an event in reply to GET /api/session.
     fn session(&self) -> Result<SessionConfig> {
-        let mut events = self.api.events()?;
-        self.api.get("/api/session")?;
+        let mut events = self.api().events()?;
+        self.api().get("/api/session")?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if let Some(Event { event_type: EventType::Session(session), .. }) = events.next(Duration::from_millis(500))? {
@@ -906,7 +945,7 @@ impl Stack {
         self.drop_reader();
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
-        let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api, stopped, &mut started_steam);
+        let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), stopped, &mut started_steam);
         let headset = headset.inspect(Headset::resume).unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
         let spare = {
             let mut state = self.state.lock();
@@ -933,6 +972,12 @@ impl Stack {
             }
         }
     }
+}
+
+/// The API at the session's port, ALVR's default 8082 while no streamer is known.
+// shortcut: port read at MCP start and reload, re-read after prepare if web_server_port overrides must apply to a first start
+fn api_for(paths: &Paths) -> Api {
+    paths.session_file().map_or(Api { port: 8082 }, |f| Api::from_session_file(&f))
 }
 
 /// Drops an OpenVR reader within OPENVR_TIMEOUT, or leaves it on its thread.
@@ -984,7 +1029,7 @@ fn supervise(stack: Weak<Stack>) {
 
         let mut restart = false;
         match &mut events {
-            None if s.api.ping() => events = s.api.events().map_err(|e| error!("ALVR events: {e:#}")).ok(),
+            None if s.api().ping() => events = s.api().events().map_err(|e| error!("ALVR events: {e:#}")).ok(),
             None => thread::sleep(Duration::from_millis(500)),
             Some(stream) => match stream.next(Duration::from_millis(500)) {
                 Ok(Some(Event { event_type: EventType::ServerRequestsSelfRestart, .. })) => restart = true,
@@ -1091,6 +1136,20 @@ mod tests {
         stack.state.lock().managing = false;
         let e = stack.wait_streaming(Instant::now(), Duration::from_secs(30), 0).unwrap_err();
         assert_eq!(e.to_string(), "vr_stop ended the session");
+    }
+
+    #[test]
+    fn config_reloads_only_while_nothing_runs() {
+        let stack = test_stack();
+        let cfg = |streaming_s| Config { timeouts: crate::config::Timeouts { streaming_s, app_s: 1 }, ..Default::default() };
+        stack.state.lock().managing = true;
+        assert!(!stack.reload(cfg(7)), "a vr_start session runs");
+        assert_eq!(stack.cfg().timeouts.streaming_s, 240);
+        stack.state.lock().managing = false;
+        if !steamvr::is_steamvr_running() {
+            assert!(stack.reload(cfg(7)));
+            assert_eq!(stack.cfg().timeouts.streaming_s, 7);
+        }
     }
 
     #[test]
