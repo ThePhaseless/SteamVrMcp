@@ -164,6 +164,7 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
     match a.via {
         Via::Steam if a.exe.is_some() || !a.args.is_empty() || !a.env.is_empty() => return Err("exe, args and env need via \"proton\"".into()),
         Via::Proton if a.exe.is_none() => return Err("via \"proton\" needs exe, relative to the app's install dir".into()),
+        Via::Proton if a.app_id.trim().parse() == Ok(steamvr::STEAMVR_APP_ID) => return Err("via \"proton\" cannot launch SteamVR (app 250820)".into()),
         _ => (),
     }
     if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
@@ -1458,6 +1459,10 @@ mod tests {
         assert!(check_launch(&a(Via::Proton, None, &[], &[])).unwrap_err().contains("exe"));
         for env in [("A=B", "1"), ("", "1"), ("A\0", "1"), ("A", "1\0")] {
             assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[env])).is_err(), "{env:?}");
+        }
+        for id in ["250820", " 250820"] {
+            let vr = LaunchArgs { app_id: id.into(), ..a(Via::Proton, Some("vrstartup.exe"), &[], &[]) };
+            assert!(check_launch(&vr).unwrap_err().contains("SteamVR"), "{id:?}");
         }
         for key in ["STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId"] {
             assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err().contains(key), "the MCP sets {key}");

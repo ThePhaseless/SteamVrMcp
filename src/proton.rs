@@ -1,6 +1,6 @@
 //! `launch_app via proton`: run a Steam game's compatibility tool the way Steam does, and find
 //! every process of that run again to stop it.
-use crate::steamvr::{self, AppInfo, compat_tool, entry_value, find_app, libraries, signalable, vdf_value};
+use crate::steamvr::{self, AppInfo, STEAMVR_APP_ID, VR_PROCESS_NAMES, compat_tool, entry_value, find_app, libraries, signalable, vdf_value};
 use alvr_common::{
     anyhow::{Context, Result, bail},
     parking_lot::Mutex,
@@ -196,6 +196,7 @@ const APP_ID_KEYS: [&str; 2] = ["STEAM_COMPAT_APP_ID", "SteamGameId"];
 /// (game_pids of `launched` and of the scene pid's own env): wine processes leave the group.
 /// SIGKILL after 15 s. The pids and group signalled, sorted; none when nothing ran.
 pub fn stop(scene: Option<u32>, launched: Option<&Launched>) -> Result<Vec<u32>> {
+    let scene = scene.filter(|&pid| !is_steamvr(pid, &fs::read(format!("/proc/{pid}/environ")).unwrap_or_default()));
     let mut games: Vec<(String, String)> = launched.and_then(|l| Some((l.compatdata.to_str()?.to_owned(), l.app_id.to_string()))).into_iter().collect();
     let scene_game = scene.and_then(|pid| Some((env_of(pid, COMPAT_DATA)?, APP_ID_KEYS.iter().find_map(|k| env_of(pid, k))?)));
     games.extend(scene_game);
@@ -252,18 +253,27 @@ pub fn ancestors() -> Vec<u32> {
 
 /// Every process of a game's tree: its environ has the game's STEAM_COMPAT_DATA_PATH and its app
 /// id (STEAM_COMPAT_APP_ID or SteamGameId), which a shell that only exported the path lacks. Never
-/// pid 1, this MCP, its ancestors or its process group; other users' processes (unreadable environ) are skipped.
+/// pid 1, this MCP, its ancestors, its process group or SteamVR's processes; other users' processes (unreadable environ) are skipped.
 // shortcut: skips the MCP's group, which holds a Steam the MCP started and maybe its games' processes; narrow to pids if a via-steam game's tree outlives stop_app
 pub fn game_pids(compatdata: &str, app_id: &str) -> Vec<u32> {
+    if app_id == STEAMVR_APP_ID.to_string() {
+        return vec![];
+    }
     let (group, mine) = (unsafe { libc::getpgrp() }, ancestors());
     steamvr::all_pids()
         .into_iter()
         .filter(|pid| !mine.contains(pid) && signalable(*pid).is_some_and(|p| unsafe { libc::getpgid(p) } != group))
         .filter(|pid| {
             fs::read(format!("/proc/{pid}/environ"))
-                .is_ok_and(|env| environ_has(&env, COMPAT_DATA, compatdata) && APP_ID_KEYS.iter().any(|k| environ_has(&env, k, app_id)))
+                .is_ok_and(|env| environ_has(&env, COMPAT_DATA, compatdata) && APP_ID_KEYS.iter().any(|k| environ_has(&env, k, app_id)) && !is_steamvr(*pid, &env))
         })
         .collect()
+}
+
+/// SteamVR's own processes, which all carry SteamVR's compat env (app 250820): never a game's.
+fn is_steamvr(pid: u32, environ: &[u8]) -> bool {
+    let id = STEAMVR_APP_ID.to_string();
+    APP_ID_KEYS.iter().any(|k| environ_has(environ, k, &id)) || steamvr::comm(pid).is_some_and(|c| VR_PROCESS_NAMES.contains(&c.as_str()))
 }
 
 /// kill(-pgid, sig); false, and nothing sent, for 0, 1 and this MCP's own group.
@@ -490,6 +500,20 @@ mod tests {
         }
         assert!(group_alive(shell.0.pgid), "the prefix path alone does not prove a process is the game's");
         assert!(group_alive(other_app.0.pgid), "another app on the same prefix");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn steamvr_processes_are_never_swept() {
+        let dir = root("steamvr");
+        let vr = dir.join("compatdata/250820");
+        let vr = vr.to_str().unwrap();
+        // every SteamVR process (vrserver, vrmonitor, reaper, pressure-vessel) carries SteamVR's compat env
+        let env = [(COMPAT_DATA, vr), ("STEAM_COMPAT_APP_ID", "250820"), ("SteamGameId", "250820")];
+        let (scene, vrserver) = (sleeper(&dir, 250820, &env), sleeper(&dir, 250820, &env));
+        assert_eq!(game_pids(vr, "250820"), Vec::<u32>::new());
+        assert_eq!(stop(Some(scene.0.pgid), None).unwrap(), Vec::<u32>::new(), "a scene with SteamVR's app id is SteamVR's own");
+        assert!(group_alive(scene.0.pgid) && group_alive(vrserver.0.pgid));
         fs::remove_dir_all(&dir).ok();
     }
 

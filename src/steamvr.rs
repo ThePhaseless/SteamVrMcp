@@ -15,6 +15,7 @@ use std::{
 };
 
 pub const STEAMVR_URL: &str = "steam://rungameid/250820";
+pub const STEAMVR_APP_ID: u32 = 250820;
 
 /// SteamVR's processes, as `/proc/<pid>/comm` names them (pinned from a live SteamVR 2.x run).
 /// vrmonitor is last: killing it first makes SteamVR's safe mode block the ALVR driver.
