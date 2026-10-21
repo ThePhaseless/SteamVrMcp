@@ -29,6 +29,8 @@ pub struct HeadsetStatus {
     /// Streams started by any headset of this MCP, as of this headset's latest; grows on every
     /// StreamingStarted, so a caller sees a new stream even when it missed the gap between.
     pub stream_generation: u64,
+    /// The proximity state sent at every stream start; false only after `set_proximity(false)`.
+    pub on_head: bool,
 }
 
 /// Which part of the side-by-side frame a screenshot shows.
@@ -109,6 +111,9 @@ struct Shared {
     /// The newest HAPTICS_KEPT haptic events, oldest first.
     // shortcut: lost when the headset is recreated (watchdog or reconnect); move to Stack if tests read across one
     haptics: VecDeque<HapticEvent>,
+    /// Inverted so the derived Default is "worn".
+    // shortcut: lost when the headset is recreated (watchdog or reconnect), then worn again
+    off_head: bool,
 }
 
 impl Shared {
@@ -145,12 +150,18 @@ impl Shared {
         events
     }
 
-    fn on_streaming_started(&mut self, fps: f32, view_resolution: [u32; 2]) {
+    fn set_on_head(&mut self, on_head: bool) {
+        self.off_head = !on_head;
+    }
+
+    /// Returns the proximity state to send: SteamVR 2.18 keeps an OpenXR session at VISIBLE until it has one.
+    fn on_streaming_started(&mut self, fps: f32, view_resolution: [u32; 2]) -> bool {
         let status = &mut self.status;
         (status.streaming, status.fps, status.view_resolution) = (true, fps, view_resolution);
         // The handshake's "stream will begin soon" text would otherwise outlive the stream start.
         status.hud_message.clear();
         status.stream_generation = STREAMS_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+        !self.off_head
     }
 
     fn on_streaming_stopped(&mut self) {
@@ -300,7 +311,8 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
                 ClientCoreEvent::StreamingStarted(config) => {
                     let negotiated = &config.negotiated_config;
                     let fps = negotiated.refresh_rate_hint;
-                    shared.lock().on_streaming_started(fps, negotiated.view_resolution.to_array());
+                    let on_head = shared.lock().on_streaming_started(fps, negotiated.view_resolution.to_array());
+                    context.send_proximity_state(on_head);
                     context.send_view_params(view_params());
                     streaming.set(true);
                     let (context, rig, streaming) = (Arc::clone(&context), Arc::clone(&rig), Arc::clone(&streaming));
@@ -361,7 +373,8 @@ impl Headset {
     }
 
     pub fn status(&self) -> HeadsetStatus {
-        self.shared.lock().status.clone()
+        let shared = self.shared.lock();
+        HeadsetStatus { on_head: !shared.off_head, ..shared.status.clone() }
     }
 
     /// Haptic events with `t_s` after `since_s`, oldest first; `clear` empties the log.
@@ -384,6 +397,7 @@ impl Headset {
     }
 
     pub fn set_proximity(&self, on_head: bool) {
+        self.shared.lock().set_on_head(on_head);
         self.context.send_proximity_state(on_head);
     }
 }
@@ -471,6 +485,17 @@ mod tests {
         assert!(a.status.stream_generation > 0 && b.status.stream_generation > a.status.stream_generation);
         b.on_streaming_stopped();
         assert!(b.status.stream_generation > a.status.stream_generation, "kept after the stream stops");
+    }
+
+    #[test]
+    fn wanted_proximity_is_sent_on_every_stream_start() {
+        let mut s = Shared::default();
+        assert!(s.on_streaming_started(72.0, [1088, 1216]), "worn by default");
+        s.on_streaming_stopped();
+        assert!(s.on_streaming_started(72.0, [1088, 1216]), "worn again after a restart");
+        s.set_on_head(false);
+        s.on_streaming_stopped();
+        assert!(!s.on_streaming_started(72.0, [1088, 1216]), "an explicit off-head survives a restart");
     }
 
     #[test]
