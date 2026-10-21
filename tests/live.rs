@@ -7,6 +7,7 @@ use vr_test_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
     headset::Eye,
+    openvr::TrackedState,
     rig::{AnimateArgs, FingerCurlArgs, Hand, PoseArgs, RigAction},
     setup::{prepare, restore, session_values},
     stack::Stack,
@@ -308,15 +309,25 @@ fn live_finger_curls_per_finger() {
     }
     let _reset = Reset(Arc::clone(&s));
 
+    // SteamVR gives the reader no input while the scene app starts (IsInputAvailable false, scene
+    // state "waiting"), so right after vr_start every skeleton action reads inactive
+    let active = |st: &TrackedState| st.skeletons.values().all(|k| k.active);
+    let ready = steamvr::wait_for(Duration::from_secs(60), || s.tracked_state(false).is_ok_and(|st| active(&st)));
+    assert!(ready, "skeleton actions still inactive after 60 s; scene app {:?}", s.scene_app());
+
     let mut failures = vec![];
     for (hand, name) in [(Hand::Left, "left"), (Hand::Right, "right")] {
         for f in 0..5 {
             curl(&s, hand, Some(f)).unwrap();
-            thread::sleep(Duration::from_millis(300));
+            let follows = |k: usize, v: f32| if k == f { v >= 0.7 } else { v <= 0.3 };
+            let settled = |st: &TrackedState| {
+                let sk = &st.skeletons[name];
+                sk.active && (0..5).all(|k| follows(k, sk.curls[k])) && (1..5).all(|k| follows(k, sk.device_curls[k]))
+            };
+            steamvr::wait_for(Duration::from_secs(2), || s.tracked_state(false).is_ok_and(|st| settled(&st)));
             let state = s.tracked_state(false).unwrap();
             let sk = &state.skeletons[name];
             println!("{name} finger {f} at 1: active {} curls {:?} device_curls {:?}", sk.active, sk.curls, sk.device_curls);
-            let follows = |k: usize, v: f32| if k == f { v >= 0.7 } else { v <= 0.3 };
             if !sk.active {
                 failures.push(format!("{name} finger {f}: skeleton action inactive"));
             }
