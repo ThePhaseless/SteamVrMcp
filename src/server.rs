@@ -63,6 +63,13 @@ struct ProximityArgs {
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+struct FrameTimingArgs {
+    /// Seconds to measure, 0.5 to 60; default 5.
+    window_s: Option<f64>,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 struct HapticsArgs {
     /// Only events with t_s after this; pass the last t_s seen to get new ones.
     since_s: Option<f64>,
@@ -330,6 +337,11 @@ impl VrServer {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
 
+    #[tool(description = "Wait window_s (0.5 to 60, default 5), then report frame timing over it: compositor (SteamVR's GetFrameTimings for frames within window_s of the newest: frames, fps, interval_ms and gpu_ms p50/p95/p99 by nearest rank, dropped, mispresented, reprojected frames), counts (compositor presents, dropped and reprojected frames during the window) and alvr (mean of ALVR's statistics summaries: samples, latencies in ms, client_fps, server_fps, video_mbits_per_sec), t_s and at of the window's end. A part that could not be read is null and its error is in notes. Limit: SteamVR keeps at most 1024 frames.")]
+    async fn get_frame_timing(&self, Parameters(args): Parameters<FrameTimingArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.frame_timing(args.window_s)?)).await.map_err(message)
+    }
+
     #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). A bad path or value fails before any restart. With a restart the call can take minutes.")]
     async fn set_alvr_settings(&self, Parameters(args): Parameters<SettingsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.set_alvr_settings(args.values)?)).await.map_err(message)
@@ -481,12 +493,12 @@ mod tests {
             press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
             set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
             set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release \
-            read_app_log wait_for_log set_proximity"
+            read_app_log wait_for_log set_proximity get_frame_timing"
             .split_whitespace()
             .map(String::from)
             .collect();
         want.sort();
-        assert_eq!((names.len(), names), (38, want));
+        assert_eq!((names.len(), names), (39, want));
     }
 
     #[test]

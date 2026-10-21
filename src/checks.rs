@@ -34,7 +34,7 @@ pub struct Readiness {
 }
 
 /// Tools that change nothing, so an observer without the lease keeps them.
-pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release", "read_app_log", "wait_for_log"];
+pub const READ_ONLY: &[&str] = &["vr_status", "get_logs", "get_haptics", "get_tracked_state", "screenshot", "vr_acquire", "vr_release", "read_app_log", "wait_for_log", "get_frame_timing"];
 
 /// The checks vr_start needs.
 pub const CORE: [&str; 7] =
@@ -79,7 +79,7 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
             holds(r.steamvr_running, "SteamVR is not running")?;
             checks(&["openvr_client"])
         }
-        "launch_app" | "stop_app" => {
+        "launch_app" | "stop_app" | "get_frame_timing" => {
             streaming()?;
             checks(&["openvr_client"])
         }

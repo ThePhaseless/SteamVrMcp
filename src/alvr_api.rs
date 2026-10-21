@@ -135,9 +135,47 @@ pub fn compatible(server_version: &str) -> bool {
     protocol_id_of(server_version).is_ok_and(|id| id == alvr_common::protocol_id())
 }
 
+/// The mean of ALVR's 500 ms statistics summaries.
+#[derive(Debug, Serialize)]
+pub struct AlvrSummary {
+    pub samples: usize,
+    pub total_latency_ms: f32,
+    pub network_latency_ms: f32,
+    pub encode_latency_ms: f32,
+    pub decode_latency_ms: f32,
+    pub client_fps: f32,
+    pub server_fps: f32,
+    pub video_mbits_per_sec: f32,
+}
+
+pub fn average(samples: &[alvr_events::StatisticsSummary]) -> Option<AlvrSummary> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mean = |f: fn(&alvr_events::StatisticsSummary) -> f32| samples.iter().map(f).sum::<f32>() / samples.len() as f32;
+    Some(AlvrSummary {
+        samples: samples.len(),
+        total_latency_ms: mean(|s| s.total_latency_ms),
+        network_latency_ms: mean(|s| s.network_latency_ms),
+        encode_latency_ms: mean(|s| s.encode_latency_ms),
+        decode_latency_ms: mean(|s| s.decode_latency_ms),
+        client_fps: mean(|s| s.client_fps as f32),
+        server_fps: mean(|s| s.server_fps as f32),
+        video_mbits_per_sec: mean(|s| s.video_mbits_per_sec),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn average_means_samples() {
+        let at = |ms| alvr_events::StatisticsSummary { total_latency_ms: ms, ..Default::default() };
+        let a = average(&[at(10.0), at(20.0)]).unwrap();
+        assert_eq!((a.samples, a.total_latency_ms), (2, 15.0));
+        assert!(average(&[]).is_none());
+    }
 
     #[test]
     fn compatible_follows_protocol_id() {

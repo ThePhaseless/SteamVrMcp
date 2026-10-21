@@ -88,11 +88,66 @@ pub struct SceneApp {
     pub state: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct FrameStats {
     pub presents: u32,
     pub dropped: u32,
     pub reprojected: u32,
+}
+
+/// One compositor frame from `GetFrameTimings`.
+#[derive(Clone, Copy, Default)]
+pub struct FrameTiming {
+    pub system_s: f64,
+    pub interval_ms: f32,
+    pub gpu_ms: f32,
+    pub dropped: u32,
+    pub mispresented: u32,
+    pub reprojected: bool,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Spread {
+    pub p50: f32,
+    pub p95: f32,
+    pub p99: f32,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct CompositorSummary {
+    pub frames: usize,
+    pub fps: f32,
+    pub interval_ms: Spread,
+    pub gpu_ms: Spread,
+    pub dropped: u32,
+    pub mispresented: u32,
+    pub reprojected: usize,
+}
+
+/// How many frames of SteamVR's history to ask for.
+pub const TIMINGS_MAX: u32 = 1024;
+
+/// Nearest-rank percentiles; sorts `values`, which must not be empty.
+pub fn spread(values: &mut [f32]) -> Spread {
+    values.sort_by(f32::total_cmp);
+    let rank = |p: usize| values[(p * values.len()).div_ceil(100) - 1];
+    Spread { p50: rank(50), p95: rank(95), p99: rank(99) }
+}
+
+/// The frames within `window_s` of the newest, or None when there are none.
+pub fn summarize(timings: &[FrameTiming], window_s: f64) -> Option<CompositorSummary> {
+    let newest = timings.iter().map(|t| t.system_s).max_by(f64::total_cmp)?;
+    let kept: Vec<&FrameTiming> = timings.iter().filter(|t| t.system_s >= newest - window_s).collect();
+    let mean = kept.iter().map(|t| t.interval_ms).sum::<f32>() / kept.len() as f32;
+    Some(CompositorSummary {
+        frames: kept.len(),
+        fps: 1000.0 / mean,
+        interval_ms: spread(&mut kept.iter().map(|t| t.interval_ms).collect::<Vec<_>>()),
+        gpu_ms: spread(&mut kept.iter().map(|t| t.gpu_ms).collect::<Vec<_>>()),
+        dropped: kept.iter().map(|t| t.dropped).sum(),
+        mispresented: kept.iter().map(|t| t.mispresented).sum(),
+        reprojected: kept.iter().filter(|t| t.reprojected).count(),
+    })
 }
 
 /// Position and x, y, z, w rotation of an OpenVR row-major 3x4 pose.
@@ -332,6 +387,27 @@ impl OpenVr {
         }
         Ok(FrameStats { presents: s.m_nNumFramePresents, dropped: s.m_nNumDroppedFrames, reprojected: s.m_nNumReprojectedFrames })
     }
+
+    /// The compositor's recent frames, oldest first.
+    pub fn frame_timings(&self) -> Result<Vec<FrameTiming>> {
+        let mut frames = vec![unsafe { zeroed::<Compositor_FrameTiming>() }; TIMINGS_MAX as usize];
+        frames[0].m_nSize = size_of::<Compositor_FrameTiming>() as u32;
+        let got = call!(self.compositor, GetFrameTimings, frames.as_mut_ptr(), TIMINGS_MAX) as usize;
+        if got == 0 {
+            bail!("no frame timings: no scene app, or the compositor withholds them from a background app");
+        }
+        Ok(frames[..got.min(frames.len())]
+            .iter()
+            .map(|f| FrameTiming {
+                system_s: f.m_flSystemTimeInSeconds,
+                interval_ms: f.m_flClientFrameIntervalMs,
+                gpu_ms: f.m_flTotalRenderGpuMs,
+                dropped: f.m_nNumDroppedFrames,
+                mispresented: f.m_nNumMisPresented,
+                reprojected: f.m_nReprojectionFlags != 0,
+            })
+            .collect())
+    }
 }
 
 /// The hmd's worn state after an event; SteamVR derives these from the driver's /proximity input.
@@ -355,6 +431,38 @@ mod tests {
     use super::*;
     use alvr_common::glam::Quat;
     use std::f32::consts::FRAC_PI_2;
+
+    #[test]
+    fn spread_uses_nearest_rank() {
+        let mut v: Vec<f32> = (1..=100).map(|i| i as f32).collect();
+        let s = spread(&mut v);
+        assert_eq!((s.p50, s.p95, s.p99), (50.0, 95.0, 99.0));
+        let s = spread(&mut [7.0]);
+        assert_eq!((s.p50, s.p95, s.p99), (7.0, 7.0, 7.0));
+    }
+
+    #[test]
+    fn summarize_keeps_window_and_counts() {
+        let timings: Vec<FrameTiming> = (0..900)
+            .map(|i| FrameTiming {
+                system_s: i as f64 / 90.0,
+                interval_ms: 11.1,
+                gpu_ms: 5.0,
+                dropped: u32::from(i % 10 == 0),
+                reprojected: i % 10 == 0,
+                ..Default::default()
+            })
+            .collect();
+        let s = summarize(&timings, 1.05).unwrap();
+        assert_eq!((s.frames, s.dropped, s.reprojected), (95, 9, 9));
+        assert!((s.fps - 90.09).abs() < 0.01, "{}", s.fps);
+        assert_eq!((s.gpu_ms.p50, s.gpu_ms.p95, s.gpu_ms.p99), (5.0, 5.0, 5.0));
+    }
+
+    #[test]
+    fn summarize_empty_is_none() {
+        assert!(summarize(&[], 5.0).is_none());
+    }
 
     #[test]
     fn proximity_follows_hmd_events_only() {

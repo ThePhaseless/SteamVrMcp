@@ -7,7 +7,7 @@ fn main() {
         .header(header)
         .allowlist_type("VR_IVR(System|Input|Applications|Compositor)_FnTable")
         .allowlist_type("TrackedDevicePose_t|InputSkeletalActionData_t|VRSkeletalSummaryData_t|VRBoneTransform_t")
-        .allowlist_type("VRActiveActionSet_t|Compositor_CumulativeStats")
+        .allowlist_type("VRActiveActionSet_t|Compositor_CumulativeStats|Compositor_FrameTiming")
         .allowlist_type("ETrackedDeviceClass|ETrackedControllerRole|ETrackingUniverseOrigin|ETrackedDeviceProperty|EVRSkeletalTransformSpace")
         .allowlist_type("EVRSkeletalMotionRange|EVRSummaryType|EVRSceneApplicationState|EVRApplicationType|EVRInitError")
         .allowlist_var("IVR(System|Input|Applications|Compositor)_Version|k_unMaxTrackedDeviceCount")

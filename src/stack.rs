@@ -636,9 +636,60 @@ impl Stack {
         self.read(|vr| Ok(vr.scene_app())).ok()
     }
 
-    /// None when SteamVR is not running, no scene app runs, or the reader cannot connect.
-    pub fn frame_stats(&self) -> Option<openvr::FrameStats> {
-        self.read(|vr| vr.frame_stats()).ok()
+    /// Err when SteamVR is not running, no scene app runs, or the reader cannot connect.
+    pub fn frame_stats(&self) -> Result<openvr::FrameStats> {
+        self.read(|vr| vr.frame_stats())
+    }
+
+    /// Waits `window_s` (default 5, 0.5 to 60), then reports the compositor's frames in it, the
+    /// cumulative-counter deltas and the mean of ALVR's statistics. A part that failed is null, with
+    /// its error in `notes`.
+    // shortcut: at most TIMINGS_MAX frames of SteamVR's history, raise if longer windows need full coverage
+    pub fn frame_timing(&self, window_s: Option<f64>) -> Result<Value> {
+        let window_s = window_s.unwrap_or(5.0);
+        if !(0.5..=60.0).contains(&window_s) {
+            bail!("window_s must be from 0.5 to 60, got {window_s}");
+        }
+        let mut notes = Vec::new();
+        let mut events = self.api().events().map_err(|e| notes.push(format!("alvr: {e:#}"))).ok();
+        let s0 = self.frame_stats().map_err(|e| notes.push(format!("counts: {e:#}")));
+        let (end, mut summaries) = (Instant::now() + Duration::from_secs_f64(window_s), Vec::new());
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match events.as_mut().map(|e| e.next(left)) {
+                Some(Ok(Some(Event { event_type: EventType::StatisticsSummary(s), .. }))) => summaries.push(s),
+                Some(Ok(_)) => (),
+                Some(Err(e)) => {
+                    notes.push(format!("alvr: {e:#}"));
+                    events = None;
+                }
+                None => std::thread::sleep(left),
+            }
+        }
+        let s1 = self.frame_stats().map_err(|e| notes.push(format!("counts: {e:#}")));
+        let counts = s0.ok().zip(s1.ok()).map(|(a, b)| {
+            serde_json::json!({
+                "presents": b.presents.saturating_sub(a.presents),
+                "dropped": b.dropped.saturating_sub(a.dropped),
+                "reprojected": b.reprojected.saturating_sub(a.reprojected),
+            })
+        });
+        let compositor = match self.read(|vr| vr.frame_timings()) {
+            Ok(t) => openvr::summarize(&t, window_s),
+            Err(e) => {
+                notes.push(format!("compositor: {e:#}"));
+                None
+            }
+        };
+        let alvr = alvr_api::average(&summaries);
+        if alvr.is_none() && events.is_some() {
+            notes.push("alvr: no statistics summary arrived, the headset may not be streaming".to_owned());
+        }
+        let t_s = clock::now_s();
+        Ok(serde_json::json!({ "window_s": window_s, "t_s": t_s, "at": clock::at(t_s), "compositor": compositor, "counts": counts, "alvr": alvr, "notes": notes }))
     }
 
     /// Runs `f` on the OpenVR reader, which connects on first use and again when vrserver's pid
@@ -1265,6 +1316,13 @@ fn supervise(stack: Weak<Stack>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn frame_timing_rejects_bad_window() {
+        for w in [0.1, 61.0] {
+            assert!(test_stack().frame_timing(Some(w)).unwrap_err().to_string().contains("window_s"), "{w}");
+        }
+    }
 
     fn test_stack() -> Arc<Stack> {
         let paths = Paths {
