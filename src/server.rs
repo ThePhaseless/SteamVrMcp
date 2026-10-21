@@ -1,6 +1,6 @@
 use crate::{
     checks::{self, Readiness},
-    headset::Eye,
+    headset::{Eye, Source},
     lease::Owner,
     rig::{
         AnimateArgs, AnimateControllerArgs, AxisArgs, ButtonArgs, ControllerPoseArgs, ControllerStateArgs, FingerCurlArgs, GripArgs,
@@ -41,6 +41,9 @@ fn client_name(context: &RequestContext<RoleServer>) -> String {
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct ScreenshotArgs {
+    /// "headset" (default): the H264 stream the virtual headset receives. "compositor": SteamVR's uncompressed scene textures, which need a running scene app.
+    #[serde(default)]
+    source: Source,
     /// Which eye to show; "both" is the side-by-side frame ALVR streams.
     #[serde(default)]
     eye: Eye,
@@ -179,10 +182,11 @@ impl VrServer {
         self.run(|s| json(s.stop()?)).await.map_err(message)
     }
 
-    #[tool(description = "A PNG screenshot of what the headset streams, from a fresh keyframe: both eyes side by side, or one eye.")]
+    #[tool(description = "A PNG screenshot: both eyes side by side, or one eye. source headset (default): what the headset streams, from a fresh keyframe. source compositor: SteamVR's uncompressed scene textures; needs a scene app that has submitted a frame.")]
     async fn screenshot(&self, Parameters(args): Parameters<ScreenshotArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| {
-            let shot = s.screenshot(args.eye)?;
+            checks::source_ready(args.source.name(), &s.readiness()).map_err(|e| anyhow::anyhow!("not ready: {e}"))?;
+            let shot = s.screenshot(args.source, args.eye)?;
             Ok(CallToolResult::success(vec![
                 ContentBlock::image(STANDARD.encode(&shot.png), "image/png"),
                 ContentBlock::text(serde_json::to_string(&shot)?),

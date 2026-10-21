@@ -42,14 +42,37 @@ pub enum Eye {
     Right,
 }
 
+/// Where a screenshot comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, rmcp::schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum Source {
+    /// The H264 stream ALVR sends to the virtual headset.
+    #[default]
+    Headset,
+    /// SteamVR's compositor: the scene app's uncompressed textures, side by side.
+    Compositor,
+}
+
+impl Source {
+    pub fn name(self) -> &'static str {
+        match self {
+            Source::Headset => "headset",
+            Source::Compositor => "compositor",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Screenshot {
     #[serde(skip)]
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    pub frame_timestamp_ms: u64,
-    /// When the IDR frame arrived, on the session clock.
+    pub source: &'static str,
+    /// The stream's timestamp of the frame; only for the headset.
+    pub frame_timestamp_ms: Option<u64>,
+    /// When the IDR frame arrived (headset) or the compositor was asked (compositor), on the session clock.
     pub t_s: f64,
     pub at: String,
 }
@@ -191,6 +214,30 @@ fn crop(eye: Eye, width: u32, height: u32, rgb: &[u8]) -> (u32, Vec<u8>) {
     };
     let rows = (0..height as usize).flat_map(|y| &rgb[(y * width + from) * 3..(y * width + to) * 3]);
     ((to - from) as u32, rows.copied().collect())
+}
+
+pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>> {
+    let mut png = vec![];
+    let mut encoder = png::Encoder::new(&mut png, width, height);
+    (encoder.set_color(png::ColorType::Rgb), encoder.set_depth(png::BitDepth::Eight));
+    encoder.write_header()?.write_image_data(rgb)?;
+    Ok(png)
+}
+
+/// `eye` of a side-by-side PNG of any color type, as width, height and an 8-bit RGB PNG.
+pub fn split_png(png: &[u8], eye: Eye) -> Result<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info()?;
+    let mut buf = vec![0; reader.output_buffer_size().context("PNG too large")?];
+    let info = reader.next_frame(&mut buf)?;
+    let samples = info.color_type.samples();
+    let rgb: Vec<u8> = buf[..info.buffer_size()]
+        .chunks(samples)
+        .flat_map(|p| if samples < 3 { [p[0]; 3] } else { [p[0], p[1], p[2]] })
+        .collect();
+    let (width, rgb) = crop(eye, info.width, info.height, &rgb);
+    Ok((width, info.height, encode_rgb(width, info.height, &rgb)?))
 }
 
 fn hand_name(device_id: u64) -> &'static str {
@@ -367,12 +414,10 @@ impl Grabber {
         let ((timestamp, frame, arrived), config_nal) = frame.context("no IDR frame arrived within 2 s")?;
         let (width, height, rgb) = decode_idr(&config_nal, &frame)?;
         let (width, rgb) = crop(eye, width, height, &rgb);
-        let mut png = vec![];
-        let mut encoder = png::Encoder::new(&mut png, width, height);
-        (encoder.set_color(png::ColorType::Rgb), encoder.set_depth(png::BitDepth::Eight));
-        encoder.write_header()?.write_image_data(&rgb)?;
+        let png = encode_rgb(width, height, &rgb)?;
         let t_s = clock::t_s(arrived);
-        Ok(Screenshot { png, width, height, frame_timestamp_ms: timestamp.as_millis() as u64, t_s, at: clock::at(t_s) })
+        let (source, frame_timestamp_ms) = (Source::Headset.name(), Some(timestamp.as_millis() as u64));
+        Ok(Screenshot { png, width, height, source, frame_timestamp_ms, t_s, at: clock::at(t_s) })
     }
 }
 
@@ -461,6 +506,33 @@ mod tests {
         assert_eq!(cw, 64);
         assert!(right.chunks(3).all(|p| p[2] > 200 && p[0] < 60));
         assert_eq!(crop(Eye::Both, w, h, &rgb), (128, rgb));
+    }
+
+    #[test]
+    fn split_png_crops_rgba_halves() {
+        let mut rgba = vec![];
+        for _ in 0..2 {
+            rgba.extend([[255, 0, 0, 255]; 2].concat());
+            rgba.extend([[0, 0, 255, 255]; 2].concat());
+        }
+        let mut png = vec![];
+        let mut encoder = png::Encoder::new(&mut png, 4, 2);
+        (encoder.set_color(png::ColorType::Rgba), encoder.set_depth(png::BitDepth::Eight));
+        encoder.write_header().unwrap().write_image_data(&rgba).unwrap();
+        let pixels = |png: &[u8]| {
+            let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+            let mut out = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut out).unwrap();
+            assert_eq!(info.color_type, png::ColorType::Rgb);
+            out
+        };
+        let (w, h, left) = split_png(&png, Eye::Left).unwrap();
+        assert_eq!((w, h), (2, 2));
+        assert!(pixels(&left).chunks(3).all(|p| p == [255, 0, 0]));
+        let (_, _, right) = split_png(&png, Eye::Right).unwrap();
+        assert!(pixels(&right).chunks(3).all(|p| p == [0, 0, 255]));
+        let (w, h, both) = split_png(&png, Eye::Both).unwrap();
+        assert_eq!((w, h, pixels(&both).len()), (4, 2, 4 * 2 * 3));
     }
 
     #[test]

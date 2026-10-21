@@ -136,8 +136,9 @@ pub fn spread(values: &mut [f32]) -> Spread {
 
 /// The frames within `window_s` of the newest, or None when there are none.
 pub fn summarize(timings: &[FrameTiming], window_s: f64) -> Option<CompositorSummary> {
-    let newest = timings.iter().map(|t| t.system_s).max_by(f64::total_cmp)?;
-    let kept: Vec<&FrameTiming> = timings.iter().filter(|t| t.system_s >= newest - window_s).collect();
+    let finite: Vec<&FrameTiming> = timings.iter().filter(|t| t.system_s.is_finite()).collect();
+    let newest = finite.iter().map(|t| t.system_s).max_by(f64::total_cmp)?;
+    let kept: Vec<&FrameTiming> = finite.into_iter().filter(|t| t.system_s >= newest - window_s).collect();
     let mean = kept.iter().map(|t| t.interval_ms).sum::<f32>() / kept.len() as f32;
     Some(CompositorSummary {
         frames: kept.len(),
@@ -178,6 +179,7 @@ pub struct OpenVr {
     input: *const VR_IVRInput_FnTable,
     apps: *const VR_IVRApplications_FnTable,
     compositor: *const VR_IVRCompositor_FnTable,
+    screenshots: *const VR_IVRScreenshots_FnTable,
     set: VRActionSetHandle_t,
     skeletons: [VRActionHandle_t; 2],
     // shortcut: whether SteamVR delivers these events to a Background app is unverified live, check once and fall back to None
@@ -214,6 +216,7 @@ impl OpenVr {
             input: ptr::null(),
             apps: ptr::null(),
             compositor: ptr::null(),
+            screenshots: ptr::null(),
             set: 0,
             skeletons: [0; 2],
             head_proximity: Cell::new(None),
@@ -237,6 +240,7 @@ impl OpenVr {
         self.input = table(IVRInput_Version)? as _;
         self.apps = table(IVRApplications_Version)? as _;
         self.compositor = table(IVRCompositor_Version)? as _;
+        self.screenshots = table(IVRScreenshots_Version)? as _;
 
         let dir = state_dir.join("openvr");
         fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
@@ -388,6 +392,18 @@ impl OpenVr {
         Ok(FrameStats { presents: s.m_nNumFramePresents, dropped: s.m_nNumDroppedFrames, reprojected: s.m_nNumReprojectedFrames })
     }
 
+    /// Asks the compositor to write the scene app's current textures to `<preview>.png` and `<vr>.png`
+    /// (side by side); the files appear later, written by vrserver. Paths are given without extension.
+    pub fn take_stereo_screenshot(&self, preview: &Path, vr: &Path) -> Result<()> {
+        let (preview, vr) = (CString::new(preview.as_os_str().as_bytes())?, CString::new(vr.as_os_str().as_bytes())?);
+        let mut handle = 0;
+        let e = call!(self.screenshots, TakeStereoScreenshot, &mut handle, preview.as_ptr() as *mut _, vr.as_ptr() as *mut _);
+        if e != EVRScreenshotError_VRScreenshotError_None {
+            bail!("{}", screenshot_error(e));
+        }
+        Ok(())
+    }
+
     /// The compositor's recent frames, oldest first.
     pub fn frame_timings(&self) -> Result<Vec<FrameTiming>> {
         let mut frames = vec![unsafe { zeroed::<Compositor_FrameTiming>() }; TIMINGS_MAX as usize];
@@ -408,6 +424,15 @@ impl OpenVr {
             })
             .collect())
     }
+}
+
+fn screenshot_error(code: EVRScreenshotError) -> String {
+    let hint = match code {
+        EVRScreenshotError_VRScreenshotError_ScreenshotAlreadyInProgress => ": a screenshot is already in progress, retry in a moment",
+        EVRScreenshotError_VRScreenshotError_RequestFailed => ": no scene app has submitted a frame yet, launch one first",
+        _ => "",
+    };
+    format!("TakeStereoScreenshot: EVRScreenshotError {code}{hint}")
 }
 
 /// The hmd's worn state after an event; SteamVR derives these from the driver's /proximity input.
@@ -462,6 +487,22 @@ mod tests {
     #[test]
     fn summarize_empty_is_none() {
         assert!(summarize(&[], 5.0).is_none());
+    }
+
+    #[test]
+    fn summarize_drops_non_finite_samples() {
+        let at = |system_s| FrameTiming { system_s, interval_ms: 10.0, ..Default::default() };
+        assert!(summarize(&[at(f64::NAN)], 5.0).is_none());
+        let s = summarize(&[at(f64::NAN), at(1.0), at(f64::INFINITY), at(2.0)], 5.0).unwrap();
+        assert_eq!(s.frames, 2);
+    }
+
+    #[test]
+    fn screenshot_errors_carry_hints() {
+        let hint = |code| screenshot_error(code).to_string();
+        assert!(hint(108).contains("already in progress"), "{}", hint(108));
+        assert!(hint(1).contains("scene app"), "{}", hint(1));
+        assert!(hint(101).contains("101") && !hint(101).contains("scene app"));
     }
 
     #[test]

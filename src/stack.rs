@@ -4,7 +4,7 @@ use crate::{
     checks::{self, Check, Readiness},
     clock,
     config::{Config, Paths},
-    headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot},
+    headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot, Source},
     lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
     rig::{self, AppliedStep, Rig, RigAction, SequenceReport, SequenceStep},
@@ -27,6 +27,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::{
     collections::VecDeque,
+    path::Path,
     process::Child,
     sync::{Arc, Weak},
     thread,
@@ -56,6 +57,19 @@ fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T + Send + '
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || tx.send(f()).ok());
     rx.recv_timeout(timeout).ok()
+}
+
+/// The file's bytes once its size is non-zero and the same on two polls 100 ms apart: vrserver writes it on its own schedule.
+fn read_when_stable(path: &Path, timeout: Duration) -> Result<Vec<u8>> {
+    let mut last = 0;
+    let stable = steamvr::wait_for(timeout, || {
+        let size = std::fs::metadata(path).map_or(0, |m| m.len());
+        size > 0 && size == std::mem::replace(&mut last, size)
+    });
+    if !stable {
+        bail!("SteamVR wrote no screenshot to {} within {} s; vrserver may not see this directory", path.display(), timeout.as_secs());
+    }
+    std::fs::read(path).with_context(|| path.display().to_string())
 }
 
 /// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
@@ -565,10 +579,30 @@ impl Stack {
         Ok(())
     }
 
-    /// A screenshot of the headset's stream. The wait for the frame runs outside the state lock.
-    pub fn screenshot(&self, eye: Eye) -> Result<Screenshot> {
+    /// A screenshot of the headset's stream, or of the compositor's scene textures. The waits run outside the state lock.
+    pub fn screenshot(&self, source: Source, eye: Eye) -> Result<Screenshot> {
+        if source == Source::Compositor {
+            return self.compositor_screenshot(eye);
+        }
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
         grabber.screenshot(&self.api(), eye)
+    }
+
+    fn compositor_screenshot(&self, eye: Eye) -> Result<Screenshot> {
+        // shortcut: assumes vrserver's container can write state_dir (true under $HOME), as for the action manifest
+        let dir = self.paths().state_dir.join("screenshots");
+        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        let t_s = clock::now_s();
+        let stem = format!("vr-{}", (t_s * 1000.0) as u64);
+        let (preview, vr) = (dir.join(format!("{stem}-preview")), dir.join(&stem));
+        let (p, v) = (preview.clone(), vr.clone());
+        let taken = self.read(move |openvr| openvr.take_stereo_screenshot(&p, &v));
+        let png = taken.and_then(|()| read_when_stable(&dir.join(format!("{stem}.png")), Duration::from_secs(10)));
+        for f in [format!("{stem}-preview.png"), format!("{stem}.png")] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
+        let (width, height, png) = headset::split_png(&png?, eye)?;
+        Ok(Screenshot { png, width, height, source: Source::Compositor.name(), frame_timestamp_ms: None, t_s, at: clock::at(t_s) })
     }
 
     /// Changes the head or a controller; returns how long until an animation is done.
@@ -1555,6 +1589,27 @@ mod tests {
     fn within_reports_a_stuck_closure_as_leaked() {
         assert_eq!(within(Duration::from_secs(1), || 5), Some(5));
         assert_eq!(within(Duration::from_millis(20), || thread::sleep(Duration::from_millis(300))), None);
+    }
+
+    #[test]
+    fn read_when_stable_waits_for_the_writer() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-stable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        let writer = {
+            let path = path.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                std::fs::write(&path, b"ab").unwrap();
+                thread::sleep(Duration::from_millis(30)); // grows between two polls
+                std::fs::write(&path, b"abcd").unwrap();
+            })
+        };
+        assert_eq!(read_when_stable(&path, Duration::from_secs(5)).unwrap(), b"abcd");
+        writer.join().unwrap();
+        let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("never.png"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn pairs(path: &str, value: serde_json::Value) -> Vec<PathValuePair> {

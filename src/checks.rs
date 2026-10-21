@@ -43,13 +43,39 @@ const AMD: u32 = 0x1002;
 const INTEL: u32 = 0x8086;
 const NVIDIA: u32 = 0x10de;
 
-/// Ok, or the first missing need of `tool`.
-pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
-    let checks = |names: &[&str]| match names.iter().find_map(|n| Some((n, r.failed.get(n)?))) {
+/// The screenshot sources `source_ready` knows, in the order the tool's error lists them.
+pub const SOURCES: &[&str] = &["headset", "compositor"];
+
+/// Ok, or the first of `names` that failed its startup check.
+pub(crate) fn failed_check(r: &Readiness, names: &[&str]) -> Result<(), String> {
+    match names.iter().find_map(|n| Some((n, r.failed.get(n)?))) {
         Some((name, reason)) => Err(format!("check {name} failed: {reason}")),
         None => Ok(()),
-    };
-    let holds = |ok: bool, missing: &str| if ok { Ok(()) } else { Err(missing.to_owned()) };
+    }
+}
+
+fn holds(ok: bool, missing: &str) -> Result<(), String> {
+    if ok { Ok(()) } else { Err(missing.to_owned()) }
+}
+
+/// Ok, or the first missing need of one `screenshot` source.
+pub fn source_ready(source: &str, r: &Readiness) -> Result<(), String> {
+    match source {
+        "headset" => {
+            holds(r.streaming, "headset is not streaming")?;
+            failed_check(r, &["h264_encoder", "screenshot_decoder"])
+        }
+        "compositor" => {
+            holds(r.steamvr_running, "SteamVR is not running")?;
+            failed_check(r, &["openvr_client"])
+        }
+        _ => Err("unknown source".to_owned()),
+    }
+}
+
+/// Ok, or the first missing need of `tool`.
+pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
+    let checks = |names: &[&str]| failed_check(r, names);
     let streaming = || holds(r.streaming, "headset is not streaming");
     if let Some(holder) = &r.leased_to
         && !READ_ONLY.contains(&tool)
@@ -71,8 +97,8 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
         | "set_hand_skeleton" | "set_hand_gesture" | "run_sequence" | "set_playspace" | "recenter"
         | "get_haptics" | "set_proximity" => streaming(),
         "screenshot" => {
-            streaming()?;
-            checks(&["h264_encoder", "screenshot_decoder"])
+            let reasons: Vec<String> = SOURCES.iter().map(|s| source_ready(s, r)).filter_map(Result::err).collect();
+            if reasons.len() == SOURCES.len() { Err(reasons.join("; ")) } else { Ok(()) }
         }
         "read_app_log" | "wait_for_log" => holds(r.app_logs, "no [app_logs] entry in config.toml"),
         "get_tracked_state" => {
@@ -365,6 +391,28 @@ mod tests {
         for tool in READ_ONLY {
             assert_eq!(tool_ready(tool, &r), Ok(()), "{tool}");
         }
+    }
+
+    #[test]
+    fn source_ready_per_source() {
+        let r = Readiness { streaming: false, ..all_ready() };
+        assert_eq!(source_ready("headset", &r), Err("headset is not streaming".to_owned()));
+        assert_eq!(source_ready("compositor", &r), Ok(()));
+        let r = Readiness { steamvr_running: false, ..all_ready() };
+        assert_eq!(source_ready("compositor", &r), Err("SteamVR is not running".to_owned()));
+        assert_eq!(source_ready("headset", &r), Ok(()));
+        let r = Readiness { failed: [("openvr_client", "gone".to_owned())].into(), ..all_ready() };
+        assert!(source_ready("compositor", &r).unwrap_err().contains("openvr_client"));
+        assert_eq!(source_ready("bogus", &all_ready()), Err("unknown source".to_owned()));
+    }
+
+    #[test]
+    fn screenshot_listed_while_any_source_ready() {
+        let r = Readiness { streaming: false, steamvr_running: true, ..all_ready() };
+        assert_eq!(tool_ready("screenshot", &r), Ok(()));
+        let r = Readiness { streaming: false, steamvr_running: false, ..all_ready() };
+        let err = tool_ready("screenshot", &r).unwrap_err();
+        assert!(err.contains("headset is not streaming") && err.contains("SteamVR is not running"), "{err}");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use std::{
 use vr_test_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
-    headset::Eye,
+    headset::{Eye, Source},
     openvr::TrackedState,
     hand::Gesture,
     rig::{
@@ -212,9 +212,9 @@ fn live_screenshot_png() {
     };
     for (eye, width) in [(Eye::Both, 2 * view_w), (Eye::Left, view_w)] {
         let started = Instant::now();
-        let shot = s.screenshot(eye).unwrap();
+        let shot = s.screenshot(Source::Headset, eye).unwrap();
         let took = started.elapsed();
-        println!("{eye:?}: {}x{} in {took:?}, frame at {} ms", shot.width, shot.height, shot.frame_timestamp_ms);
+        println!("{eye:?}: {}x{} in {took:?}, frame at {:?} ms", shot.width, shot.height, shot.frame_timestamp_ms);
         assert!(took < Duration::from_secs(3), "{eye:?} took {took:?}");
         let (w, h, rgb) = decode(&shot.png);
         assert_eq!((w, h, shot.width, shot.height), (width, view_h, width, view_h), "{eye:?}");
@@ -263,7 +263,7 @@ fn live_head_move_tracked() {
     let set = |position, yaw| s.apply(RigAction::SetHeadPose(PoseArgs { position, yaw, ..Default::default() })).unwrap();
     let hmd = || s.tracked_state(false).unwrap().devices.into_iter().find(|d| d.class == "hmd").expect("no hmd");
     let pixels = |eye| {
-        let png = s.screenshot(eye).unwrap().png;
+        let png = s.screenshot(Source::Headset, eye).unwrap().png;
         let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
         let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
         reader.next_frame(&mut rgb).unwrap();
@@ -402,7 +402,7 @@ fn live_launch_app_reaches_menu() {
     // Beat Saber is a Windows game; this needs an explicit CompatToolMapping entry, as a shortcut has
     assert!(report.app.compat_tool.is_some(), "no compatibility tool reported: {report:?}");
     thread::sleep(Duration::from_secs(15));
-    let shot = s.screenshot(Eye::Left).unwrap();
+    let shot = s.screenshot(Source::Headset, Eye::Left).unwrap();
     let mut reader = png::Decoder::new(std::io::Cursor::new(&shot.png)).read_info().unwrap();
     let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
     reader.next_frame(&mut rgb).unwrap();
@@ -434,9 +434,9 @@ fn live_swing_with_trigger() {
     let s = ensure_streaming();
     let app = s.launch_app(&id).unwrap();
     thread::sleep(Duration::from_secs(15)); // the menu
-    let a = rgb(&s.screenshot(Eye::Left).unwrap().png);
+    let a = rgb(&s.screenshot(Source::Headset, Eye::Left).unwrap().png);
     thread::sleep(Duration::from_secs(1));
-    let a2 = rgb(&s.screenshot(Eye::Left).unwrap().png); // the menu at rest, to tell menu motion from the swing
+    let a2 = rgb(&s.screenshot(Source::Headset, Eye::Left).unwrap().png); // the menu at rest, to tell menu motion from the swing
     let steps: Vec<SequenceStep> = serde_json::from_value(json!([
         { "at_s": 0.0, "action": "set_trigger", "args": { "hand": "right", "value": 1.0 } },
         { "at_s": 0.0, "action": "animate_controller", "args": {
@@ -449,7 +449,7 @@ fn live_swing_with_trigger() {
         let s = Arc::clone(&s);
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(750));
-            s.screenshot(Eye::Left).unwrap()
+            s.screenshot(Source::Headset, Eye::Left).unwrap()
         })
     };
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
