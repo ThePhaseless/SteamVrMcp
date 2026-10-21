@@ -32,6 +32,27 @@ struct Shared {
     last_frame: Duration,
 }
 
+impl Shared {
+    /// The decoder callback. Accepts a frame only once DecoderConfig has arrived, as a real client
+    /// does: the server sends DecoderConfig only in reply to RequestIdr (server_core
+    /// connection.rs:1287-1294), and the client sends one for every frame not accepted.
+    fn on_frame(&mut self, timestamp: Duration) -> bool {
+        self.status.frames_received += 1;
+        self.last_frame = timestamp;
+        self.status.codec.is_some()
+    }
+
+    fn on_decoder_config(&mut self, codec: String, config_nal: Vec<u8>) {
+        self.status.codec = Some(codec);
+        self.config_nal = config_nal;
+    }
+
+    fn on_streaming_stopped(&mut self) {
+        let status = &mut self.status;
+        (status.streaming, status.fps, status.view_resolution, status.codec) = (false, 0.0, [0, 0], None);
+    }
+}
+
 /// The virtual headset: a stock `ClientCoreContext` driven like `alvr_client_mock`, without its GUI.
 pub struct Headset {
     context: Arc<ClientCoreContext>,
@@ -118,13 +139,10 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, sto
                     if let Some(t) = tracking.take() {
                         t.join().ok();
                     }
-                    let status = &mut shared.lock().status;
-                    (status.streaming, status.fps, status.view_resolution, status.codec) = (false, 0.0, [0, 0], None);
+                    shared.lock().on_streaming_stopped();
                 }
                 ClientCoreEvent::DecoderConfig { codec, config_nal } => {
-                    let mut shared = shared.lock();
-                    shared.status.codec = Some(format!("{codec:?}"));
-                    shared.config_nal = config_nal;
+                    shared.lock().on_decoder_config(format!("{codec:?}"), config_nal);
                 }
                 ClientCoreEvent::Haptics { .. } | ClientCoreEvent::RealTimeConfig(_) => (),
             }
@@ -155,13 +173,7 @@ impl Headset {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(RelaxedAtomic::new(false));
         let frames = Arc::clone(&shared);
-        // true for every frame: false makes the client request an IDR on every frame
-        context.set_decoder_input_callback(Box::new(move |timestamp, _nal| {
-            let mut shared = frames.lock();
-            shared.status.frames_received += 1;
-            shared.last_frame = timestamp;
-            true
-        }));
+        context.set_decoder_input_callback(Box::new(move |timestamp, _nal| frames.lock().on_frame(timestamp)));
         context.resume();
         let thread = thread::spawn({
             let (context, shared, stop) = (Arc::clone(&context), Arc::clone(&shared), Arc::clone(&stop));
@@ -212,5 +224,18 @@ mod tests {
         assert_eq!(c.default_view_resolution % 32, UVec2::ZERO);
         assert_eq!(c.refresh_rates, vec![72.0, 90.0]);
         assert!(!c.foveated_encoding);
+    }
+
+    #[test]
+    fn frames_are_accepted_only_after_decoder_config() {
+        let mut s = Shared::default();
+        // not accepted: the client then sends RequestIdr, the only trigger for DecoderConfig
+        assert!(!s.on_frame(Duration::from_millis(1)));
+        s.on_decoder_config("H264".into(), vec![0, 0, 1]);
+        assert!(s.on_frame(Duration::from_millis(2)));
+        s.on_streaming_stopped();
+        assert!(!s.on_frame(Duration::from_millis(3)), "a new stream needs a new DecoderConfig");
+        assert_eq!((s.status.frames_received, s.last_frame), (3, Duration::from_millis(3)));
+        assert_eq!(s.status.codec, None);
     }
 }
