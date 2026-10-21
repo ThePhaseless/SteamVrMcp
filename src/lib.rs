@@ -3,6 +3,7 @@ pub mod checks;
 pub mod config;
 pub mod headset;
 pub mod openvr;
+pub mod rig;
 pub mod server;
 pub mod setup;
 pub mod stack;

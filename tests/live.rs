@@ -1,11 +1,13 @@
 mod common;
 
+use alvr_common::glam::{Quat, Vec3};
 use common::Snap;
 use std::{fs, panic, path::Path, sync::{Arc, OnceLock}, thread, time::{Duration, Instant}};
 use vr_test_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
     headset::Eye,
+    rig::{AnimateArgs, PoseArgs, RigAction},
     setup::{prepare, restore, session_values},
     stack::Stack,
     steamvr,
@@ -218,6 +220,60 @@ fn live_tracked_head_matches() {
     roles.sort();
     // pose_valid may stay false until Task 6 sends controller poses
     assert_eq!(roles, ["left", "right"], "{:?}", state.devices);
+}
+
+/// Proves done-when 3: head moves show in get_tracked_state and in the screenshot (and the
+/// deferred Task 4 check that the screenshot changes between two head poses). Needs Steam closed
+/// or its GPU supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_head_move_tracked() {
+    let s = ensure_streaming();
+    let set = |position, yaw| s.apply(RigAction::SetHeadPose(PoseArgs { position, yaw, ..Default::default() })).unwrap();
+    let hmd = || s.tracked_state(false).unwrap().devices.into_iter().find(|d| d.class == "hmd").expect("no hmd");
+    let pixels = |eye| {
+        let png = s.screenshot(eye).unwrap().png;
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+        let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut rgb).unwrap();
+        rgb
+    };
+
+    set([0.0, 1.6, 0.0], None);
+    thread::sleep(Duration::from_millis(300));
+    let a = pixels(Eye::Left);
+    set([0.3, 1.7, -0.2], Some(90.0));
+    thread::sleep(Duration::from_millis(300));
+    let d = hmd();
+    let forward = Quat::from_array(d.quat) * Vec3::NEG_Z;
+    let yaw = (-forward.x).atan2(-forward.z).to_degrees();
+    println!("hmd {:?} yaw {yaw:.2}", d.position);
+    assert!(Vec3::from_array(d.position).distance(Vec3::new(0.3, 1.7, -0.2)) < 0.01, "{d:?}");
+    assert!((yaw - 90.0).abs() < 1.0, "yaw {yaw}: {d:?}");
+    let b = pixels(Eye::Left);
+    assert_eq!(a.len(), b.len());
+    let diff = a.iter().zip(&b).map(|(&x, &y)| (x as f64 - y as f64).abs()).sum::<f64>() / a.len() as f64;
+    println!("mean absolute pixel difference {diff:.2}");
+    assert!(diff > 8.0, "the screenshot did not change with the head pose: {diff:.2}");
+
+    let waypoints = vec![
+        PoseArgs { position: [0.0, 1.6, -0.5], ..Default::default() },
+        PoseArgs { position: [0.3, 1.6, 0.0], yaw: Some(-45.0), ..Default::default() },
+    ];
+    let started = Instant::now();
+    let done_after = s.apply(RigAction::AnimateHead(AnimateArgs { waypoints, duration_s: 2.0 })).unwrap();
+    assert_eq!(done_after, Duration::from_secs(2));
+    for at in [0.5, 1.5] {
+        thread::sleep(Duration::from_secs_f32(at).saturating_sub(started.elapsed()));
+        let d = hmd();
+        println!("at {at} s: {d:?}");
+        assert!(Vec3::from_array(d.linear_velocity).length() > 0.05, "no velocity mid-animation: {d:?}");
+    }
+    thread::sleep(done_after.saturating_sub(started.elapsed()) + Duration::from_millis(300));
+    let d = hmd();
+    assert!(Vec3::from_array(d.position).distance(Vec3::new(0.3, 1.6, 0.0)) < 0.01, "{d:?}");
+    // later tests in this process expect the default head pose
+    set([0.0, 1.6, 0.0], None);
 }
 
 /// Proves early risk 5 (Beat Saber runs on the integrated GPU at the MCP's default resolution). Needs env

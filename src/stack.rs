@@ -4,12 +4,13 @@ use crate::{
     config::{Config, Paths},
     headset::{self, Eye, Headset, HeadsetStatus, Screenshot},
     openvr::{self, OpenVr},
+    rig::{Rig, RigAction},
     setup,
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
 use alvr_common::{
     ConnectionState,
-    anyhow::{Context, Result, bail},
+    anyhow::{Context, Result, anyhow, bail},
     error,
     parking_lot::Mutex,
     warn,
@@ -109,6 +110,8 @@ pub struct Stack {
     /// calls (bounded by OPENVR_TIMEOUT), never together with `state`.
     reader: Mutex<Option<(u32, OpenVr)>>,
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// The poses every headset sends; outlives headset restarts. Locked only briefly.
+    rig: Arc<Mutex<Rig>>,
 }
 
 pub fn restore_guard(steamvr_running: bool) -> Result<()> {
@@ -131,6 +134,7 @@ impl Stack {
             checks: Mutex::default(),
             reader: Mutex::new(None),
             on_change: Mutex::new(None),
+            rig: Arc::default(),
         });
         stack.recheck();
         let weak = Arc::downgrade(&stack);
@@ -186,6 +190,11 @@ impl Stack {
     pub fn screenshot(&self, eye: Eye) -> Result<Screenshot> {
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
         grabber.screenshot(&self.api, eye)
+    }
+
+    /// Changes the head or a controller; returns how long until an animation is done.
+    pub fn apply(&self, a: RigAction) -> Result<Duration> {
+        self.rig.lock().apply(a, Instant::now()).map_err(|e| anyhow!(e))
     }
 
     /// SteamVR's own view of devices and hand skeletons.
@@ -288,7 +297,7 @@ impl Stack {
         }
         self.paths.session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
 
-        self.state.lock().headset.get_or_insert_with(Headset::start);
+        self.state.lock().headset.get_or_insert_with(|| Headset::start(Arc::clone(&self.rig)));
         let hostname = headset::client_hostname()?;
         let values = setup::session_values(&self.cfg)?;
         let steamvr_running = steamvr::is_steamvr_running();
@@ -412,7 +421,7 @@ impl Stack {
         if let Some(h) = old {
             self.dispose(h); // the old client must stop listening on 9943 before the new one starts
         }
-        let new = Headset::start();
+        let new = Headset::start(Arc::clone(&self.rig));
         self.state.lock().headset = Some(new);
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
         self.restart_steamvr();
@@ -464,7 +473,7 @@ impl Stack {
         });
         self.drop_reader();
         let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api);
-        let headset = headset.inspect(Headset::resume).unwrap_or_else(Headset::start);
+        let headset = headset.inspect(Headset::resume).unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
         let spare = {
             let mut state = self.state.lock();
             match state.headset {

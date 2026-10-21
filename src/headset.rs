@@ -1,12 +1,11 @@
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
-    DeviceMotion, Fov, HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    Fov, Pose, RelaxedAtomic, ViewParams,
     anyhow::{Context, Result, bail},
     glam::{Quat, UVec2, Vec3},
     parking_lot::Mutex,
 };
-use crate::alvr_api::Api;
-use alvr_packets::{FaceData, TrackingData};
+use crate::{alvr_api::Api, rig::Rig};
 use openh264::{decoder::Decoder, formats::YUVSource};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -148,25 +147,19 @@ fn view_params() -> [ViewParams; 2] {
     ]
 }
 
-fn tracking_thread(context: Arc<ClientCoreContext>, streaming: Arc<RelaxedAtomic>, fps: f32) {
+fn tracking_thread(context: Arc<ClientCoreContext>, rig: Arc<Mutex<Rig>>, streaming: Arc<RelaxedAtomic>, fps: f32) {
     let origin = Instant::now();
     let mut deadline = Instant::now();
     while streaming.value() {
-        let pose = Pose { orientation: Quat::IDENTITY, position: Vec3::new(0.0, 1.6, 0.0) };
-        context.send_tracking(TrackingData {
-            poll_timestamp: origin.elapsed(),
-            device_motions: vec![(*HEAD_ID, DeviceMotion { pose, linear_velocity: Vec3::ZERO, angular_velocity: Vec3::ZERO })],
-            hand_skeletons: [None, None],
-            face: FaceData::default(),
-            body: None,
-        });
+        let data = rig.lock().tracking(Instant::now(), origin.elapsed());
+        context.send_tracking(data);
         deadline += Duration::from_secs_f32(1.0 / fps / 3.0);
         thread::sleep(deadline.saturating_duration_since(Instant::now()));
     }
 }
 
 /// Port of the mock's `client_thread` loop: events, then one emulated frame per frame period.
-fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, stop: Arc<RelaxedAtomic>) {
+fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig: Arc<Mutex<Rig>>, stop: Arc<RelaxedAtomic>) {
     let streaming = Arc::new(RelaxedAtomic::new(false));
     let mut tracking = None;
     let mut reported_frame = Duration::ZERO;
@@ -186,8 +179,8 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, sto
                     }
                     context.send_view_params(view_params());
                     streaming.set(true);
-                    let (context, streaming) = (Arc::clone(&context), Arc::clone(&streaming));
-                    tracking = Some(thread::spawn(move || tracking_thread(context, streaming, fps)));
+                    let (context, rig, streaming) = (Arc::clone(&context), Arc::clone(&rig), Arc::clone(&streaming));
+                    tracking = Some(thread::spawn(move || tracking_thread(context, rig, streaming, fps)));
                 }
                 ClientCoreEvent::StreamingStopped => {
                     streaming.set(false);
@@ -223,7 +216,8 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, sto
 }
 
 impl Headset {
-    pub fn start() -> Headset {
+    /// Starts the client; its tracking thread sends what `rig` holds.
+    pub fn start(rig: Arc<Mutex<Rig>>) -> Headset {
         let context = Arc::new(ClientCoreContext::new(capabilities(), vec![]));
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(RelaxedAtomic::new(false));
@@ -232,7 +226,7 @@ impl Headset {
         context.resume();
         let thread = thread::spawn({
             let (context, shared, stop) = (Arc::clone(&context), Arc::clone(&shared), Arc::clone(&stop));
-            move || event_thread(context, shared, stop)
+            move || event_thread(context, shared, rig, stop)
         });
         Headset { context, shared, stop, thread: Some(thread) }
     }

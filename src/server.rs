@@ -1,4 +1,9 @@
-use crate::{checks::{self, Readiness}, headset::Eye, stack::Stack};
+use crate::{
+    checks::{self, Readiness},
+    headset::Eye,
+    rig::{AnimateArgs, AnimateControllerArgs, ControllerPoseArgs, ControllerStateArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction},
+    stack::Stack,
+};
 use alvr_common::anyhow::{self, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rmcp::{
@@ -101,6 +106,60 @@ impl VrServer {
             json(serde_json::json!({ "devices": state.devices, "skeletons": state.skeletons, "scene_app": s.scene_app() }))
         })
         .await
+        .map_err(message)
+    }
+
+    /// Applies `a`; an animation returns once it is done.
+    async fn rig(&self, a: RigAction) -> Result<CallToolResult, String> {
+        let animated = matches!(a, RigAction::AnimateHead(_) | RigAction::AnimateController(_));
+        let done_after = self.stack.apply(a).map_err(message)?; // a brief rig lock, no blocking call
+        if !animated {
+            return json(serde_json::json!({ "ok": true })).map_err(message);
+        }
+        tokio::time::sleep(done_after).await; // no Stack lock is held here
+        json(serde_json::json!({ "done_after_s": done_after.as_secs_f32() })).map_err(message)
+    }
+
+    #[tool(description = "Set the head pose in SteamVR standing space (meters, +Y up, -Z forward): position plus yaw/pitch/roll in degrees, or a quaternion x, y, z, w. Stops an animation.")]
+    async fn set_head_pose(&self, Parameters(args): Parameters<PoseArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetHeadPose(args)).await
+    }
+
+    #[tool(description = "Move the head relative to where it is: offset in meters along the playspace axes or, with frame \"local\", the head's own axes; yaw/pitch/roll in degrees about the head's own axes.")]
+    async fn move_head(&self, Parameters(args): Parameters<MoveArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::MoveHead(args)).await
+    }
+
+    #[tool(description = "Move the head smoothly from its current pose through the waypoints, evenly spaced over duration_s, sending velocities as a real headset does. Returns when done.")]
+    async fn animate_head(&self, Parameters(args): Parameters<AnimateArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::AnimateHead(args)).await
+    }
+
+    #[tool(description = "Set a Valve Index controller's pose, in the playspace or relative to the head's pose now (relative_to \"head\"). Same pose fields as set_head_pose.")]
+    async fn set_controller_pose(&self, Parameters(args): Parameters<ControllerPoseArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetControllerPose(args)).await
+    }
+
+    #[tool(description = "Move a controller relative to where it is, as move_head does for the head.")]
+    async fn move_controller(&self, Parameters(args): Parameters<MoveControllerArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::MoveController(args)).await
+    }
+
+    #[tool(description = "Animate a controller through waypoints, as animate_head does; waypoints are in the playspace or relative to the head's pose at the call. Returns when done.")]
+    async fn animate_controller(&self, Parameters(args): Parameters<AnimateControllerArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::AnimateController(args)).await
+    }
+
+    #[tool(description = "Connect or disconnect a controller. ALVR 21 has one flag for both connected and tracked (Controller.cpp:187-205), so either false makes the controller disconnected and untracked. Input tools refuse for it.")]
+    async fn set_controller_state(&self, Parameters(args): Parameters<ControllerStateArgs>) -> Result<CallToolResult, String> {
+        let active = args.active();
+        self.rig(RigAction::SetControllerState(args)).await?;
+        json(serde_json::json!({
+            "ok": true,
+            "connected": active,
+            "tracked": active,
+            "note": "ALVR 21 sets connected and tracked from one flag per hand (Controller.cpp:187-205)",
+        }))
         .map_err(message)
     }
 
