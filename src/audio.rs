@@ -42,7 +42,7 @@ pub fn check() -> Result<String, String> {
     match within(CHECK_TIMEOUT, probe) {
         Some(Ok(())) => Ok("PipeWire connects".to_owned()),
         Some(Err(e)) => Err(format!("PipeWire: {e}")),
-        None => Err(format!("no answer from PipeWire within {} s", CHECK_TIMEOUT.as_secs())),
+        None => Err(format!("no answer from PipeWire (deadline {} s)", CHECK_TIMEOUT.as_secs())),
     }
 }
 
@@ -69,11 +69,12 @@ pub fn capture(seconds: f64) -> Result<Vec<i16>> {
             move |id, _, res, msg| if id == 0 { fail(format!("PipeWire disconnected: {msg} ({res})")) }
         })
         .register();
+    let deadline = Duration::from_secs_f64(seconds) + SLACK;
     let timer = mainloop.loop_().add_timer({
         let fail = fail.clone();
-        move |_| fail("no audio from the default sink's monitor; is a default sink running?".to_owned())
+        move |_| fail(format!("no audio from the default sink's monitor (deadline {} s); is a default sink running?", deadline.as_secs_f64()))
     });
-    timer.update_timer(Some(Duration::from_secs_f64(seconds) + SLACK), None).into_result()?;
+    timer.update_timer(Some(deadline), None).into_result()?;
     let stream = StreamRc::new(
         core.clone(),
         "vr-test-mcp-capture",

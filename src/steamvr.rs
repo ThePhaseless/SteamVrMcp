@@ -79,6 +79,23 @@ pub fn wait_gone(names: &[&str], timeout: Duration) -> bool {
     wait_for(timeout, || names.iter().all(|n| pids_named(n).is_empty()))
 }
 
+/// The first key seen on an earlier poll that is no longer `alive`. `seen` carries the keys across
+/// polls; `appeared` adds this poll's.
+pub fn gone_after_seen<K: Copy + PartialEq>(seen: &mut Vec<K>, appeared: impl IntoIterator<Item = K>, alive: impl Fn(K) -> bool) -> Option<K> {
+    for k in appeared {
+        if !seen.contains(&k) {
+            seen.push(k);
+        }
+    }
+    seen.iter().copied().find(|&k| !alive(k))
+}
+
+/// vrserver or vrmonitor once it ran during this wait (`seen`) and is gone: SteamVR quit or crashed.
+pub fn vr_exited(seen: &mut Vec<&'static str>) -> Option<&'static str> {
+    let up: Vec<&'static str> = ["vrserver", "vrmonitor"].into_iter().filter(|n| !pids_named(n).is_empty()).collect();
+    gone_after_seen(seen, up.iter().copied(), |n| up.contains(&n))
+}
+
 /// `pid` as kill() takes it, when that names one process the MCP may signal: 0 and anything above
 /// i32::MAX would signal a process group or every process, and init, this MCP and the leader of its
 /// process group (often the agent that started it) are never signalled.
@@ -99,12 +116,15 @@ pub fn kill_vr_processes() -> bool {
         for name in VR_PROCESS_NAMES {
             pids_named(name).into_iter().for_each(|pid| terminate(pid, sig));
         }
-        if wait_gone(VR_PROCESS_NAMES, Duration::from_secs(5)) {
+        if wait_gone(VR_PROCESS_NAMES, KILL_WAIT) {
             return true;
         }
     }
     false
 }
+
+/// How long kill_vr_processes waits after each signal.
+pub const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// True when `now` holds a vrserver pid that `old` does not: SteamVR really relaunched.
 pub fn is_new_vrserver(old: &[u32], now: &[u32]) -> bool {
@@ -367,10 +387,10 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option
         blocked.is_some()
     });
     if let Some(msg) = not_taken {
-        bail!(msg);
+        bail!("failed: {msg}");
     }
     if let Some((id, step)) = blocked {
-        bail!("Steam is waiting for a dialog on the desktop ({step} for AppID {id}); dismiss it and retry");
+        bail!("failed: Steam is waiting for a dialog on the desktop ({step} for AppID {id}); dismiss it and retry");
     }
     Ok(finished)
 }
@@ -477,7 +497,7 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
     if !wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
         if !kill_vr_processes() {
             let left: Vec<_> = VR_PROCESS_NAMES.iter().filter(|n| !pids_named(n).is_empty()).collect();
-            bail!("SteamVR processes still running after SIGKILL: {left:?}");
+            bail!("SteamVR processes still running after SIGKILL: {left:?} (deadline {} s)", KILL_WAIT.as_secs());
         }
     }
     // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
@@ -488,12 +508,19 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
     *started_steam = launch(cfg, STEAMVR_URL)?;
     let handed = (!*started_steam).then_some(STEAMVR_URL);
     // the old server can still answer ping while it hangs in shutdown
-    let relaunched = || stopped() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping());
+    let (mut seen, mut exited) = (Vec::new(), None);
+    let relaunched = || {
+        exited = vr_exited(&mut seen);
+        stopped() || exited.is_some() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping())
+    };
     if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
-        bail!("ALVR did not come back within {} s after the SteamVR restart", cfg.timeouts.streaming_s);
+        bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", cfg.timeouts.streaming_s);
     }
     if stopped() {
-        bail!("vr_stop ended the SteamVR restart");
+        bail!("failed: vr_stop ended the SteamVR restart");
+    }
+    if let Some(name) = exited {
+        bail!("failed: {name} exited before ALVR came back after the SteamVR restart");
     }
     Ok(())
 }
@@ -512,6 +539,18 @@ mod tests {
         }
         b.extend(b"\x08\x08");
         b
+    }
+
+    #[test]
+    fn a_process_seen_then_gone_ends_the_wait() {
+        let mut seen = Vec::new();
+        assert_eq!(gone_after_seen(&mut seen, [], |_: &str| false), None, "never seen: still starting");
+        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor"], |n| n == "vrmonitor"), None);
+        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor", "vrserver"], |_| true), None);
+        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor"], |n| n == "vrmonitor"), Some("vrserver"));
+        let mut pids = Vec::new();
+        assert_eq!(gone_after_seen(&mut pids, Some(42), |_| true), None);
+        assert_eq!(gone_after_seen(&mut pids, None, |p| p != 42), Some(42), "the scene pid went away while the scene showed none");
     }
 
     #[test]

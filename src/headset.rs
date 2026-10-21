@@ -414,7 +414,7 @@ impl Grabber {
             thread::sleep(Duration::from_millis(10));
         };
         posted?;
-        let ((timestamp, frame, arrived), config_nal) = frame.context("no IDR frame arrived within 2 s")?;
+        let ((timestamp, frame, arrived), config_nal) = frame.context("no IDR frame arrived (deadline 2 s)")?;
         let (width, height, rgb) = decode_idr(&config_nal, &frame)?;
         let (width, rgb) = crop(eye, width, height, &rgb);
         let png = encode_rgb(width, height, &rgb)?;

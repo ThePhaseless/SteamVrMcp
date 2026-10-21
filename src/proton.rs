@@ -220,7 +220,7 @@ pub fn stop(scene: Option<u32>, launched: Option<&Launched>) -> Result<Vec<u32>>
     if !stopped.is_empty() && !steamvr::wait_for(Duration::from_secs(15), gone) {
         stopped.extend(signal(libc::SIGKILL));
         if !steamvr::wait_for(Duration::from_secs(5), gone) {
-            bail!("still running 5 s after SIGKILL: {:?}", live());
+            bail!("still running after SIGKILL: {:?} (deadline 5 s)", live());
         }
     }
     stopped.sort_unstable();

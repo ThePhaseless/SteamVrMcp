@@ -33,7 +33,7 @@ pub struct Timeouts {
 
 impl Default for Timeouts {
     fn default() -> Self {
-        Self { streaming_s: 240, app_s: 180 }
+        Self { streaming_s: 150, app_s: 180 }
     }
 }
 
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn config_defaults_when_file_absent() {
         let c = Config::default();
-        assert_eq!((c.timeouts.streaming_s, c.timeouts.app_s), (240, 180));
+        assert_eq!((c.timeouts.streaming_s, c.timeouts.app_s), (150, 180));
         assert!(c.steam.env.is_empty() && c.steam.args.is_empty() && c.alvr_settings.is_empty());
     }
 

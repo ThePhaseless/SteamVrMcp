@@ -36,7 +36,7 @@ The server reads the file at startup, at each `vr_start`, and at `vr_status` whe
 | `steam.env` | Environment variables for Steam, table of strings. |
 | `steam.args` | Extra arguments for Steam, list of strings. |
 | `alvr_settings` | ALVR session path to value, applied after the built-in defaults on every `vr_start`. |
-| `timeouts.streaming_s` | Wait for the headset to stream. Default 240. |
+| `timeouts.streaming_s` | Wait for the headset to stream. Default 150. |
 | `timeouts.app_s` | Wait for a launched app's scene. Default 180. |
 
 `steam.env` and `steam.args` apply only when the MCP starts Steam. If Steam is already running, the MCP uses it as it is and cannot change its environment. Steam gets only the desktop session's variables (`HOME`, `PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_*`, locale, D-Bus and Pulse) plus `steam.env`. The rest of the agent's environment, API keys included, stays out of Steam and its games.
