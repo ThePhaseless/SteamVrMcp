@@ -124,6 +124,7 @@ Coordinates are SteamVR standing space (+Y up, -Z forward). Tool arguments use m
 - SteamVR gives background OpenVR readers no input until the scene app (SteamVR Home) is running. `get_tracked_state` skeletons stay inactive before that.
 - SteamVR reserves the Index system click for its dashboard. System touch reaches apps.
 - Steam can block a launch on a desktop dialog (`ShowInterstitials` or `ShowLaunchOption`, for example "VR Theater Screen" for an app Steam treats as non-VR). `launch_app` and `vr_start` fail fast and name the dialog. Dismiss it on the desktop.
+- A second Steam client running at the same time (Flatpak Steam, for example) can take over Steam's runtime launch service. The Steam that the MCP talks to then stops accepting `steam://` URLs. `vr_start` and `launch_app` fail within 20 s with "Steam did not take ...". Close the other Steam, or start this Steam before it, then restart this Steam.
 - `set_alvr_settings` changes last until the next `vr_start`, which applies the defaults and `config.toml` `alvr_settings` again.
 - `vr_start`, `vr_stop`, `set_alvr_settings`, `set_hand_tracking_flavour`, `launch_app` and `run_sequence` return only when they are done, which can take minutes.
 - `vr_stop` stops only a SteamVR that runs ALVR. If you started SteamVR without ALVR, close it yourself.

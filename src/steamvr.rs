@@ -295,15 +295,18 @@ pub fn pending_interstitial(console_log: &str) -> Option<(u32, &'static str)> {
 /// How long Steam may take to log `ExecuteSteamURL` for a URL handed to it while it runs.
 const URL_TAKEN_WAIT: Duration = Duration::from_secs(20);
 
-/// None when `console_log` shows Steam took `url`; else the failure message.
+/// None when `since` (the console log after the hand-off) shows Steam took `url`; else the failure
+/// message, naming the cause when `tail` (the log's last lines) shows the runtime launch service failing.
 // shortcut: fails fast instead of recovering; restart Steam automatically only if a later report shows the user wants that
-pub fn url_not_taken(console_log: &str, url: &str) -> Option<String> {
-    if console_log.contains(&format!("ExecuteSteamURL: \"{url}\"")) {
+pub fn url_not_taken(since: &str, tail: &str, url: &str) -> Option<String> {
+    if since.contains(&format!("ExecuteSteamURL: \"{url}\"")) {
         return None;
     }
     let mut msg = format!("Steam did not take {url} (no ExecuteSteamURL in console_log.txt within {} s); restart Steam and retry", URL_TAKEN_WAIT.as_secs());
-    if console_log.contains("steam-runtime-launcher-service process exited too many times, disabling") {
-        msg += "; Steam disabled its runtime launch service (another Steam, e.g. Flatpak, may be running)";
+    // seen live with a Flatpak Steam running: both compete for the service's D-Bus name, and this Steam stops taking URLs
+    let exits = tail.lines().filter(|l| l.contains("steam-runtime-launcher-service pid") && l.ends_with(" exited")).count();
+    if exits >= 3 || tail.contains("steam-runtime-launcher-service process exited too many times, disabling") {
+        msg += "; Steam's runtime launch service keeps failing (another Steam, e.g. Flatpak, may hold it: close that one, or start this Steam first)";
     }
     Some(msg)
 }
@@ -323,7 +326,7 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option
         }
         if let (Some(d), Some(url)) = (steam_dir, handed_url) {
             if began.elapsed() >= URL_TAKEN_WAIT {
-                not_taken = url_not_taken(&console_log_since(d, log_from), url);
+                not_taken = url_not_taken(&console_log_since(d, log_from), &log_tail(d, "console_log", 200).join("\n"), url);
                 if not_taken.is_some() {
                     return true;
                 }
@@ -489,12 +492,17 @@ mod tests {
     fn url_not_taken_scans_log() {
         let url = "steam://rungameid/250820";
         let taken = format!("[x] ExecCommandLine: \"{url}\"\n[x] ExecuteSteamURL: \"{url}\"\n");
-        assert_eq!(url_not_taken(&taken, url), None);
-        let msg = url_not_taken("[x] something else\nExecuteSteamURL: \"steam://rungameid/1\"\n", url).unwrap();
+        assert_eq!(url_not_taken(&taken, "", url), None);
+        let msg = url_not_taken("[x] something else\nExecuteSteamURL: \"steam://rungameid/1\"\n", "", url).unwrap();
         assert_eq!(msg, format!("Steam did not take {url} (no ExecuteSteamURL in console_log.txt within 20 s); restart Steam and retry"));
+        let cause = "; Steam's runtime launch service keeps failing (another Steam, e.g. Flatpak, may hold it: close that one, or start this Steam first)";
         let off = "Steam Runtime Launch Service: steam-runtime-launcher-service process exited too many times, disabling\n";
-        let msg = url_not_taken(off, url).unwrap();
-        assert!(msg.ends_with("; Steam disabled its runtime launch service (another Steam, e.g. Flatpak, may be running)"), "{msg}");
+        assert!(url_not_taken("", off, url).unwrap().ends_with(cause));
+        // seen live: the loop ran before the hand-off and Steam then stopped logging, so only the tail shows it
+        let looping = "Steam Runtime Launch Service: steam-runtime-launcher-service pid 7 exited\n".repeat(3);
+        assert!(url_not_taken("", &looping, url).unwrap().ends_with(cause));
+        let once = "Steam Runtime Launch Service: steam-runtime-launcher-service pid 7 exited\n";
+        assert!(!url_not_taken("", once, url).unwrap().contains("keeps failing"), "one exit is a normal SteamVR stop");
     }
 
     #[test]
