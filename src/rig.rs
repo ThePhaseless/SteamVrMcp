@@ -6,10 +6,13 @@ use alvr_common::{
     DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose,
     glam::{EulerRot, Quat, Vec3, Vec4},
 };
-use alvr_packets::{FaceData, TrackingData};
+use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +27,13 @@ impl Hand {
         match self {
             Hand::Left => *HAND_LEFT_ID,
             Hand::Right => *HAND_RIGHT_ID,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Hand::Left => "left",
+            Hand::Right => "right",
         }
     }
 }
@@ -183,6 +193,154 @@ pub struct HandGestureArgs {
     pub curls: Option<Curls>,
 }
 
+/// A Valve Index control. "grip" is the squeeze sensor.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum Button {
+    A,
+    B,
+    System,
+    Trigger,
+    Grip,
+    Thumbstick,
+    Trackpad,
+}
+
+impl Button {
+    /// The OpenXR path component; the grip is ALVR's "squeeze".
+    fn path(self) -> &'static str {
+        match self {
+            Button::A => "a",
+            Button::B => "b",
+            Button::System => "system",
+            Button::Trigger => "trigger",
+            Button::Grip => "squeeze",
+            Button::Thumbstick => "thumbstick",
+            Button::Trackpad => "trackpad",
+        }
+    }
+}
+
+/// Input path suffixes under /user/hand/<hand>/input/ and their values.
+type Inputs = Vec<(String, ButtonValue)>;
+
+/// What pressing (or releasing) `b` sets.
+fn press(b: Button, down: bool) -> Inputs {
+    use ButtonValue::{Binary, Scalar};
+    let s = if down { 1.0 } else { 0.0 };
+    let e: Vec<(&str, ButtonValue)> = match b {
+        Button::Trigger => vec![("value", Scalar(s)), ("click", Binary(down)), ("touch", Binary(down))],
+        Button::Grip => vec![("value", Scalar(s)), ("force", Scalar(0.0))],
+        Button::Trackpad => vec![("force", Scalar(s)), ("touch", Binary(down))],
+        _ => vec![("click", Binary(down)), ("touch", Binary(down))],
+    };
+    e.into_iter().map(|(k, v)| (format!("{}/{k}", b.path()), v)).collect()
+}
+
+fn in_range(name: &str, v: f32, min: f32) -> Result<f32, String> {
+    if (min..=1.0).contains(&v) { Ok(v) } else { Err(format!("{name} must be within {min} and 1")) }
+}
+
+/// The inputs one input action sets, or None for other actions.
+fn inputs(a: &RigAction) -> Result<Option<(Hand, Inputs)>, String> {
+    use ButtonValue::{Binary, Scalar};
+    let unit = |name, v| in_range(name, v, 0.0);
+    let axis = |name, v| in_range(name, v, -1.0);
+    let set = |e: &[(&str, ButtonValue)]| e.iter().map(|&(k, v)| (k.to_owned(), v)).collect::<Inputs>();
+    Ok(Some(match a {
+        RigAction::PressButton(b) => (b.hand, press(b.button, true)),
+        RigAction::ReleaseButton(b) => (b.hand, press(b.button, false)),
+        RigAction::TouchButton(t) if t.button == Button::Grip => {
+            return Err("the grip has no touch sensor in ALVR's Index profile (common/src/inputs.rs:228-275)".into());
+        }
+        RigAction::TouchButton(t) => (t.hand, vec![(format!("{}/touch", t.button.path()), Binary(t.touched))]),
+        RigAction::SetTrigger(t) => {
+            let v = unit("value", t.value)?;
+            (t.hand, set(&[("trigger/value", Scalar(v)), ("trigger/click", Binary(v >= 0.95)), ("trigger/touch", Binary(v > 0.0))]))
+        }
+        RigAction::SetGrip(g) => {
+            let (v, f) = (unit("value", g.value)?, unit("force", g.force.unwrap_or(0.0))?);
+            (g.hand, set(&[("squeeze/value", Scalar(v)), ("squeeze/force", Scalar(f))]))
+        }
+        RigAction::SetThumbstick(t) => {
+            let (x, y, click) = (axis("x", t.x)?, axis("y", t.y)?, t.click.unwrap_or(false));
+            let touch = t.touch.unwrap_or(x != 0.0 || y != 0.0 || click);
+            let e = [("thumbstick/x", Scalar(x)), ("thumbstick/y", Scalar(y)), ("thumbstick/click", Binary(click)), ("thumbstick/touch", Binary(touch))];
+            (t.hand, set(&e))
+        }
+        RigAction::SetTrackpad(t) => {
+            let (x, y, force) = (axis("x", t.x)?, axis("y", t.y)?, unit("force", t.force.unwrap_or(0.0))?);
+            let touch = t.touch.unwrap_or(true);
+            let e = [("trackpad/x", Scalar(x)), ("trackpad/y", Scalar(y)), ("trackpad/force", Scalar(force)), ("trackpad/touch", Binary(touch))];
+            (t.hand, set(&e))
+        }
+        _ => return Ok(None),
+    }))
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct ButtonArgs {
+    pub hand: Hand,
+    pub button: Button,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct TouchArgs {
+    pub hand: Hand,
+    /// Any button but "grip": ALVR's Index profile has no squeeze touch.
+    pub button: Button,
+    pub touched: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct TriggerArgs {
+    pub hand: Hand,
+    /// 0 to 1; click is value >= 0.95, touch is value > 0.
+    pub value: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct GripArgs {
+    pub hand: Hand,
+    /// 0 to 1.
+    pub value: f32,
+    /// 0 to 1, default 0.
+    pub force: Option<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct AxisArgs {
+    pub hand: Hand,
+    /// -1 (left) to 1 (right).
+    pub x: f32,
+    /// -1 (down) to 1 (up).
+    pub y: f32,
+    /// Default false.
+    pub click: Option<bool>,
+    /// Default: x or y is not 0, or click.
+    pub touch: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct TrackpadArgs {
+    pub hand: Hand,
+    /// -1 (left) to 1 (right).
+    pub x: f32,
+    /// -1 (down) to 1 (up).
+    pub y: f32,
+    /// 0 to 1, default 0.
+    pub force: Option<f32>,
+    /// Default true.
+    pub touch: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "action", content = "args", rename_all = "snake_case")]
 pub enum RigAction {
@@ -197,6 +355,13 @@ pub enum RigAction {
     SetHandMode(HandModeArgs),
     SetHandSkeleton(HandSkeletonArgs),
     SetHandGesture(HandGestureArgs),
+    PressButton(ButtonArgs),
+    ReleaseButton(ButtonArgs),
+    TouchButton(TouchArgs),
+    SetTrigger(TriggerArgs),
+    SetGrip(GripArgs),
+    SetThumbstick(AxisArgs),
+    SetTrackpad(TrackpadArgs),
 }
 
 impl PoseArgs {
@@ -347,6 +512,10 @@ pub struct Rig {
     controllers: [Body; 2],
     active: [bool; 2],
     hands: [HandState; 2],
+    /// Every input set so far by full path id, for a resend to a new stream.
+    buttons: BTreeMap<u64, ButtonValue>,
+    /// Inputs set since the last `take_buttons`, in order.
+    pending: Vec<(u64, ButtonValue)>,
 }
 
 impl Default for Rig {
@@ -362,6 +531,8 @@ impl Rig {
             controllers: [Body::at(Vec3::new(-0.2, 1.2, -0.3)), Body::at(Vec3::new(0.2, 1.2, -0.3))],
             active: [true; 2],
             hands: Default::default(),
+            buttons: BTreeMap::new(),
+            pending: vec![],
         }
     }
 
@@ -375,6 +546,22 @@ impl Rig {
 
     /// Applies `a` and returns how long until it is done: an animation's duration, else zero.
     pub fn apply(&mut self, a: RigAction, now: Instant) -> Result<Duration, String> {
+        if let Some((hand, inputs)) = inputs(&a)? {
+            let i = hand as usize;
+            if !self.active[i] {
+                // ALVR drops buttons of a hand without a valid pose (Controller.cpp:145-147)
+                return Err(format!("{} controller is not tracked", hand.name()));
+            }
+            if self.hands[i].mode == HandMode::Hand {
+                return Err(format!("the {} hand is a bare hand: ALVR's gestures drive its buttons; set_hand_mode controller first", hand.name()));
+            }
+            for (suffix, value) in inputs {
+                let id = alvr_common::hash_string(&format!("/user/hand/{}/input/{suffix}", hand.name()));
+                self.buttons.insert(id, value);
+                self.pending.push((id, value));
+            }
+            return Ok(Duration::ZERO);
+        }
         match a {
             RigAction::SetHeadPose(p) => self.head.set(p.to_pose()?, now),
             RigAction::MoveHead(mv) => self.head.move_by(&mv, now)?,
@@ -425,8 +612,19 @@ impl Rig {
                 let h = &mut self.hands[a.hand as usize];
                 (h.curls, h.raw) = (Some(c), None);
             }
+            _ => unreachable!("input actions return above"),
         }
         Ok(Duration::ZERO)
+    }
+
+    /// The inputs set since the last call, for the headset to send.
+    pub fn take_buttons(&mut self) -> Vec<ButtonEntry> {
+        self.pending.drain(..).map(|(path_id, value)| ButtonEntry { path_id, value }).collect()
+    }
+
+    /// Every input set so far. A new stream needs them again: the server's mapping state starts empty.
+    pub fn all_buttons(&self) -> Vec<ButtonEntry> {
+        self.buttons.iter().map(|(&path_id, &value)| ButtonEntry { path_id, value }).collect()
     }
 
     /// The head plus each active hand at `now`: a controller pose, its skeleton once curls or
@@ -665,6 +863,93 @@ mod tests {
         rig.apply(args(None, Some(Curls { index: 0.5, ..Default::default() })), now).unwrap();
     }
 
+    /// (path, value) pairs; ButtonValue has no PartialEq, so values compare by Debug text.
+    fn entries(v: Vec<ButtonEntry>) -> Vec<(u64, String)> {
+        v.into_iter().map(|e| (e.path_id, format!("{:?}", e.value))).collect()
+    }
+
+    fn want(hand: &str, e: &[(&str, ButtonValue)]) -> Vec<(u64, String)> {
+        e.iter().map(|(p, v)| (alvr_common::hash_string(&format!("/user/hand/{hand}/input/{p}")), format!("{v:?}"))).collect()
+    }
+
+    fn press(hand: Hand, button: Button) -> RigAction {
+        RigAction::PressButton(ButtonArgs { hand, button })
+    }
+
+    #[test]
+    fn press_trigger_entries() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        rig.apply(press(Hand::Right, Button::Trigger), now).unwrap();
+        use ButtonValue::{Binary, Scalar};
+        let trigger = [("trigger/value", Scalar(1.0)), ("trigger/click", Binary(true)), ("trigger/touch", Binary(true))];
+        assert_eq!(entries(rig.take_buttons()), want("right", &trigger));
+        assert!(rig.take_buttons().is_empty(), "taken once");
+        rig.apply(RigAction::ReleaseButton(ButtonArgs { hand: Hand::Left, button: Button::A }), now).unwrap();
+        assert_eq!(entries(rig.take_buttons()), want("left", &[("a/click", Binary(false)), ("a/touch", Binary(false))]));
+        rig.apply(press(Hand::Left, Button::Trackpad), now).unwrap();
+        rig.apply(press(Hand::Left, Button::Grip), now).unwrap();
+        let pad_grip = [("trackpad/force", Scalar(1.0)), ("trackpad/touch", Binary(true)), ("squeeze/value", Scalar(1.0)), ("squeeze/force", Scalar(0.0))];
+        assert_eq!(entries(rig.take_buttons()), want("left", &pad_grip));
+        let stick = AxisArgs { hand: Hand::Right, x: 0.0, y: 0.5, click: None, touch: None };
+        rig.apply(RigAction::SetThumbstick(stick), now).unwrap();
+        let stick = [("thumbstick/x", Scalar(0.0)), ("thumbstick/y", Scalar(0.5)), ("thumbstick/click", Binary(false)), ("thumbstick/touch", Binary(true))];
+        assert_eq!(entries(rig.take_buttons()), want("right", &stick));
+    }
+
+    #[test]
+    fn button_args_reject_unknown_and_touchless() {
+        assert!(serde_json::from_value::<ButtonArgs>(serde_json::json!({"hand": "right", "button": "x"})).is_err());
+        let ok: ButtonArgs = serde_json::from_value(serde_json::json!({"hand": "right", "button": "thumbstick"})).unwrap();
+        assert_eq!(ok.button, Button::Thumbstick);
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        assert!(rig.apply(RigAction::TouchButton(TouchArgs { hand: Hand::Right, button: Button::Grip, touched: true }), now).is_err());
+        for bad in [1.5, -0.1, f32::NAN] {
+            assert!(rig.apply(RigAction::SetTrigger(TriggerArgs { hand: Hand::Right, value: bad }), now).is_err(), "{bad}");
+            assert!(rig.apply(RigAction::SetGrip(GripArgs { hand: Hand::Right, value: 0.5, force: Some(bad) }), now).is_err());
+        }
+        let pad = |x| RigAction::SetTrackpad(TrackpadArgs { hand: Hand::Left, x, y: 0.0, force: None, touch: None });
+        assert!(rig.apply(pad(1.1), now).is_err() && rig.apply(pad(f32::NAN), now).is_err());
+        assert!(rig.take_buttons().is_empty(), "rejected calls send nothing");
+        rig.apply(RigAction::TouchButton(TouchArgs { hand: Hand::Right, button: Button::B, touched: true }), now).unwrap();
+        assert_eq!(entries(rig.take_buttons()), want("right", &[("b/touch", ButtonValue::Binary(true))]));
+    }
+
+    #[test]
+    fn buttons_refused_when_inactive() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        let state = ControllerStateArgs { hand: Hand::Right, connected: Some(false), tracked: None };
+        rig.apply(RigAction::SetControllerState(state), now).unwrap();
+        assert_eq!(rig.apply(press(Hand::Right, Button::A), now).unwrap_err(), "right controller is not tracked");
+        assert!(rig.take_buttons().is_empty());
+        assert!(rig.apply(press(Hand::Left, Button::A), now).is_ok(), "the left hand is still tracked");
+    }
+
+    #[test]
+    fn inputs_refuse_for_bare_hand() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        rig.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Left, mode: HandMode::Hand }), now).unwrap();
+        let err = rig.apply(RigAction::SetTrigger(TriggerArgs { hand: Hand::Left, value: 0.5 }), now).unwrap_err();
+        assert!(err.contains("bare hand"), "{err}");
+        assert!(rig.take_buttons().is_empty());
+    }
+
+    #[test]
+    fn all_buttons_resend_current_state() {
+        let (mut rig, now) = (Rig::new(), Instant::now());
+        rig.apply(RigAction::SetTrigger(TriggerArgs { hand: Hand::Right, value: 0.5 }), now).unwrap();
+        rig.apply(press(Hand::Left, Button::B), now).unwrap();
+        rig.take_buttons();
+        let all = entries(rig.all_buttons());
+        use ButtonValue::{Binary, Scalar};
+        let expected = want("right", &[("trigger/value", Scalar(0.5)), ("trigger/click", Binary(false)), ("trigger/touch", Binary(true))])
+            .into_iter()
+            .chain(want("left", &[("b/click", Binary(true)), ("b/touch", Binary(true))]));
+        for e in expected {
+            assert!(all.contains(&e), "{e:?} missing from {all:?}");
+        }
+        assert_eq!(all.len(), 5);
+    }
+
     #[test]
     fn rig_action_json_shape() {
         let a: RigAction = serde_json::from_str(
@@ -679,5 +964,7 @@ mod tests {
         assert!(matches!(a, RigAction::SetHandGesture(HandGestureArgs { gesture: Some(Gesture::ThumbsUp), curls: None, .. })));
         let a: RigAction = serde_json::from_str(r#"{"action":"set_hand_gesture","args":{"hand":"left","curls":{"index":0.5}}}"#).unwrap();
         assert!(matches!(a, RigAction::SetHandGesture(HandGestureArgs { curls: Some(Curls { index: 0.5, thumb: 0.0, .. }), .. })));
+        let a: RigAction = serde_json::from_str(r#"{"action":"set_grip","args":{"hand":"left","value":0.5}}"#).unwrap();
+        assert!(matches!(a, RigAction::SetGrip(GripArgs { force: None, .. })));
     }
 }

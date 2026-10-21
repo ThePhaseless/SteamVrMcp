@@ -53,6 +53,8 @@ pub struct PrepareReport {
 
 /// Built-in defaults, then `cfg.alvr_settings` in key order. Paths start at the session JSON root.
 pub fn session_values(cfg: &Config) -> Result<Vec<PathValuePair>> {
+    let session = serde_json::to_value(alvr_session::SessionConfig::default())?;
+    let template = &session["session_settings"]["headset"]["controllers"]["content"]["button_mappings"];
     let defaults = [
         ("session_settings.video.preferred_codec.variant", json!("H264")),
         ("session_settings.video.encoder_config.h264_profile.variant", json!("Baseline")),
@@ -72,12 +74,37 @@ pub fn session_values(cfg: &Config) -> Result<Vec<PathValuePair>> {
         ("session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0", json!(false)),
         ("session_settings.headset.controllers.content.hand_tracking_interaction.enabled", json!(true)),
         ("session_settings.connection.client_discovery.enabled", json!(false)),
+        ("session_settings.headset.controllers.content.button_mappings", index_button_mappings(&template)),
     ];
     defaults
         .into_iter()
         .chain(cfg.alvr_settings.iter().map(|(k, v)| (k.as_str(), v.clone())))
         .map(|(key, value)| Ok(PathValuePair { path: parse_path(key)?, value }))
         .collect()
+}
+
+/// ALVR's manual `button_mappings` passing every Index input straight through, so the ones its
+/// automatic mapping has no source for (trackpad, left A/B; server_core/src/input_mapping.rs:243-590)
+/// reach SteamVR too. `template` is the default session's `button_mappings` value.
+pub fn index_button_mappings(template: &Value) -> Value {
+    let index = &alvr_common::CONTROLLER_PROFILE_INFO[&*alvr_common::INDEX_CONTROLLER_PROFILE_ID].button_set;
+    let mut paths: Vec<_> = index.iter().map(|id| alvr_common::BUTTON_INFO[id].path).collect();
+    paths.sort();
+    let value = &template["content"]["value"];
+    let pairs = paths
+        .into_iter()
+        .map(|path| {
+            let mut target = value["element"].clone();
+            target["destination"] = json!(path);
+            let mut targets = value.clone();
+            targets["content"] = json!([target]);
+            json!([path, targets])
+        })
+        .collect::<Vec<_>>();
+    let mut mappings = template.clone();
+    mappings["set"] = json!(true);
+    mappings["content"]["content"] = json!(pairs);
+    mappings
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -347,6 +374,26 @@ mod tests {
         assert!(matches!(s.audio.microphone, Switch::Disabled));
         assert!(matches!(s.connection.client_discovery, Switch::Disabled));
         assert_eq!(s.video.preferred_fps, 72.0);
+    }
+
+    #[test]
+    fn index_mappings_cover_every_index_input() {
+        use alvr_common::{BUTTON_INFO, CONTROLLER_PROFILE_INFO, INDEX_CONTROLLER_PROFILE_ID};
+        use alvr_session::ButtonMappingType;
+        let m = applied(&Config::default()).unwrap();
+        let Switch::Enabled(c) = &m.settings().headset.controllers else { panic!("controllers disabled") };
+        let mappings = c.button_mappings.as_ref().expect("manual button mappings");
+        let index = &CONTROLLER_PROFILE_INFO[&*INDEX_CONTROLLER_PROFILE_ID].button_set;
+        assert_eq!((mappings.len(), index.len()), (38, 38));
+        for (key, targets) in mappings {
+            assert!(index.iter().any(|id| BUTTON_INFO[id].path == key), "{key} is not an Index input");
+            assert_eq!(targets.len(), 1, "{key}");
+            assert_eq!(targets[0].destination, *key);
+            assert!(matches!(targets[0].mapping_type, ButtonMappingType::Passthrough), "{key}");
+            assert!(targets[0].binary_conditions.is_empty(), "{key}");
+        }
+        let keys: Vec<_> = mappings.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"/user/hand/left/input/a/click") && keys.contains(&"/user/hand/right/input/trackpad/force"));
     }
 
     #[test]

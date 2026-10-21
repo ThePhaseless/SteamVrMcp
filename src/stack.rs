@@ -2,7 +2,7 @@ use crate::{
     alvr_api::{self, Api},
     checks::{self, Check, Readiness},
     config::{Config, Paths},
-    headset::{self, Eye, Headset, HeadsetStatus, Screenshot},
+    headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot},
     openvr::{self, OpenVr},
     rig::{Rig, RigAction},
     setup,
@@ -195,6 +195,11 @@ impl Stack {
     /// Changes the head or a controller; returns how long until an animation is done.
     pub fn apply(&self, a: RigAction) -> Result<Duration> {
         self.rig.lock().apply(a, Instant::now()).map_err(|e| anyhow!(e))
+    }
+
+    /// Haptic events the app sent with `t_s` after `since_s`, oldest first; `clear` empties the log.
+    pub fn haptics(&self, since_s: f64, clear: bool) -> Vec<HapticEvent> {
+        self.state.lock().headset.as_ref().map(|h| h.haptics(Some(since_s), clear)).unwrap_or_default()
     }
 
     /// SteamVR's own view of devices and hand skeletons.

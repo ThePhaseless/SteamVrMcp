@@ -2,13 +2,28 @@ mod common;
 
 use alvr_common::glam::{Quat, Vec3};
 use common::Snap;
-use std::{fs, panic, path::Path, sync::{Arc, OnceLock}, thread, time::{Duration, Instant}};
+use alvr_common::parking_lot::Mutex;
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::{BufRead, BufReader},
+    panic,
+    path::Path,
+    process::{Child, Command, Stdio},
+    sync::{Arc, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
 use vr_test_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
     headset::Eye,
     openvr::TrackedState,
-    rig::{AnimateArgs, FingerCurlArgs, Hand, PoseArgs, RigAction},
+    hand::Gesture,
+    rig::{
+        AnimateArgs, AxisArgs, Button, ButtonArgs, FingerCurlArgs, GripArgs, Hand, HandGestureArgs, HandMode, HandModeArgs,
+        PoseArgs, RigAction, TouchArgs, TrackpadArgs, TriggerArgs,
+    },
     setup::{prepare, restore, session_values},
     stack::Stack,
     steamvr,
@@ -364,4 +379,215 @@ fn live_beat_saber_menu_fps() {
     let ratio = bad as f64 / presents.max(1) as f64;
     println!("{f0:?} -> {f1:?}: {bad} dropped or reprojected of {presents} presents ({ratio:.3})");
     assert!(presents > 0 && ratio < 0.10, "ratio {ratio:.3}");
+}
+
+/// examples/xr_probe as a child, with its newest stdout line. SIGTERM on drop.
+struct Probe {
+    child: Child,
+    line: Arc<Mutex<Value>>,
+}
+
+impl Probe {
+    /// Builds and starts the probe, and waits up to 60 s for its session to be FOCUSED.
+    fn start() -> Probe {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let built = Command::new(cargo).args(["build", "--example", "xr_probe"]).status().unwrap();
+        assert!(built.success(), "cargo build --example xr_probe failed");
+        let target = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target").into());
+        let mut child = Command::new(format!("{target}/debug/examples/xr_probe")).stdout(Stdio::piped()).spawn().unwrap();
+        let line = Arc::new(Mutex::new(Value::Null));
+        let stdout = child.stdout.take().unwrap();
+        let sink = Arc::clone(&line);
+        thread::spawn(move || {
+            for l in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Ok(v) = serde_json::from_str(&l) {
+                    *sink.lock() = v;
+                }
+            }
+        });
+        let probe = Probe { child, line };
+        let focused = steamvr::wait_for(Duration::from_secs(60), || probe.state() == "FOCUSED");
+        assert!(focused, "probe not FOCUSED after 60 s: {}", probe.line());
+        probe
+    }
+
+    fn line(&self) -> Value {
+        self.line.lock().clone()
+    }
+
+    fn state(&self) -> String {
+        self.line()["state"].as_str().unwrap_or_default().to_owned()
+    }
+
+    /// Waits up to `timeout` for `ok` on the newest line; returns the last line seen and whether it held.
+    fn wait(&self, timeout: Duration, ok: impl Fn(&Value) -> bool) -> (Value, bool) {
+        let held = steamvr::wait_for(timeout, || ok(&self.line()));
+        (self.line(), held)
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        // SAFETY: plain kill(2) on our own child's pid
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        if !steamvr::wait_for(Duration::from_secs(10), || self.child.try_wait().is_ok_and(|s| s.is_some())) {
+            self.child.kill().ok();
+        }
+        self.child.wait().ok();
+    }
+}
+
+/// Whether probe hand `h` shows `want` for each key: numbers within 0.05, [x, y] per axis, booleans exact.
+fn shows(h: &Value, want: &[(String, Value)]) -> bool {
+    let close = |a: &Value, b: &Value| a.as_f64().zip(b.as_f64()).is_some_and(|(a, b)| (a - b).abs() <= 0.05);
+    want.iter().all(|(k, w)| match (&h[k.as_str()], w) {
+        (Value::Array(a), Value::Array(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| close(a, b)),
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (a, b) => close(a, b),
+    })
+}
+
+/// One input table row: the call, what the probe must show, and the call that undoes it.
+struct Row {
+    name: String,
+    apply: RigAction,
+    want: Vec<(String, Value)>,
+    undo: RigAction,
+}
+
+fn want(pairs: &[(&str, Value)]) -> Vec<(String, Value)> {
+    pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+}
+
+fn rows(hand: Hand) -> Vec<Row> {
+    let button = |button| ButtonArgs { hand, button };
+    let mut rows = vec![];
+    for (b, key) in [(Button::A, "a"), (Button::B, "b"), (Button::Thumbstick, "thumbstick"), (Button::System, "system")] {
+        let want = vec![(format!("{key}_click"), json!(true)), (format!("{key}_touch"), json!(true))];
+        rows.push(Row { name: format!("press {key}"), apply: RigAction::PressButton(button(b)), want, undo: RigAction::ReleaseButton(button(b)) });
+    }
+    let presses = [
+        (Button::Trigger, "trigger", want(&[("trigger_value", json!(1.0)), ("trigger_click", json!(true)), ("trigger_touch", json!(true))])),
+        (Button::Grip, "grip", want(&[("squeeze_value", json!(1.0)), ("squeeze_force", json!(0.0))])),
+        (Button::Trackpad, "trackpad", want(&[("trackpad_force", json!(1.0)), ("trackpad_touch", json!(true))])),
+    ];
+    for (b, key, want) in presses {
+        rows.push(Row { name: format!("press {key}"), apply: RigAction::PressButton(button(b)), want, undo: RigAction::ReleaseButton(button(b)) });
+    }
+    let touchable = [(Button::A, "a"), (Button::B, "b"), (Button::Trigger, "trigger"), (Button::Thumbstick, "thumbstick"), (Button::Trackpad, "trackpad"), (Button::System, "system")];
+    for (b, key) in touchable {
+        let touch = |touched| RigAction::TouchButton(TouchArgs { hand, button: b, touched });
+        rows.push(Row { name: format!("touch {key}"), apply: touch(true), want: vec![(format!("{key}_touch"), json!(true))], undo: touch(false) });
+    }
+    let trigger = |value| RigAction::SetTrigger(TriggerArgs { hand, value });
+    rows.push(Row {
+        name: "set_trigger 0.5".into(),
+        apply: trigger(0.5),
+        want: want(&[("trigger_value", json!(0.5)), ("trigger_click", json!(false)), ("trigger_touch", json!(true))]),
+        undo: trigger(0.0),
+    });
+    rows.push(Row {
+        name: "set_grip 0.6 force 0.4".into(),
+        apply: RigAction::SetGrip(GripArgs { hand, value: 0.6, force: Some(0.4) }),
+        want: want(&[("squeeze_value", json!(0.6)), ("squeeze_force", json!(0.4))]),
+        undo: RigAction::SetGrip(GripArgs { hand, value: 0.0, force: None }),
+    });
+    let stick = |x, y| RigAction::SetThumbstick(AxisArgs { hand, x, y, click: None, touch: None });
+    rows.push(Row {
+        name: "set_thumbstick 0.5 -0.5".into(),
+        apply: stick(0.5, -0.5),
+        want: want(&[("thumbstick", json!([0.5, -0.5])), ("thumbstick_click", json!(false)), ("thumbstick_touch", json!(true))]),
+        undo: stick(0.0, 0.0),
+    });
+    rows.push(Row {
+        name: "set_trackpad -0.4 0.3 force 0.2".into(),
+        apply: RigAction::SetTrackpad(TrackpadArgs { hand, x: -0.4, y: 0.3, force: Some(0.2), touch: None }),
+        want: want(&[("trackpad", json!([-0.4, 0.3])), ("trackpad_force", json!(0.2)), ("trackpad_touch", json!(true))]),
+        undo: RigAction::SetTrackpad(TrackpadArgs { hand, x: 0.0, y: 0.0, force: None, touch: Some(false) }),
+    });
+    // system last: SteamVR may keep the system click for its dashboard, which takes the probe's focus
+    rows.sort_by_key(|r| r.name.contains("system"));
+    rows
+}
+
+/// Proves early risk 3: every Index input, including the trackpad and left A/B, reaches an OpenXR
+/// app through ALVR's manual button mappings and SteamVR's Index bindings, for both hands.
+/// The system click may be kept by SteamVR for its dashboard; then the probe losing focus counts
+/// as arrival, and a second press closes the dashboard. Needs Steam closed or its GPU supported,
+/// and SteamVR closed or streaming. Builds and runs examples/xr_probe.
+#[test]
+#[ignore]
+fn live_index_inputs_reach_openxr() {
+    let s = ensure_streaming();
+    let probe = Probe::start();
+    let mut failures = vec![];
+    for hand in [Hand::Left, Hand::Right] {
+        let name = if hand == Hand::Left { "left" } else { "right" };
+        for row in rows(hand) {
+            s.apply(row.apply).unwrap();
+            let (line, ok) = probe.wait(Duration::from_secs(1), |l| shows(&l[name], &row.want));
+            let dashboard = row.name == "press system" && line["state"] != "FOCUSED";
+            println!("{name} {}: {} {}", row.name, if ok { "ok" } else if dashboard { "dashboard opened" } else { "MISSING" }, line[name]);
+            if !ok && !dashboard {
+                failures.push(format!("{name} {}: want {:?}, probe {}", row.name, row.want, line[name]));
+            }
+            s.apply(row.undo).unwrap();
+            if dashboard {
+                s.apply(RigAction::PressButton(ButtonArgs { hand, button: Button::System })).unwrap();
+                thread::sleep(Duration::from_millis(200));
+                s.apply(RigAction::ReleaseButton(ButtonArgs { hand, button: Button::System })).unwrap();
+                assert!(probe.wait(Duration::from_secs(10), |l| l["state"] == "FOCUSED").1, "probe did not get its focus back");
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Proves done-when 4's haptics half on the probe: the probe's pulse on an A press is recorded
+/// with its hand and amplitude. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_haptics_recorded() {
+    let s = ensure_streaming();
+    let probe = Probe::start();
+    s.haptics(f64::NEG_INFINITY, true);
+    let a = ButtonArgs { hand: Hand::Left, button: Button::A };
+    s.apply(RigAction::PressButton(a.clone())).unwrap();
+    let pulse = |e: &vr_test_mcp::headset::HapticEvent| e.hand == "left" && (e.amplitude - 0.8).abs() <= 0.05;
+    let recorded = steamvr::wait_for(Duration::from_secs(1), || s.haptics(f64::NEG_INFINITY, false).iter().any(pulse));
+    s.apply(RigAction::ReleaseButton(a)).unwrap();
+    let events = s.haptics(f64::NEG_INFINITY, false);
+    println!("{events:#?}\nprobe {}", probe.line()["left"]);
+    assert!(recorded, "no left pulse at amplitude 0.8: {events:?}");
+}
+
+/// Proves done-when 6 (Index flavour) on the probe: a bare hand's pinch acts as the trigger in an
+/// OpenXR app. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_bare_hand_pinch_is_trigger() {
+    let s = ensure_streaming();
+    // later tests in this process expect a right controller, also after a failed assertion
+    struct Reset(Arc<Stack>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let open = HandGestureArgs { hand: Hand::Right, gesture: Some(Gesture::Open), curls: None };
+            self.0.apply(RigAction::SetHandGesture(open)).ok();
+            self.0.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Right, mode: HandMode::Controller })).ok();
+        }
+    }
+    let _reset = Reset(Arc::clone(&s));
+    let probe = Probe::start();
+    let gesture = |g| RigAction::SetHandGesture(HandGestureArgs { hand: Hand::Right, gesture: Some(g), curls: None });
+    s.apply(RigAction::SetHandMode(HandModeArgs { hand: Hand::Right, mode: HandMode::Hand })).unwrap();
+    s.apply(gesture(Gesture::Pinch)).unwrap();
+    let value = |l: &Value| l["right"]["trigger_value"].as_f64().unwrap_or(-1.0);
+    let (line, pinched) = probe.wait(Duration::from_secs(1), |l| value(l) > 0.5);
+    println!("pinch: {}", line["right"]);
+    assert!(pinched, "pinch did not pull the trigger: {}", line["right"]);
+    s.apply(gesture(Gesture::Open)).unwrap();
+    let (line, opened) = probe.wait(Duration::from_secs(1), |l| (0.0..0.1).contains(&value(l)));
+    println!("open: {}", line["right"]);
+    assert!(opened, "open hand did not release the trigger: {}", line["right"]);
 }

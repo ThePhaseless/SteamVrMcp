@@ -27,5 +27,10 @@ openh264 = "0.9"
 png = "0.18"
 base64 = "0.23"
 
+[dev-dependencies]
+# xr_probe example only
+openxr = "0.22"
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+
 [build-dependencies]
 bindgen = "0.72"

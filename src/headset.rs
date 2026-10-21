@@ -1,6 +1,6 @@
 use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
 use alvr_common::{
-    Fov, Pose, RelaxedAtomic, ViewParams,
+    Fov, HAND_LEFT_ID, HAND_RIGHT_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::{Context, Result, bail},
     glam::{Quat, UVec2, Vec3},
     parking_lot::Mutex,
@@ -9,7 +9,8 @@ use crate::{alvr_api::Api, rig::Rig};
 use openh264::{decoder::Decoder, formats::YUVSource};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::Arc,
+    collections::VecDeque,
+    sync::{Arc, LazyLock},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -44,6 +45,22 @@ pub struct Screenshot {
     pub frame_timestamp_ms: u64,
 }
 
+/// The time base of haptic events, shared by every headset so a recreated one keeps `since_s` meaningful.
+static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+const HAPTICS_KEPT: usize = 1024;
+
+/// A haptic pulse the app sent. `t_s` is seconds on the MCP's clock (since its first headset started).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HapticEvent {
+    pub t_s: f64,
+    /// "left", "right" or "other".
+    pub hand: String,
+    pub duration_s: f32,
+    pub frequency: f32,
+    pub amplitude: f32,
+}
+
 #[derive(Default)]
 struct Shared {
     status: HeadsetStatus,
@@ -53,6 +70,9 @@ struct Shared {
     idr: Option<(Duration, Vec<u8>)>,
     /// Timestamp of the newest video frame, for ALVR's client statistics.
     last_frame: Duration,
+    /// The newest HAPTICS_KEPT haptic events, oldest first.
+    // shortcut: lost when the headset is recreated (watchdog or reconnect); move to Stack if tests read across one
+    haptics: VecDeque<HapticEvent>,
 }
 
 impl Shared {
@@ -71,6 +91,22 @@ impl Shared {
     fn on_decoder_config(&mut self, codec: String, config_nal: Vec<u8>) {
         self.status.codec = Some(codec);
         self.config_nal = config_nal;
+    }
+
+    fn on_haptics(&mut self, event: HapticEvent) {
+        if self.haptics.len() == HAPTICS_KEPT {
+            self.haptics.pop_front();
+        }
+        self.haptics.push_back(event);
+    }
+
+    /// Events after `since_s`, oldest first; `clear` empties the ring.
+    fn haptics(&mut self, since_s: Option<f64>, clear: bool) -> Vec<HapticEvent> {
+        let events = self.haptics.iter().filter(|e| since_s.is_none_or(|s| e.t_s > s)).cloned().collect();
+        if clear {
+            self.haptics.clear();
+        }
+        events
     }
 
     fn on_streaming_stopped(&mut self) {
@@ -139,6 +175,14 @@ fn crop(eye: Eye, width: u32, height: u32, rgb: &[u8]) -> (u32, Vec<u8>) {
     ((to - from) as u32, rows.copied().collect())
 }
 
+fn hand_name(device_id: u64) -> &'static str {
+    match device_id {
+        id if id == *HAND_LEFT_ID => "left",
+        id if id == *HAND_RIGHT_ID => "right",
+        _ => "other",
+    }
+}
+
 fn view_params() -> [ViewParams; 2] {
     let eye = |x: f32, fov| ViewParams { pose: Pose { orientation: Quat::IDENTITY, position: Vec3::new(x, 0.0, 0.0) }, fov };
     [
@@ -150,9 +194,22 @@ fn view_params() -> [ViewParams; 2] {
 fn tracking_thread(context: Arc<ClientCoreContext>, rig: Arc<Mutex<Rig>>, streaming: Arc<RelaxedAtomic>, fps: f32) {
     let origin = Instant::now();
     let mut deadline = Instant::now();
+    // shortcut: resends held inputs once, 1 s in, when the controller poses have surely reached
+    // SteamVR (it drops buttons before, Controller.cpp:145-147); resend on pose validity if 1 s proves short
+    let mut resend_at = Some(origin + Duration::from_secs(1));
     while streaming.value() {
-        let data = rig.lock().tracking(Instant::now(), origin.elapsed());
+        let (data, buttons) = {
+            let mut rig = rig.lock();
+            let mut buttons = rig.take_buttons();
+            if resend_at.is_some_and(|t| Instant::now() >= t) {
+                (resend_at, buttons) = (None, rig.all_buttons());
+            }
+            (rig.tracking(Instant::now(), origin.elapsed()), buttons)
+        };
         context.send_tracking(data);
+        if !buttons.is_empty() {
+            context.send_buttons(buttons);
+        }
         deadline += Duration::from_secs_f32(1.0 / fps / 3.0);
         thread::sleep(deadline.saturating_duration_since(Instant::now()));
     }
@@ -192,7 +249,12 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
                 ClientCoreEvent::DecoderConfig { codec, config_nal } => {
                     shared.lock().on_decoder_config(format!("{codec:?}"), config_nal);
                 }
-                ClientCoreEvent::Haptics { .. } | ClientCoreEvent::RealTimeConfig(_) => (),
+                ClientCoreEvent::Haptics { device_id, duration, frequency, amplitude } => {
+                    let t_s = ORIGIN.elapsed().as_secs_f64();
+                    let hand = hand_name(device_id).to_owned();
+                    shared.lock().on_haptics(HapticEvent { t_s, hand, duration_s: duration.as_secs_f32(), frequency, amplitude });
+                }
+                ClientCoreEvent::RealTimeConfig(_) => (),
             }
         }
 
@@ -218,6 +280,7 @@ fn event_thread(context: Arc<ClientCoreContext>, shared: Arc<Mutex<Shared>>, rig
 impl Headset {
     /// Starts the client; its tracking thread sends what `rig` holds.
     pub fn start(rig: Arc<Mutex<Rig>>) -> Headset {
+        LazyLock::force(&ORIGIN);
         let context = Arc::new(ClientCoreContext::new(capabilities(), vec![]));
         let shared = Arc::new(Mutex::new(Shared::default()));
         let stop = Arc::new(RelaxedAtomic::new(false));
@@ -233,6 +296,11 @@ impl Headset {
 
     pub fn status(&self) -> HeadsetStatus {
         self.shared.lock().status.clone()
+    }
+
+    /// Haptic events with `t_s` after `since_s`, oldest first; `clear` empties the log.
+    pub fn haptics(&self, since_s: Option<f64>, clear: bool) -> Vec<HapticEvent> {
+        self.shared.lock().haptics(since_s, clear)
     }
 
     /// A handle that takes screenshots without the headset itself, so callers need not hold a lock around the wait.
@@ -358,6 +426,22 @@ mod tests {
         assert_eq!(cw, 64);
         assert!(right.chunks(3).all(|p| p[2] > 200 && p[0] < 60));
         assert_eq!(crop(Eye::Both, w, h, &rgb), (128, rgb));
+    }
+
+    #[test]
+    fn haptics_ring_filters_and_clears() {
+        let mut s = Shared::default();
+        let event = |t_s| HapticEvent { t_s, hand: "left".into(), duration_s: 0.1, frequency: 160.0, amplitude: 0.8 };
+        for i in 0..1030 {
+            s.on_haptics(event(i as f64));
+        }
+        let all = s.haptics(None, false);
+        assert_eq!((all.len(), all[0].t_s, all[1023].t_s), (1024, 6.0, 1029.0), "a ring of 1024");
+        assert_eq!(s.haptics(Some(1027.0), false), vec![event(1028.0), event(1029.0)], "strictly after since_s");
+        assert_eq!(s.haptics(Some(1028.0), true), vec![event(1029.0)]);
+        assert!(s.haptics(None, false).is_empty(), "cleared");
+        assert_eq!(hand_name(*alvr_common::HAND_RIGHT_ID), "right");
+        assert_eq!(hand_name(*alvr_common::HEAD_ID), "other");
     }
 
     #[test]

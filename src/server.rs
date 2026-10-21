@@ -2,8 +2,9 @@ use crate::{
     checks::{self, Readiness},
     headset::Eye,
     rig::{
-        AnimateArgs, AnimateControllerArgs, ControllerPoseArgs, ControllerStateArgs, FingerCurlArgs, HandGestureArgs, HandModeArgs,
-        HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction,
+        AnimateArgs, AnimateControllerArgs, AxisArgs, ButtonArgs, ControllerPoseArgs, ControllerStateArgs, FingerCurlArgs, GripArgs,
+        HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, TouchArgs, TrackpadArgs,
+        TriggerArgs,
     },
     stack::Stack,
 };
@@ -50,6 +51,16 @@ struct TrackedStateArgs {
     /// Also return the 31 OpenVR hand bones per hand (model space, without controller).
     #[serde(default)]
     include_bones: bool,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct HapticsArgs {
+    /// Only events with t_s after this; pass the last t_s seen to get new ones.
+    since_s: Option<f64>,
+    /// Empty the log after reading.
+    #[serde(default)]
+    clear: bool,
 }
 
 /// A tool result with `v` as pretty JSON text.
@@ -184,6 +195,46 @@ impl VrServer {
     #[tool(description = "Pose a hand through the hand model: give either gesture (open, fist, point, pinch, thumbs_up) or custom curls (thumb, index, middle, ring, pinky, splay, each 0 to 1, unset 0), not both. A bare hand's pinch meets ALVR's pinch distance, so it acts as the trigger.")]
     async fn set_hand_gesture(&self, Parameters(args): Parameters<HandGestureArgs>) -> Result<CallToolResult, String> {
         self.rig(RigAction::SetHandGesture(args)).await
+    }
+
+    #[tool(description = "Press a Valve Index button and hold it until release_button: a, b, system, thumbstick (click and touch), trigger (value 1, click, touch), grip (squeeze value 1, force 0) or trackpad (force 1, touch). Refuses for an untracked controller or a bare hand.")]
+    async fn press_button(&self, Parameters(args): Parameters<ButtonArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::PressButton(args)).await
+    }
+
+    #[tool(description = "Release a button: everything press_button set for it goes back to false or 0.")]
+    async fn release_button(&self, Parameters(args): Parameters<ButtonArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::ReleaseButton(args)).await
+    }
+
+    #[tool(description = "Touch or untouch a button's capacitive sensor without pressing it: a, b, system, trigger, thumbstick or trackpad. The grip has no touch in ALVR's Index profile.")]
+    async fn touch_button(&self, Parameters(args): Parameters<TouchArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::TouchButton(args)).await
+    }
+
+    #[tool(description = "Set the trigger value, 0 to 1; click follows at >= 0.95 and touch at > 0.")]
+    async fn set_trigger(&self, Parameters(args): Parameters<TriggerArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetTrigger(args)).await
+    }
+
+    #[tool(description = "Set the grip (squeeze) value and force, each 0 to 1; force defaults to 0.")]
+    async fn set_grip(&self, Parameters(args): Parameters<GripArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetGrip(args)).await
+    }
+
+    #[tool(description = "Set the thumbstick: x and y from -1 to 1 (+x right, +y up), click (default false), touch (default: deflected or clicked). Holds until changed; set 0, 0 to center it.")]
+    async fn set_thumbstick(&self, Parameters(args): Parameters<AxisArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetThumbstick(args)).await
+    }
+
+    #[tool(description = "Set the trackpad: x and y from -1 to 1 (+x right, +y up), force 0 to 1 (default 0), touch (default true). Holds until changed; send touch false to lift the finger.")]
+    async fn set_trackpad(&self, Parameters(args): Parameters<TrackpadArgs>) -> Result<CallToolResult, String> {
+        self.rig(RigAction::SetTrackpad(args)).await
+    }
+
+    #[tool(description = "Haptic events the app sent, oldest first: t_s (seconds on the MCP's clock), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
+    async fn get_haptics(&self, Parameters(args): Parameters<HapticsArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
 
     #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs.")]
