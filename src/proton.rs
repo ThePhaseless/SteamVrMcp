@@ -80,7 +80,7 @@ pub fn resolve_exe(install_dir: &Path, exe: &str) -> Result<PathBuf> {
         bail!("exe {exe:?} must be relative to the install dir");
     }
     let root = install_dir.canonicalize().with_context(|| install_dir.display().to_string())?;
-    let path = root.join(&relative).canonicalize().with_context(|| format!("exe {exe:?} is not in {}", root.display()))?;
+    let path = root.join(&relative).canonicalize().with_context(|| format!("exe {exe:?} not found under {}", root.display()))?;
     if !path.starts_with(&root) {
         bail!("exe {exe:?} resolves to {}, outside the install dir {}", path.display(), root.display());
     }
@@ -96,11 +96,12 @@ pub struct ProtonLaunch {
     pub env: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,
     pub compatdata: PathBuf,
+    pub app_id: u32,
 }
 
 /// How to run `exe` of a Steam app through its compatibility tool: the app's CompatToolMapping
-/// entry, else Steam's default ("0"). Env: `base_env`, the app ids, `caller_env`, then the
-/// STEAM_COMPAT_* paths, which the caller cannot change since stop_app finds the run by them.
+/// entry, else Steam's default ("0"). Env: `base_env`, `caller_env`, then the app ids and STEAM_COMPAT_*
+/// paths, which the caller cannot change since stop_app finds the run by them.
 pub fn plan(steam_dir: &Path, app: &AppInfo, exe: &str, args: &[String], base_env: Vec<(OsString, OsString)>, caller_env: &BTreeMap<String, String>) -> Result<ProtonLaunch> {
     let install = app.install_dir.as_deref().with_context(|| format!("{} has no installdir in its appmanifest", app.name))?;
     let exe = resolve_exe(install, exe)?;
@@ -125,9 +126,10 @@ pub fn plan(steam_dir: &Path, app: &AppInfo, exe: &str, args: &[String], base_en
     }
     let id = OsString::from(app.app_id.to_string());
     let mut env: BTreeMap<OsString, OsString> = base_env.into_iter().collect();
-    env.extend([("SteamAppId".into(), id.clone()), ("SteamGameId".into(), app.game_id.to_string().into())]);
     env.extend(caller_env.iter().map(|(k, v)| (k.into(), v.into())));
     env.extend([
+        ("SteamAppId".into(), id.clone()),
+        ("SteamGameId".into(), app.game_id.to_string().into()),
         ("STEAM_COMPAT_DATA_PATH".into(), app.compatdata.clone().into()),
         ("STEAM_COMPAT_CLIENT_INSTALL_PATH".into(), steam_dir.into()),
         ("STEAM_COMPAT_INSTALL_PATH".into(), install.into()),
@@ -135,7 +137,7 @@ pub fn plan(steam_dir: &Path, app: &AppInfo, exe: &str, args: &[String], base_en
         ("STEAM_COMPAT_TOOL_PATHS".into(), tool_paths),
         ("STEAM_COMPAT_APP_ID".into(), id),
     ]);
-    Ok(ProtonLaunch { argv, env: env.into_iter().collect(), cwd, compatdata: app.compatdata.clone() })
+    Ok(ProtonLaunch { argv, env: env.into_iter().collect(), cwd, compatdata: app.compatdata.clone(), app_id: app.app_id })
 }
 
 /// A spawned launcher: the leader of its own process group.
@@ -143,6 +145,7 @@ pub fn plan(steam_dir: &Path, app: &AppInfo, exe: &str, args: &[String], base_en
 pub struct Launched {
     pub pgid: u32,
     pub compatdata: PathBuf,
+    pub app_id: u32,
     /// The leader's exit status once reaped. While None the leader is unreaped, so its pid, the
     /// pgid, cannot name another group yet.
     pub exited: Arc<Mutex<Option<ExitStatus>>>,
@@ -177,28 +180,32 @@ pub fn spawn(l: &ProtonLaunch, log: &Path) -> Result<Launched> {
     thread::spawn(move || {
         // wait without reaping, then reap under the lock: Launched::signal never races a reused pgid
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        while unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
         let mut status = status.lock();
         *status = child.wait().ok();
     });
-    Ok(Launched { pgid: pid, compatdata: l.compatdata.clone(), exited })
+    Ok(Launched { pgid: pid, compatdata: l.compatdata.clone(), app_id: l.app_id, exited })
 }
 
 const COMPAT_DATA: &str = "STEAM_COMPAT_DATA_PATH";
+const APP_ID_KEYS: [&str; 2] = ["STEAM_COMPAT_APP_ID", "SteamGameId"];
 
-/// SIGTERM to the scene pid, to `launched`'s group, and to every process with the game's
-/// STEAM_COMPAT_DATA_PATH (`launched`'s, else the scene pid's): wine processes leave the group.
+/// SIGTERM to the scene pid, to `launched`'s group, and to every process of the game's trees
+/// (game_pids of `launched` and of the scene pid's own env): wine processes leave the group.
 /// SIGKILL after 15 s. The pids and group signalled, sorted; none when nothing ran.
 pub fn stop(scene: Option<u32>, launched: Option<&Launched>) -> Result<Vec<u32>> {
-    let compatdata = match launched {
-        Some(l) => l.compatdata.to_str().map(str::to_owned),
-        None => scene.and_then(|pid| env_of(pid, COMPAT_DATA)),
-    }
-    .filter(|v| !v.is_empty());
-    // single pids proven to be the game's: the scene app, and processes with its compat data path
+    let mut games: Vec<(String, String)> = launched.and_then(|l| Some((l.compatdata.to_str()?.to_owned(), l.app_id.to_string()))).into_iter().collect();
+    let scene_game = scene.and_then(|pid| Some((env_of(pid, COMPAT_DATA)?, APP_ID_KEYS.iter().find_map(|k| env_of(pid, k))?)));
+    games.extend(scene_game);
+    games.retain(|(dir, id)| !dir.is_empty() && !id.is_empty());
+    games.dedup();
+    let scene_comm = scene.and_then(steamvr::comm);
+    // single pids proven to be the game's: the scene app (same comm, so not a reused pid), and its trees
     let live = || {
-        let mut pids: Vec<u32> = scene.filter(|pid| Path::new(&format!("/proc/{pid}")).exists()).into_iter().collect();
-        pids.extend(compatdata.as_deref().map_or(vec![], |v| pids_with_env(COMPAT_DATA, v)));
+        let mut pids: Vec<u32> = scene.filter(|&pid| scene_comm.is_some() && steamvr::comm(pid) == scene_comm).into_iter().collect();
+        games.iter().for_each(|(dir, id)| pids.extend(game_pids(dir, id)));
         pids
     };
     let signal = |sig| {
@@ -234,15 +241,28 @@ pub fn env_of(pid: u32, key: &str) -> Option<String> {
     String::from_utf8(value.to_vec()).ok()
 }
 
-/// Every process whose environ holds `key=value`, except pid 1, this MCP and its process group; processes
-/// of other users (unreadable environ) are skipped.
-pub fn pids_with_env(key: &str, value: &str) -> Vec<u32> {
-    let group = unsafe { libc::getpgrp() };
-    let Ok(dir) = fs::read_dir("/proc") else { return vec![] };
-    dir.flatten()
-        .filter_map(|e| e.file_name().to_str()?.parse().ok())
-        .filter(|&pid: &u32| signalable(pid).is_some_and(|p| unsafe { libc::getpgid(p) } != group))
-        .filter(|pid| fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| environ_has(&env, key, value)))
+/// This MCP and its ancestors up to (not including) init.
+pub fn ancestors() -> Vec<u32> {
+    let ppid = |pid: u32| {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+    };
+    std::iter::successors(Some(std::process::id()), |&pid| ppid(pid).filter(|&p| p > 1)).collect()
+}
+
+/// Every process of a game's tree: its environ has the game's STEAM_COMPAT_DATA_PATH and its app
+/// id (STEAM_COMPAT_APP_ID or SteamGameId), which a shell that only exported the path lacks. Never
+/// pid 1, this MCP, its ancestors or its process group; other users' processes (unreadable environ) are skipped.
+// shortcut: skips the MCP's group, which holds a Steam the MCP started and maybe its games' processes; narrow to pids if a via-steam game's tree outlives stop_app
+pub fn game_pids(compatdata: &str, app_id: &str) -> Vec<u32> {
+    let (group, mine) = (unsafe { libc::getpgrp() }, ancestors());
+    steamvr::all_pids()
+        .into_iter()
+        .filter(|pid| !mine.contains(pid) && signalable(*pid).is_some_and(|p| unsafe { libc::getpgid(p) } != group))
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|env| environ_has(&env, COMPAT_DATA, compatdata) && APP_ID_KEYS.iter().any(|k| environ_has(&env, k, app_id)))
+        })
         .collect()
 }
 
@@ -259,7 +279,7 @@ pub fn group_alive(pgid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::steamvr::AppKind;
-    use std::{os::unix::process::ExitStatusExt, process::Child};
+    use std::os::unix::process::ExitStatusExt;
 
     fn root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("vr-test-mcp-proton-{name}-{}", std::process::id()));
@@ -370,18 +390,19 @@ mod tests {
         };
         let host = [("HOME", "/h"), ("XDG_CONFIG_HOME", "/h/.config"), ("SECRET_TOKEN", "s")].map(|(k, v)| (k.into(), v.into()));
         let base = steamvr::steam_env(host, &BTreeMap::new());
-        let caller = [("SteamAppId", "1"), ("STEAM_COMPAT_DATA_PATH", "/elsewhere")].map(|(k, v)| (k.to_owned(), v.to_owned())).into();
+        let caller = [("XDG_CONFIG_HOME", "/c"), ("SteamAppId", "1"), ("STEAM_COMPAT_DATA_PATH", "/elsewhere")].map(|(k, v)| (k.to_owned(), v.to_owned())).into();
         let l = plan(&steam, &app, "Game.exe", &["-a".into()], base.clone(), &caller).unwrap();
         let env: BTreeMap<String, String> = l.env.iter().map(|(k, v)| (k.to_str().unwrap().into(), v.to_str().unwrap().into())).collect();
-        assert_eq!((env["HOME"].as_str(), env["XDG_CONFIG_HOME"].as_str()), ("/h", "/h/.config"));
+        assert_eq!((env["HOME"].as_str(), env["XDG_CONFIG_HOME"].as_str()), ("/h", "/c"), "caller env over the desktop's");
         assert!(!env.contains_key("SECRET_TOKEN"));
         let s = |p: &Path| p.to_str().unwrap().to_owned();
-        assert_eq!(env["STEAM_COMPAT_DATA_PATH"], s(&app.compatdata), "the MCP's value wins: stop_app finds the game by it");
+        assert_eq!(env["STEAM_COMPAT_DATA_PATH"], s(&app.compatdata), "check_launch refuses these keys; the MCP's value wins anyway: stop_app finds the game by it");
         assert_eq!(env["STEAM_COMPAT_CLIENT_INSTALL_PATH"], s(&steam));
         assert_eq!(env["STEAM_COMPAT_INSTALL_PATH"], s(&install));
         assert_eq!(env["STEAM_COMPAT_LIBRARY_PATHS"], s(&steam.join("steamapps")));
         assert_eq!(env["STEAM_COMPAT_TOOL_PATHS"], format!("{}:{}", s(&tool), s(&runtime)));
-        assert_eq!((env["SteamAppId"].as_str(), env["SteamGameId"].as_str(), env["STEAM_COMPAT_APP_ID"].as_str()), ("1", "620980", "620980"), "caller env wins");
+        assert_eq!((env["SteamAppId"].as_str(), env["SteamGameId"].as_str(), env["STEAM_COMPAT_APP_ID"].as_str()), ("620980", "620980", "620980"));
+        assert_eq!(l.app_id, 620980);
         let canon = install.canonicalize().unwrap();
         let tail: Vec<OsString> = vec![tool.join("proton").into(), "waitforexitandrun".into(), canon.join("Game.exe").into(), "-a".into()];
         assert_eq!((&l.argv[0], &l.argv[3..]), (&runtime.join("_v2-entry-point").into_os_string(), &tail[..]));
@@ -424,12 +445,13 @@ mod tests {
         let dir = root("spawn");
         let marker = dir.to_str().unwrap().to_owned();
         let env = vec![("PATH".into(), std::env::var_os("PATH").unwrap()), ("STEAM_COMPAT_DATA_PATH".into(), marker.clone().into())];
-        let l = ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env, cwd: dir.clone(), compatdata: dir.clone() };
+        let env = [env, vec![("STEAM_COMPAT_APP_ID".into(), "7".into())]].concat();
+        let l = ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env, cwd: dir.clone(), compatdata: dir.clone(), app_id: 7 };
         let launched = spawn(&l, &dir.join("run.log")).unwrap();
         let guard = KillGroup(launched.clone());
         let mut second = Command::new("sleep").arg("30").process_group(launched.pgid as i32).spawn().unwrap();
         assert!(group_alive(launched.pgid));
-        assert_eq!(pids_with_env("STEAM_COMPAT_DATA_PATH", &marker), [launched.pgid], "only the launched process carries the marker");
+        assert_eq!(game_pids(&marker, "7"), [launched.pgid], "only the launched process carries the marker");
         assert!(launched.signal(libc::SIGTERM));
         assert_eq!(second.wait().unwrap().signal(), Some(libc::SIGTERM), "the group signal reached the second process");
         assert!(steamvr::wait_for(Duration::from_secs(5), || !group_alive(launched.pgid)));
@@ -439,30 +461,41 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// SIGKILLs and reaps a test's child when the test ends early.
-    struct KillChild(Child);
-    impl Drop for KillChild {
-        fn drop(&mut self) {
-            self.0.kill().ok();
-            self.0.wait().ok();
-        }
+    /// A `sleep 30` group, spawned as launch_app would, with PATH and `env`; killed when the test ends.
+    fn sleeper(dir: &Path, app_id: u32, env: &[(&str, &str)]) -> KillGroup {
+        let mut all: Vec<(OsString, OsString)> = vec![("PATH".into(), std::env::var_os("PATH").unwrap())];
+        all.extend(env.iter().map(|&(k, v)| (k.into(), v.into())));
+        let l = ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env: all, cwd: dir.into(), compatdata: dir.join("a"), app_id };
+        KillGroup(spawn(&l, Path::new("/dev/null")).unwrap())
     }
 
     #[test]
-    fn stop_kills_group_and_detached_processes_with_the_compat_data_path() {
+    fn stop_kills_stale_launched_and_scene_trees_only() {
         assert_eq!(stop(None, None).unwrap(), Vec::<u32>::new(), "nothing ran");
         let dir = root("stop");
-        let env: Vec<(OsString, OsString)> = vec![("PATH".into(), std::env::var_os("PATH").unwrap()), (COMPAT_DATA.into(), dir.clone().into())];
-        let l = ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env: env.clone(), cwd: dir.clone(), compatdata: dir.clone() };
-        let launched = spawn(&l, &dir.join("run.log")).unwrap();
-        let _group = KillGroup(launched.clone());
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
+        // a stale proton launch of app 1, and a scene of app 2 that Steam launched on another prefix
+        let launched = sleeper(&dir, 1, &[(COMPAT_DATA, a), ("STEAM_COMPAT_APP_ID", "1")]);
+        let scene = sleeper(&dir, 2, &[(COMPAT_DATA, b), ("STEAM_COMPAT_APP_ID", "2"), ("SteamGameId", "2")]);
         // as wineserver daemonizes into its own group: only its environ ties it to the game
-        let mut detached = KillChild(Command::new("sleep").arg("30").env_clear().envs(env).process_group(0).spawn().unwrap());
-        let mut want = vec![launched.pgid, detached.0.id()];
+        let wineserver = sleeper(&dir, 2, &[(COMPAT_DATA, b), ("SteamGameId", "2"), ("X", "1")]);
+        let shell = sleeper(&dir, 2, &[(COMPAT_DATA, b)]);
+        let other_app = sleeper(&dir, 3, &[(COMPAT_DATA, b), ("STEAM_COMPAT_APP_ID", "3"), ("SteamGameId", "3")]);
+        let mut want = vec![launched.0.pgid, scene.0.pgid, wineserver.0.pgid];
         want.sort_unstable();
-        assert_eq!(stop(None, Some(&launched)).unwrap(), want);
-        assert_eq!(detached.0.wait().unwrap().signal(), Some(libc::SIGTERM));
-        assert!(launched.exited.lock().is_some());
+        assert_eq!(stop(Some(scene.0.pgid), Some(&launched.0)).unwrap(), want);
+        for dead in [&launched, &scene, &wineserver] {
+            assert!(dead.0.exited.lock().is_some_and(|s| s.signal() == Some(libc::SIGTERM)), "{}", dead.0.pgid);
+        }
+        assert!(group_alive(shell.0.pgid), "the prefix path alone does not prove a process is the game's");
+        assert!(group_alive(other_app.0.pgid), "another app on the same prefix");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweep_skips_this_mcp_and_its_ancestors() {
+        let me = ancestors();
+        assert!(me.contains(&std::process::id()) && me.contains(&std::os::unix::process::parent_id()), "{me:?}");
     }
 }

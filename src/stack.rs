@@ -154,7 +154,7 @@ pub struct LaunchArgs {
     /// Proton only: the exe's arguments, passed as given (no shell).
     #[serde(default)]
     pub args: Vec<String>,
-    /// Proton only: env vars over the desktop session's, e.g. GPU selection. They cannot change the STEAM_COMPAT_* paths the MCP sets.
+    /// Proton only: env vars over the desktop session's, e.g. GPU selection. STEAM_COMPAT_*, SteamAppId and SteamGameId are refused: the MCP sets them.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -166,8 +166,11 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
         Via::Proton if a.exe.is_none() => return Err("via \"proton\" needs exe, relative to the app's install dir".into()),
         _ => (),
     }
-    match a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
-        Some((k, _)) => Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL")),
+    if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
+        return Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL"));
+    }
+    match a.env.keys().find(|k| k.starts_with("STEAM_COMPAT_") || ["SteamAppId", "SteamGameId"].contains(&k.as_str())) {
+        Some(k) => Err(format!("env must not set {k}: the MCP sets STEAM_COMPAT_*, SteamAppId and SteamGameId itself")),
         None => Ok(()),
     }
 }
@@ -1108,6 +1111,8 @@ impl Stack {
         let before = self.scene_app().map(|a| a.pid);
         let log_from = steamvr::console_log_len(steam);
         let (mut run_log, mut exited) = (None, None);
+        // shortcut: a new launch forgets the last proton run's group, which stop_app then reaches only while it is the scene; refuse while it runs if one lingers
+        self.state.lock().launched = None;
         match a.via {
             Via::Steam => {
                 steamvr::launch(&self.cfg(), &format!("steam://rungameid/{}", app.game_id))?;
@@ -1158,12 +1163,21 @@ impl Stack {
     }
 
     /// Stops the app: SIGTERM to the scene pid, to the group launch_app started, and to every
-    /// process with the game's STEAM_COMPAT_DATA_PATH (wine processes leave the group); SIGKILL after 15 s.
+    /// process with the game's STEAM_COMPAT_DATA_PATH and app id (wine processes leave the group); SIGKILL after 15 s.
     pub fn stop_app(&self) -> Result<Value> {
-        let scene = game_pid(self.scene_app().as_ref(), steamvr::comm).ok();
+        let scene = game_pid(self.scene_app().as_ref(), steamvr::comm);
         let launched = self.state.lock().launched.clone();
+        if launched.is_none() {
+            scene.map_err(|e| anyhow!(e))?;
+        }
+        let scene = scene.ok();
         let stopped = proton::stop(scene, launched.as_ref())?; // fails only while something still runs: keep tracking it
-        self.state.lock().launched = None;
+        let mut state = self.state.lock();
+        // a launch_app during the wait stored a new run: keep that one
+        if state.launched.as_ref().is_none_or(|now| launched.as_ref().is_some_and(|then| Arc::ptr_eq(&now.exited, &then.exited))) {
+            state.launched = None;
+        }
+        drop(state);
         if stopped.is_empty() {
             bail!("no app running");
         }
@@ -1444,6 +1458,9 @@ mod tests {
         assert!(check_launch(&a(Via::Proton, None, &[], &[])).unwrap_err().contains("exe"));
         for env in [("A=B", "1"), ("", "1"), ("A\0", "1"), ("A", "1\0")] {
             assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[env])).is_err(), "{env:?}");
+        }
+        for key in ["STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId"] {
+            assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err().contains(key), "the MCP sets {key}");
         }
         assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &[("DRI_PRIME", "1")])), Ok(()));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1"})).unwrap();

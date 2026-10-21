@@ -23,14 +23,14 @@ pub const VR_PROCESS_NAMES: &[&str] = &[
     "vrmonitor",
 ];
 
-pub fn pids_named(name: &str) -> Vec<u32> {
+/// Every pid in /proc.
+pub fn all_pids() -> Vec<u32> {
     let Ok(dir) = fs::read_dir("/proc") else { return vec![] };
-    dir.flatten()
-        .filter_map(|e| {
-            let pid = e.file_name().to_str()?.parse().ok()?;
-            (comm(pid)? == name).then_some(pid)
-        })
-        .collect()
+    dir.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+}
+
+pub fn pids_named(name: &str) -> Vec<u32> {
+    all_pids().into_iter().filter(|&pid| comm(pid).is_some_and(|c| c == name)).collect()
 }
 
 /// `/proc/<pid>/comm`: the process name.
