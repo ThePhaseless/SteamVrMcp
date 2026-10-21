@@ -24,10 +24,12 @@ pub const VR_PROCESS_NAMES: &[&str] = &[
     "vrmonitor",
 ];
 
-/// Every pid in /proc.
+/// Every pid in /proc owned by this user: another user's Steam or SteamVR (a second account) is not ours to see or stop.
 pub fn all_pids() -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
     let Ok(dir) = fs::read_dir("/proc") else { return vec![] };
-    dir.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+    let me = unsafe { libc::geteuid() };
+    dir.flatten().filter(|e| e.metadata().is_ok_and(|m| m.uid() == me)).filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
 }
 
 pub fn pids_named(name: &str) -> Vec<u32> {
@@ -561,6 +563,13 @@ mod tests {
         }
         b.extend(b"\x08\x08");
         b
+    }
+
+    #[test]
+    fn all_pids_lists_only_this_users_processes() {
+        let pids = all_pids();
+        assert!(pids.contains(&std::process::id()));
+        assert!(!pids.contains(&1), "pid 1 belongs to root, another user's Steam or SteamVR must not count");
     }
 
     #[test]
