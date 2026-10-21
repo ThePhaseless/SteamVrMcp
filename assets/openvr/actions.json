@@ -1,0 +1,19 @@
+{
+  "default_bindings": [
+    { "controller_type": "knuckles", "binding_url": "bindings_knuckles.json" },
+    { "controller_type": "svl_hand_interaction_augmented", "binding_url": "bindings_svl_hand_interaction_augmented.json" }
+  ],
+  "actions": [
+    { "name": "/actions/main/in/skeleton_left", "type": "skeleton", "skeleton": "/skeleton/hand/left" },
+    { "name": "/actions/main/in/skeleton_right", "type": "skeleton", "skeleton": "/skeleton/hand/right" }
+  ],
+  "action_sets": [{ "name": "/actions/main", "usage": "leftright" }],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/main": "Main",
+      "/actions/main/in/skeleton_left": "Left hand skeleton",
+      "/actions/main/in/skeleton_right": "Right hand skeleton"
+    }
+  ]
+}

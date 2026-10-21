@@ -26,3 +26,6 @@ libloading = "0.8"
 openh264 = "0.9"
 png = "0.18"
 base64 = "0.23"
+
+[build-dependencies]
+bindgen = "0.72"

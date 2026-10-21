@@ -1,0 +1,13 @@
+{
+  "controller_type": "svl_hand_interaction_augmented",
+  "name": "vr-test-mcp skeletons",
+  "description": "Hand skeletons for the vr-test-mcp tracked-state reader",
+  "bindings": {
+    "/actions/main": {
+      "skeleton": [
+        { "output": "/actions/main/in/skeleton_left", "path": "/user/hand/left/input/skeleton/left" },
+        { "output": "/actions/main/in/skeleton_right", "path": "/user/hand/right/input/skeleton/right" }
+      ]
+    }
+  }
+}

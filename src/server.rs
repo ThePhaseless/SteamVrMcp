@@ -36,6 +36,14 @@ struct ScreenshotArgs {
     eye: Eye,
 }
 
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct TrackedStateArgs {
+    /// Also return the 31 OpenVR hand bones per hand (model space, without controller).
+    #[serde(default)]
+    include_bones: bool,
+}
+
 /// A tool result with `v` as pretty JSON text.
 fn json(v: impl Serialize) -> Result<CallToolResult> {
     Ok(CallToolResult::success(vec![ContentBlock::text(serde_json::to_string_pretty(&v)?)]))
@@ -81,6 +89,16 @@ impl VrServer {
                 ContentBlock::image(STANDARD.encode(&shot.png), "image/png"),
                 ContentBlock::text(serde_json::to_string(&shot)?),
             ]))
+        })
+        .await
+        .map_err(message)
+    }
+
+    #[tool(description = "What SteamVR itself tracks: each device's class, role, serial, model, connection, pose (SteamVR standing space: meters, +Y up, -Z forward; quat x, y, z, w) and velocities; per hand the skeleton action's state, finger curls and splay as SteamVR animates them and as the driver reports them, and optionally the bones; plus the scene app's pid and state.")]
+    async fn get_tracked_state(&self, Parameters(args): Parameters<TrackedStateArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| {
+            let state = s.tracked_state(args.include_bones)?;
+            json(serde_json::json!({ "devices": state.devices, "skeletons": state.skeletons, "scene_app": s.scene_app() }))
         })
         .await
         .map_err(message)

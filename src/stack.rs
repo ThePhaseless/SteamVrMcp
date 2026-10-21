@@ -3,6 +3,7 @@ use crate::{
     checks::{self, Check, Readiness},
     config::{Config, Paths},
     headset::{self, Eye, Headset, HeadsetStatus, Screenshot},
+    openvr::{self, OpenVr},
     setup,
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
@@ -36,6 +37,9 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on each OpenVR call, connect and disconnect: a stale connection must not hang a tool.
+const OPENVR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs `f` on its own thread and returns its result, or None if it is still running after
 /// `timeout`; the thread is then left running (detached).
@@ -101,6 +105,9 @@ pub struct Stack {
     restarting: Mutex<()>,
     /// Results of the last startup checks.
     checks: Mutex<Vec<Check>>,
+    /// The OpenVR reader and the vrserver pid it connected to. Its own lock, held across OpenVR
+    /// calls (bounded by OPENVR_TIMEOUT), never together with `state`.
+    reader: Mutex<Option<(u32, OpenVr)>>,
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -122,6 +129,7 @@ impl Stack {
             state: Mutex::default(),
             restarting: Mutex::new(()),
             checks: Mutex::default(),
+            reader: Mutex::new(None),
             on_change: Mutex::new(None),
         });
         stack.recheck();
@@ -178,6 +186,58 @@ impl Stack {
     pub fn screenshot(&self, eye: Eye) -> Result<Screenshot> {
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
         grabber.screenshot(&self.api, eye)
+    }
+
+    /// SteamVR's own view of devices and hand skeletons.
+    pub fn tracked_state(&self, include_bones: bool) -> Result<openvr::TrackedState> {
+        self.read(move |vr| vr.tracked_state(include_bones))
+    }
+
+    /// None when SteamVR is not running or the reader cannot connect.
+    pub fn scene_app(&self) -> Option<openvr::SceneApp> {
+        self.read(|vr| Ok(vr.scene_app())).ok()
+    }
+
+    /// None when SteamVR is not running, no scene app runs, or the reader cannot connect.
+    pub fn frame_stats(&self) -> Option<openvr::FrameStats> {
+        self.read(|vr| vr.frame_stats()).ok()
+    }
+
+    /// Runs `f` on the OpenVR reader, which connects on first use and again when vrserver's pid
+    /// changed. A reader that does not answer within OPENVR_TIMEOUT is left on its thread.
+    // shortcut: a reader left stuck keeps OpenVR's process-global client, so the next connect may fail until the MCP restarts; fine while no hang is seen
+    fn read<T: Send + 'static>(&self, f: impl FnOnce(&OpenVr) -> Result<T> + Send + 'static) -> Result<T> {
+        let mut slot = self.reader.lock();
+        let vrserver = steamvr::pids_named("vrserver").first().copied();
+        let reader = match slot.take() {
+            Some((pid, reader)) if Some(pid) == vrserver => Some(reader),
+            Some((_, stale)) => {
+                dispose_reader(stale);
+                None
+            }
+            None => None,
+        };
+        let pid = vrserver.context("SteamVR is not running")?;
+        let steamvr_dir = self.paths.steamvr_dir.clone().context("SteamVR not found; set steamvr_dir in config.toml")?;
+        let state_dir = self.paths.state_dir.clone();
+        let (reader, result) = within(OPENVR_TIMEOUT, move || -> Result<_> {
+            let reader = match reader {
+                Some(r) => r,
+                None => OpenVr::connect(&steamvr_dir, &state_dir)?,
+            };
+            let result = f(&reader);
+            Ok((reader, result))
+        })
+        .with_context(|| format!("OpenVR did not answer within {} s", OPENVR_TIMEOUT.as_secs()))??;
+        *slot = Some((pid, reader));
+        result
+    }
+
+    /// Disconnects the reader while vrserver is still up; called before every stop and restart.
+    fn drop_reader(&self) {
+        if let Some((_, reader)) = self.reader.lock().take() {
+            dispose_reader(reader);
+        }
     }
 
     fn headset_status(&self) -> Option<HeadsetStatus> {
@@ -270,6 +330,7 @@ impl Stack {
     pub fn stop(&self) -> Result<StopReport> {
         self.state.lock().managing = false;
         let _no_restart = self.restarting.lock();
+        self.drop_reader();
         let mut report = StopReport::default();
         // ALVR's client spins forever on a TCP stream whose server went away
         // (sockets/src/stream_socket/tcp.rs:137-147), so disconnect it while the server is up
@@ -382,6 +443,7 @@ impl Stack {
             }
             paused
         });
+        self.drop_reader();
         let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api);
         let headset = headset.inspect(Headset::resume).unwrap_or_else(Headset::start);
         let spare = {
@@ -398,6 +460,13 @@ impl Stack {
             Ok(()) => self.state.lock().restarts += 1,
             Err(e) => error!("SteamVR restart failed: {e:#}"),
         }
+    }
+}
+
+/// Drops an OpenVR reader within OPENVR_TIMEOUT, or leaves it on its thread.
+fn dispose_reader(reader: OpenVr) {
+    if within(OPENVR_TIMEOUT, move || drop(reader)).is_none() {
+        warn!("OpenVR reader did not disconnect within {} s; left running", OPENVR_TIMEOUT.as_secs());
     }
 }
 

@@ -200,3 +200,45 @@ fn live_screenshot_png() {
         assert!(stddev > 0.0, "{eye:?} image is uniform");
     }
 }
+
+/// Proves early risk 6 (the host-side OpenVR client reaches vrserver in its container) and the
+/// get_tracked_state half of done-when 3. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+#[test]
+#[ignore]
+fn live_tracked_head_matches() {
+    let s = ensure_streaming();
+    let state = s.tracked_state(false).unwrap();
+    println!("{state:#?}\nscene app: {:?}", s.scene_app());
+    let hmds: Vec<_> = state.devices.iter().filter(|d| d.class == "hmd").collect();
+    assert_eq!(hmds.len(), 1, "{hmds:?}");
+    let [x, y, z] = hmds[0].position;
+    assert!(hmds[0].pose_valid, "{:?}", hmds[0]);
+    assert!(x.abs() < 0.01 && (y - 1.6).abs() < 0.01 && z.abs() < 0.01, "{:?}", hmds[0]);
+    let mut roles: Vec<_> = state.devices.iter().filter(|d| d.class == "controller").map(|d| d.role.as_str()).collect();
+    roles.sort();
+    // pose_valid may stay false until Task 6 sends controller poses
+    assert_eq!(roles, ["left", "right"], "{:?}", state.devices);
+}
+
+/// Proves early risk 5 (Beat Saber runs on the integrated GPU at the MCP's default resolution). Needs env
+/// VR_TEST_GAME_ID: the Beat Saber Steam app id or its non-Steam shortcut game id.
+#[test]
+#[ignore]
+fn live_beat_saber_menu_fps() {
+    let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
+    let s = ensure_streaming();
+    steamvr::launch(&Config::load().unwrap(), &format!("steam://rungameid/{id}")).unwrap();
+    let running = steamvr::wait_for(Duration::from_secs(180), || s.scene_app().is_some_and(|a| a.state == "running"));
+    let app = s.scene_app();
+    assert!(running, "scene app not running after 180 s: {app:?}");
+    thread::sleep(Duration::from_secs(20));
+    let f0 = s.frame_stats().expect("frame stats");
+    thread::sleep(Duration::from_secs(30));
+    let f1 = s.frame_stats().expect("frame stats");
+    steamvr::terminate(app.unwrap().pid, libc::SIGTERM);
+    let presents = f1.presents - f0.presents;
+    let bad = (f1.dropped - f0.dropped) + (f1.reprojected - f0.reprojected);
+    let ratio = bad as f64 / presents.max(1) as f64;
+    println!("{f0:?} -> {f1:?}: {bad} dropped or reprojected of {presents} presents ({ratio:.3})");
+    assert!(presents > 0 && ratio < 0.10, "ratio {ratio:.3}");
+}
