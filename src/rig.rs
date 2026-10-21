@@ -4,11 +4,11 @@
 use crate::hand::{self, Curls, Gesture};
 use alvr_common::{
     DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose,
-    glam::{EulerRot, Quat, Vec3, Vec4},
+    glam::{EulerRot, Quat, Vec2, Vec3, Vec4},
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, TrackingData};
 use rmcp::schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -364,6 +364,68 @@ pub enum RigAction {
     SetTrackpad(TrackpadArgs),
 }
 
+/// One timed action of `run_sequence`: any rig tool, by name, with its arguments.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SequenceStep {
+    /// Seconds from the start of the sequence, 0 to 600.
+    pub at_s: f32,
+    /// A rig tool's name: set_head_pose, animate_controller, set_trigger, set_finger_curl, ...
+    pub action: String,
+    /// That tool's arguments.
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+impl SequenceStep {
+    pub fn parse(&self) -> Result<RigAction, String> {
+        serde_json::from_value(serde_json::json!({ "action": self.action, "args": self.args })).map_err(|e| {
+            let e = e.to_string();
+            if e.starts_with("unknown variant") { format!("{:?} is not allowed in a sequence", self.action) } else { e }
+        })
+    }
+}
+
+/// What a sequence step did and when, in seconds from the start of the sequence.
+#[derive(Debug, Serialize)]
+pub struct AppliedStep {
+    pub at_s: f32,
+    pub action: String,
+    pub applied_s: f32,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SequenceReport {
+    pub steps: Vec<AppliedStep>,
+    /// Until the last step and the latest animation are done.
+    pub total_s: f32,
+}
+
+const SEQUENCE_STEPS_MAX: usize = 256;
+
+/// Checks every step before anything runs and orders them by `at_s` (equal times keep their order).
+pub fn plan_sequence(steps: Vec<SequenceStep>) -> Result<Vec<(SequenceStep, RigAction)>, String> {
+    if steps.len() > SEQUENCE_STEPS_MAX {
+        return Err(format!("at most {SEQUENCE_STEPS_MAX} steps"));
+    }
+    let mut plan = steps
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if !(0.0..=600.0).contains(&s.at_s) {
+                return Err(format!("step {i}: at_s must be within 0 and 600"));
+            }
+            let action = s.parse().map_err(|e| format!("step {i}: {e}"))?;
+            Ok((s, action))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    plan.sort_by(|a, b| a.0.at_s.total_cmp(&b.0.at_s));
+    Ok(plan)
+}
+
 impl PoseArgs {
     pub fn to_pose(&self) -> Result<Pose, String> {
         let position = Vec3::from_array(self.position);
@@ -516,6 +578,10 @@ pub struct Rig {
     buttons: [BTreeMap<u64, ButtonValue>; 2],
     /// Inputs set since the last `take_buttons`, in order.
     pending: Vec<(u64, ButtonValue)>,
+    /// Half the play area, the unit ALVR draws the chaperone in; the default area is 2 x 2 m.
+    playspace: Vec2,
+    /// Set until the tracking thread sends it.
+    playspace_pending: bool,
 }
 
 impl Default for Rig {
@@ -533,7 +599,30 @@ impl Rig {
             hands: Default::default(),
             buttons: Default::default(),
             pending: vec![],
+            playspace: Vec2::ONE,
+            playspace_pending: false,
         }
+    }
+
+    /// Sets the play area in meters; the tracking thread sends it. ALVR draws ±area (ChaperoneUpdater.cpp:69-76), so it gets half.
+    pub fn set_playspace(&mut self, width: f32, depth: f32) -> Result<(), String> {
+        // ALVR falls back to 2 x 2 when width * depth is not finite; 1000 m also keeps the product finite
+        if ![width, depth].iter().all(|v| *v > 0.0 && *v <= 1000.0) {
+            return Err("width and depth must be above 0 and at most 1000 meters".into());
+        }
+        self.playspace = Vec2::new(width, depth) / 2.0;
+        self.playspace_pending = true;
+        Ok(())
+    }
+
+    /// Queues the current area again: ALVR recenters on every playspace update.
+    pub fn recenter(&mut self) {
+        self.playspace_pending = true;
+    }
+
+    /// The area to send, once per `set_playspace` or `recenter`.
+    pub fn take_playspace(&mut self) -> Option<Vec2> {
+        std::mem::take(&mut self.playspace_pending).then_some(self.playspace)
     }
 
     /// Where a controller pose given `relative_to` lands in the playspace.
@@ -666,6 +755,7 @@ impl Rig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alvr_common::glam::Vec2;
 
     fn close(a: Vec3, b: Vec3) -> bool {
         a.distance(b) < 1e-4
@@ -996,5 +1086,62 @@ mod tests {
         assert!(matches!(a, RigAction::SetHandGesture(HandGestureArgs { curls: Some(Curls { index: 0.5, thumb: 0.0, .. }), .. })));
         let a: RigAction = serde_json::from_str(r#"{"action":"set_grip","args":{"hand":"left","value":0.5}}"#).unwrap();
         assert!(matches!(a, RigAction::SetGrip(GripArgs { force: None, .. })));
+    }
+    #[test]
+    fn playspace_sends_half_extents() {
+        let mut rig = Rig::new();
+        assert_eq!(rig.take_playspace(), None);
+        rig.set_playspace(3.0, 2.0).unwrap();
+        // ALVR draws the chaperone at ±area (ChaperoneUpdater.cpp:69-76)
+        assert_eq!(rig.take_playspace(), Some(Vec2::new(1.5, 1.0)));
+        assert_eq!(rig.take_playspace(), None);
+        rig.recenter();
+        assert_eq!(rig.take_playspace(), Some(Vec2::new(1.5, 1.0)), "recenter re-sends the current area");
+        let mut fresh = Rig::new();
+        fresh.recenter();
+        assert_eq!(fresh.take_playspace(), Some(Vec2::new(1.0, 1.0)), "default 2 x 2");
+    }
+
+    #[test]
+    fn playspace_rejects_bad_size() {
+        let mut rig = Rig::new();
+        for (w, d) in [(0.0, 2.0), (2.0, -1.0), (f32::NAN, 2.0), (2.0, f32::INFINITY), (1001.0, 2.0)] {
+            assert!(rig.set_playspace(w, d).is_err(), "{w} x {d}");
+        }
+        assert_eq!(rig.take_playspace(), None, "a refused size changes nothing");
+        rig.recenter();
+        assert_eq!(rig.take_playspace(), Some(Vec2::new(1.0, 1.0)));
+    }
+
+    fn step(at_s: f32, action: &str, args: serde_json::Value) -> SequenceStep {
+        SequenceStep { at_s, action: action.into(), args }
+    }
+
+    #[test]
+    fn sequence_steps_parse_as_rig_actions() {
+        let trigger = step(0.0, "set_trigger", serde_json::json!({ "hand": "right", "value": 1 }));
+        assert!(matches!(trigger.parse(), Ok(RigAction::SetTrigger(TriggerArgs { hand: Hand::Right, .. }))));
+        let swing = step(0.0, "animate_controller", serde_json::json!({ "hand": "right", "relative_to": "head", "duration_s": 1.5, "waypoints": [{ "position": [0, 0, -0.5] }] }));
+        assert!(matches!(swing.parse(), Ok(RigAction::AnimateController(AnimateControllerArgs { relative_to: RelativeTo::Head, .. }))));
+        let shot = step(0.0, "screenshot", serde_json::json!({}));
+        assert!(shot.parse().unwrap_err().contains("not allowed in a sequence"));
+        let bad = step(0.0, "set_trigger", serde_json::json!({ "hand": "right" }));
+        assert!(bad.parse().unwrap_err().contains("value"), "a bad argument names the field");
+    }
+
+    #[test]
+    fn sequence_orders_and_bounds() {
+        let t = |at_s, hand| step(at_s, "set_trigger", serde_json::json!({ "hand": hand, "value": 0 }));
+        let plan = plan_sequence(vec![t(1.0, "left"), t(0.0, "right"), t(1.0, "right")]).unwrap();
+        let order: Vec<_> = plan.iter().map(|(s, _)| (s.at_s, matches!(s.parse(), Ok(RigAction::SetTrigger(TriggerArgs { hand: Hand::Left, .. }))))).collect();
+        assert_eq!(order, [(0.0, false), (1.0, true), (1.0, false)], "sorted by at_s, equal times keep their order");
+        for bad in [-0.1, 600.1, f32::NAN] {
+            assert!(plan_sequence(vec![t(bad, "left")]).is_err(), "{bad}");
+        }
+        assert!(plan_sequence(vec![t(600.0, "left")]).is_ok());
+        assert!(plan_sequence((0..256).map(|_| t(0.0, "left")).collect()).is_ok());
+        assert!(plan_sequence((0..257).map(|_| t(0.0, "left")).collect()).is_err());
+        let err = plan_sequence(vec![t(0.0, "left"), step(1.0, "screenshot", serde_json::json!({}))]).unwrap_err();
+        assert!(err.starts_with("step 1"), "{err}");
     }
 }

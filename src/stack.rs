@@ -4,7 +4,7 @@ use crate::{
     config::{Config, Paths},
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot},
     openvr::{self, OpenVr},
-    rig::{Rig, RigAction},
+    rig::{self, AppliedStep, Rig, RigAction, SequenceReport, SequenceStep},
     setup,
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
@@ -17,7 +17,7 @@ use alvr_common::{
 };
 use alvr_events::{Event, EventType};
 use alvr_packets::{PathSegment, PathValuePair, parse_path, path_to_string};
-use alvr_session::{SessionConfig, Settings, settings_schema::SchemaNode};
+use alvr_session::{RecenteringMode, SessionConfig, Settings, settings_schema::SchemaNode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -300,6 +300,9 @@ pub struct Stack {
     alvr_logs: Mutex<VecDeque<LogLine>>,
 }
 
+const RECENTER_NOT_STAGE: &str =
+    "recentering_mode is not Stage: ALVR re-origins the playspace around the head's last pose on every playspace update, so poses sent are no longer absolute";
+
 /// The scene app's pid, unless the scene is SteamVR's own (Home runs as steamtours). `comm` names a pid.
 pub fn game_pid(scene: Option<&openvr::SceneApp>, comm: impl Fn(u32) -> Option<String>) -> Result<u32, &'static str> {
     let pid = scene.map(|a| a.pid).filter(|&pid| pid != 0).ok_or("no scene app is running")?;
@@ -391,6 +394,43 @@ impl Stack {
     /// Changes the head or a controller; returns how long until an animation is done.
     pub fn apply(&self, a: RigAction) -> Result<Duration> {
         self.rig.lock().apply(a, Instant::now()).map_err(|e| anyhow!(e))
+    }
+
+    /// Runs the steps at their `at_s` offsets and returns when the last one and the latest animation are done.
+    /// A step that fails is reported and the rest still run; a bad step fails the call before any runs. No lock is held while waiting.
+    pub async fn run_sequence(&self, steps: Vec<SequenceStep>) -> Result<SequenceReport> {
+        let plan = rig::plan_sequence(steps).map_err(|e| anyhow!(e))?;
+        let start = tokio::time::Instant::now();
+        let (mut end, mut steps) = (start, vec![]);
+        for (step, action) in plan {
+            tokio::time::sleep_until(start + Duration::from_secs_f32(step.at_s)).await;
+            let result = self.apply(action);
+            let applied_s = start.elapsed().as_secs_f32();
+            if let Ok(done_after) = &result {
+                end = end.max(tokio::time::Instant::now() + *done_after);
+            }
+            let (ok, error) = (result.is_ok(), result.err().map(|e| e.to_string()));
+            steps.push(AppliedStep { at_s: step.at_s, action: step.action, applied_s, ok, error });
+        }
+        tokio::time::sleep_until(end).await;
+        Ok(SequenceReport { steps, total_s: start.elapsed().as_secs_f32() })
+    }
+
+    /// Sets the play area (meters). The tracking thread sends it; the result says what ALVR's recentering mode does with it.
+    pub fn set_playspace(&self, width: f32, depth: f32) -> Result<Value> {
+        self.rig.lock().set_playspace(width, depth).map_err(|e| anyhow!(e))?;
+        let warning = match self.session() {
+            Ok(session) if matches!(session.to_settings().headset.recentering_mode, RecenteringMode::Stage) => None,
+            Ok(_) => Some(RECENTER_NOT_STAGE.to_owned()),
+            Err(e) => Some(format!("could not read recentering_mode ({e:#}); {RECENTER_NOT_STAGE}")),
+        };
+        Ok(serde_json::json!({ "ok": true, "width": width, "depth": depth, "warning": warning }))
+    }
+
+    /// Sends the current play area again, which is what makes ALVR recenter.
+    pub fn recenter(&self) -> Value {
+        self.rig.lock().recenter();
+        serde_json::json!({ "ok": true, "note": "In Stage recentering, the MCP's default, ALVR's recenter is the identity: poses stay absolute and nothing moves. Other recentering_mode values re-origin the playspace around the head's last pose." })
     }
 
     /// Haptic events the app sent with `t_s` after `since_s`, oldest first; `clear` empties the log.
@@ -913,6 +953,29 @@ fn supervise(stack: Weak<Stack>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn sequence_continues_past_a_failed_step_and_waits_for_animations() {
+        let paths = Paths {
+            steam_dir: None,
+            flatpak_steam: false,
+            steamvr_dir: None,
+            streamer_dir: None,
+            state_dir: "/nonexistent".into(),
+            runtime_dir: "/nonexistent".into(),
+        };
+        let stack = Stack::new(Config::default(), paths);
+        let step = |at_s, action: &str, args| SequenceStep { at_s, action: action.into(), args };
+        let steps = vec![
+            step(0.1, "set_trigger", json!({ "hand": "left", "value": 7 })),
+            step(0.0, "animate_head", json!({ "waypoints": [{ "position": [0, 1.6, 0] }], "duration_s": 0.3 })),
+        ];
+        let r = stack.run_sequence(steps).await.unwrap();
+        assert_eq!(r.steps.iter().map(|s| (s.action.as_str(), s.ok)).collect::<Vec<_>>(), [("animate_head", true), ("set_trigger", false)]);
+        assert!(r.steps[1].error.as_deref().unwrap().contains("value"), "{:?}", r.steps[1]);
+        assert!(r.steps[1].applied_s >= 0.1 && r.total_s >= 0.3 && r.total_s < 0.6, "{r:?}");
+        assert!(stack.run_sequence(vec![step(0.0, "screenshot", json!({}))]).await.is_err());
+    }
 
     #[test]
     fn vr_restore_refuses_while_steamvr_runs() {

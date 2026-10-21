@@ -22,7 +22,7 @@ use vr_test_mcp::{
     hand::Gesture,
     rig::{
         AnimateArgs, AxisArgs, Button, ButtonArgs, FingerCurlArgs, GripArgs, Hand, HandGestureArgs, HandMode, HandModeArgs,
-        PoseArgs, RigAction, TouchArgs, TrackpadArgs, TriggerArgs,
+        PoseArgs, RigAction, SequenceStep, TouchArgs, TrackpadArgs, TriggerArgs,
     },
     setup::{prepare, restore, session_values},
     stack::{LogQuery, SettingValue, Stack},
@@ -416,6 +416,59 @@ fn live_launch_app_reaches_menu() {
     // SteamVR may bring up its Home scene afterwards; the stopped game's pid must be gone from the scene
     let gone = steamvr::wait_for(Duration::from_secs(20), || s.scene_app().is_some_and(|a| a.state == "none" || a.pid != pid));
     assert!(gone, "scene app after stop_app: {:?}", s.scene_app());
+}
+
+/// Proves done-when 4: an animated controller swing with the trigger held is visible in game
+/// (a screenshot taken mid-swing differs from one before), and the playspace and recenter tools
+/// leave the stream running. Needs env VR_TEST_GAME_ID (Beat Saber).
+#[test]
+#[ignore]
+fn live_swing_with_trigger() {
+    let rgb = |png: &[u8]| {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+        let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut rgb).unwrap();
+        rgb
+    };
+    let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
+    let s = ensure_streaming();
+    let app = s.launch_app(&id).unwrap();
+    thread::sleep(Duration::from_secs(15)); // the menu
+    let a = rgb(&s.screenshot(Eye::Left).unwrap().png);
+    let steps: Vec<SequenceStep> = serde_json::from_value(json!([
+        { "at_s": 0.0, "action": "set_trigger", "args": { "hand": "right", "value": 1.0 } },
+        { "at_s": 0.0, "action": "animate_controller", "args": {
+            "hand": "right", "relative_to": "head", "duration_s": 1.5,
+            "waypoints": [{ "position": [-0.3, -0.1, -0.5] }, { "position": [0.0, 0.1, -0.6] }, { "position": [0.3, -0.1, -0.5] }] } },
+        { "at_s": 1.6, "action": "set_trigger", "args": { "hand": "right", "value": 0.0 } },
+    ]))
+    .unwrap();
+    let shooter = {
+        let s = Arc::clone(&s);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(750));
+            s.screenshot(Eye::Left).unwrap()
+        })
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let report = runtime.block_on(s.run_sequence(steps)).unwrap();
+    println!("{report:?}");
+    let b = rgb(&shooter.join().unwrap().png);
+    assert_eq!(a.len(), b.len());
+    let diff = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / a.len() as f64;
+    println!("mean abs diff {diff:.2}");
+    assert!(diff > 8.0, "the swing is not visible: mean abs diff {diff:.2}");
+    assert!(report.steps.len() == 3 && report.steps.iter().all(|st| st.ok), "{report:?}");
+    assert!(report.total_s >= 1.6, "{report:?}");
+
+    let set = s.set_playspace(3.0, 2.0).unwrap();
+    assert!(set["warning"].is_null(), "{set}");
+    println!("{}", s.recenter());
+    thread::sleep(Duration::from_secs(2));
+    assert!(s.status().headset.unwrap().streaming);
+    assert!(s.tracked_state(false).is_ok());
+    let stopped = s.stop_app().unwrap();
+    assert_eq!(stopped["stopped_pid"].as_u64().unwrap() as u32, app.scene_pid);
 }
 
 /// examples/xr_probe as a child, with its newest stdout line. SIGTERM on drop.

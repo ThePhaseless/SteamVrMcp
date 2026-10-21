@@ -212,15 +212,19 @@ fn tracking_thread(context: Arc<ClientCoreContext>, rig: Arc<Mutex<Rig>>, stream
     // shortcut: resends held inputs once, 1 s in, when the controller poses have surely reached
     // SteamVR (it drops buttons before, Controller.cpp:145-147); resend on pose validity if 1 s proves short
     let mut resend_at = Some(origin + Duration::from_secs(1));
+    rig.lock().recenter(); // a new stream gets the current play area
     while streaming.value() {
-        let (data, buttons) = {
+        let (data, buttons, area) = {
             let mut rig = rig.lock();
             let mut buttons = rig.take_buttons();
             if resend_at.is_some_and(|t| Instant::now() >= t) {
                 (resend_at, buttons) = (None, rig.all_buttons());
             }
-            (rig.tracking(Instant::now(), origin.elapsed()), buttons)
+            (rig.tracking(Instant::now(), origin.elapsed()), buttons, rig.take_playspace())
         };
+        if area.is_some() {
+            context.send_playspace(area);
+        }
         context.send_tracking(data);
         if !buttons.is_empty() {
             context.send_buttons(buttons);

@@ -3,7 +3,7 @@ use crate::{
     headset::Eye,
     rig::{
         AnimateArgs, AnimateControllerArgs, AxisArgs, ButtonArgs, ControllerPoseArgs, ControllerStateArgs, FingerCurlArgs, GripArgs,
-        HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, TouchArgs, TrackpadArgs,
+        HandGestureArgs, HandModeArgs, HandSkeletonArgs, MoveArgs, MoveControllerArgs, PoseArgs, RigAction, SequenceStep, TouchArgs, TrackpadArgs,
         TriggerArgs,
     },
     stack::{LogQuery, SettingValue, Stack},
@@ -90,6 +90,22 @@ enum Flavour {
 #[schemars(crate = "rmcp::schemars")]
 struct FlavourArgs {
     flavour: Flavour,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct PlayspaceArgs {
+    /// Meters, above 0 and at most 1000.
+    width: f32,
+    /// Meters, above 0 and at most 1000.
+    depth: f32,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct SequenceArgs {
+    /// 0 to 256 steps; run in at_s order, equal times in the order given.
+    steps: Vec<SequenceStep>,
 }
 
 /// A tool result with `v` as pretty JSON text.
@@ -261,6 +277,21 @@ impl VrServer {
         self.rig(RigAction::SetTrackpad(args)).await
     }
 
+    #[tool(description = "Set the play area to width by depth meters (the chaperone). The size is sent to ALVR as half extents, because ALVR draws the chaperone at twice what it receives. Warns when ALVR's recentering_mode is not Stage, since ALVR then also re-origins the playspace around the head's last pose.")]
+    async fn set_playspace(&self, Parameters(args): Parameters<PlayspaceArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.set_playspace(args.width, args.depth)?)).await.map_err(message)
+    }
+
+    #[tool(description = "Send the current play area to ALVR again, which makes ALVR recenter. With the MCP's default Stage recentering this is the identity: nothing moves. Any other recentering_mode re-origins the playspace around the head's last pose.")]
+    async fn recenter(&self) -> Result<CallToolResult, String> {
+        json(self.stack.recenter()).map_err(message)
+    }
+
+    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first; a bad one fails the call before any runs, while a step that fails when applied is reported and the rest still run. Returns once the last step and the latest animation are done: per step at_s, action, applied_s, ok and error, plus total_s.")]
+    async fn run_sequence(&self, Parameters(args): Parameters<SequenceArgs>) -> Result<CallToolResult, String> {
+        json(self.stack.run_sequence(args.steps).await.map_err(message)?).map_err(message)
+    }
+
     #[tool(description = "Haptic events the app sent, oldest first: t_s (seconds on the MCP's clock), hand (left, right or other), duration_s, frequency (Hz) and amplitude (0 to 1). Keeps the newest 1024.")]
     async fn get_haptics(&self, Parameters(args): Parameters<HapticsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
@@ -382,4 +413,25 @@ impl ServerHandler for VrServer {
 pub async fn serve(stack: Arc<Stack>) -> Result<()> {
     VrServer::new(stack).serve(rmcp::transport::stdio()).await?.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_spec_tools_registered() {
+        let mut names: Vec<String> = VrServer::tool_router().list_all().into_iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        let mut want: Vec<String> = "vr_status vr_start vr_stop vr_restore set_alvr_settings set_hand_tracking_flavour get_logs \
+            set_head_pose move_head animate_head set_controller_pose move_controller animate_controller set_controller_state \
+            press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
+            set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
+            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app"
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        want.sort();
+        assert_eq!((names.len(), names), (33, want));
+    }
 }
