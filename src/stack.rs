@@ -1230,6 +1230,7 @@ impl Stack {
             let pid = game_pid(scene.as_ref(), steamvr::comm).ok();
             scene_pid = pid.filter(|_| scene.as_ref().is_some_and(|a| a.state == "running")).unwrap_or(0);
             // a new scene pid, in any state, whose process is gone again: the game quit or crashed
+            // shortcut: a scene pid that hands off to a child process reads as a crash, ignore an exit while a new scene pid follows within a grace if a game does this
             scene_exited = steamvr::gone_after_seen(&mut seen, pid, |p| steamvr::comm(p).is_some());
             scene_pid != 0 || launcher_exited().is_some() || scene_exited.is_some()
         };
@@ -1748,7 +1749,7 @@ mod tests {
         let cfg = |streaming_s| Config { timeouts: crate::config::Timeouts { streaming_s, app_s: 1 }, ..Default::default() };
         stack.state.lock().managing = true;
         assert!(!stack.reload(cfg(7)), "a vr_start session runs");
-        assert_eq!(stack.cfg().timeouts.streaming_s, 150);
+        assert_eq!(stack.cfg().timeouts.streaming_s, 240);
         stack.state.lock().managing = false;
         if !steamvr::is_steamvr_running() {
             assert!(stack.reload(cfg(7)));

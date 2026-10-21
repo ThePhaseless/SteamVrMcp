@@ -179,7 +179,7 @@ impl VrServer {
         self.run(|s| json(serde_json::json!({ "released": s.release_lease()? }))).await.map_err(message)
     }
 
-    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 150 s).")]
+    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s).")]
     async fn vr_start(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.start()?)).await.map_err(message)
     }

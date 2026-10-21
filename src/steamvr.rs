@@ -92,7 +92,8 @@ pub fn gone_after_seen<K: Copy + PartialEq>(seen: &mut Vec<K>, appeared: impl In
 
 /// vrserver or vrmonitor once it ran during this wait (`seen`) and is gone: SteamVR quit or crashed.
 pub fn vr_exited(seen: &mut Vec<&'static str>) -> Option<&'static str> {
-    let up: Vec<&'static str> = ["vrserver", "vrmonitor"].into_iter().filter(|n| !pids_named(n).is_empty()).collect();
+    // one /proc pass for both names: this runs on every poll of a minutes-long wait
+    let up: Vec<&'static str> = all_pids().into_iter().filter_map(comm).filter_map(|c| ["vrserver", "vrmonitor"].into_iter().find(|n| *n == c)).collect();
     gone_after_seen(seen, up.iter().copied(), |n| up.contains(&n))
 }
 

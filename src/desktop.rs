@@ -123,9 +123,10 @@ pub fn screenshot() -> Result<Vec<u8>> {
         let handle: OwnedObjectPath = portal.call("Screenshot", &("", options))?;
         if let Some((bus, late)) = call.lock().hand((bus.clone(), handle.to_string())) {
             close(&bus, &late);
-            bail!("the deadline passed");
+            bail!("the deadline passed"); // nobody reads it: within() already returned None
         }
         if handle.as_str() != path {
+            close(&bus, handle.as_str()); // a later approval would still write a file
             bail!("the portal answered on {handle}, not {path}: its version does not follow the handle_token rule");
         }
         let signal = responses.into_iter().next().context("failed: the bus closed before the portal answered")?;
