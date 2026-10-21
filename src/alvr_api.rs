@@ -1,5 +1,5 @@
 use alvr_common::{
-    anyhow::{Context, Result, bail},
+    anyhow::{Context, Result, anyhow, bail},
     semver::Version,
     warn,
 };
@@ -12,9 +12,13 @@ use std::{
     path::Path,
     time::Duration,
 };
-use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTlsStream};
+use tungstenite::{Message, WebSocket, client::IntoClientRequest};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// For probes that must answer at once even when ALVR stalls (readiness, vr_status).
+const QUICK: Duration = Duration::from_millis(500);
+/// The events websocket handshake; ALVR answers it at once on loopback.
+const HANDSHAKE: Duration = Duration::from_secs(3);
 
 /// The ALVR server's REST and events API on 127.0.0.1.
 #[derive(Clone, Copy)]
@@ -62,30 +66,37 @@ impl Api {
     }
 
     pub fn ping(&self) -> bool {
-        // short, so readiness answers at once even when ALVR stalls
-        self.request("GET", "/api/ping", None, Duration::from_millis(500)).is_ok()
+        self.request("GET", "/api/ping", None, QUICK).is_ok()
     }
 
     pub fn version(&self) -> Result<String> {
         self.get("/api/version")
     }
 
+    /// The version within QUICK, for vr_status.
+    pub fn quick_version(&self) -> Result<String> {
+        self.request("GET", "/api/version", None, QUICK)
+    }
+
     pub fn events(&self) -> Result<EventStream> {
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))
+            .with_context(|| format!("ALVR API not reachable on port {}", self.port))?;
+        stream.set_read_timeout(Some(HANDSHAKE))?;
+        stream.set_write_timeout(Some(HANDSHAKE))?;
         let mut request = format!("ws://127.0.0.1:{}/api/events", self.port).into_client_request()?;
         request.headers_mut().insert("X-ALVR", "1".parse()?);
-        let (socket, _) = tungstenite::client::connect(request)?;
+        let (socket, _) = tungstenite::client(request, stream).map_err(|e| anyhow!("ALVR events handshake: {e}"))?;
         Ok(EventStream(socket))
     }
 }
 
-pub struct EventStream(WebSocket<MaybeTlsStream<TcpStream>>);
+pub struct EventStream(WebSocket<TcpStream>);
 
 impl EventStream {
     /// The next event, or None when none arrives within `timeout`.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<Event>> {
-        if let MaybeTlsStream::Plain(stream) = self.0.get_ref() {
-            stream.set_read_timeout(Some(timeout))?;
-        }
+        self.0.get_ref().set_read_timeout(Some(timeout))?;
         loop {
             match self.0.read() {
                 // skip what does not parse, as ALVR's dashboard does (dashboard/src/data_sources.rs)
@@ -149,6 +160,18 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(!api.ping());
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn version_probe_and_events_handshake_give_up_on_a_stalled_server() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
+        let api = Api { port: listener.local_addr().unwrap().port() };
+        let started = std::time::Instant::now();
+        assert!(api.quick_version().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        let started = std::time::Instant::now();
+        assert!(api.events().is_err());
+        assert!(started.elapsed() < HANDSHAKE + Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]

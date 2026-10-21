@@ -731,7 +731,7 @@ impl Stack {
         StatusReport {
             steam_running: steamvr::is_steam_running(),
             steamvr_running: steamvr::is_steamvr_running(),
-            alvr_version: self.api().version().ok().map(|v| v.trim().to_owned()),
+            alvr_version: self.api().quick_version().ok().map(|v| v.trim().to_owned()),
             headset: self.headset_status(),
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
             warning: leaked.then_some(LEAKED),
