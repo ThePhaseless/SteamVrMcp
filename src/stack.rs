@@ -500,6 +500,13 @@ impl Stack {
         self.release_lease().map_err(|e| error!("{e:#}")).ok();
     }
 
+    /// A stop that left SteamVR processes behind still owns the machine.
+    fn release_if_clean(&self, report: &StopReport) {
+        if report.remaining_processes.is_empty() {
+            self.release_after_success();
+        }
+    }
+
     pub fn restore(&self) -> Result<()> {
         restore_guard(steamvr::is_steamvr_running())?;
         setup::restore(&self.paths())?;
@@ -787,7 +794,7 @@ impl Stack {
             .filter(|n| !steamvr::pids_named(n).is_empty())
             .map(|n| n.to_string())
             .collect();
-        self.release_after_success();
+        self.release_if_clean(&report);
         Ok(report)
     }
 
@@ -1192,7 +1199,9 @@ mod tests {
             runtime_dir: root.join("run"),
             state_dir,
         };
-        (Stack::new(Config::default(), paths), root)
+        let stack = Stack::new(Config::default(), paths);
+        *stack.api.lock() = Api { port: 1 }; // not the default ALVR port, where a real dashboard may answer
+        (stack, root)
     }
 
     #[test]
@@ -1210,13 +1219,14 @@ mod tests {
     }
 
     #[test]
-    fn vr_restore_releases_the_lease() {
-        if !steamvr::alive_vr_processes().is_empty() {
-            return eprintln!("skipped: SteamVR is running");
-        }
-        let (stack, root) = blocked_stack("restore", false);
+    fn stop_releases_the_lease_only_when_clean() {
+        // restore() itself rewrites the real openvrpaths.vrpath, so only the release step is tested
+        let (stack, root) = blocked_stack("release", false);
         stack.claim().unwrap();
-        stack.restore().unwrap();
+        let dirty = StopReport { remaining_processes: vec!["vrserver".into()], ..Default::default() };
+        stack.release_if_clean(&dirty);
+        assert!(stack.status().owner.is_some(), "processes remain, so the lease stays");
+        stack.release_if_clean(&StopReport::default());
         assert!(stack.status().owner.is_none());
         std::fs::remove_dir_all(&root).ok();
     }
