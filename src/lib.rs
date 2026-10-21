@@ -3,6 +3,7 @@ pub mod applog;
 pub mod checks;
 pub mod clock;
 pub mod config;
+pub mod desktop;
 pub mod hand;
 pub mod headset;
 pub mod lease;

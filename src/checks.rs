@@ -1,4 +1,4 @@
-use crate::{alvr_api, config::{Config, Paths}, steamvr};
+use crate::{alvr_api, config::{Config, Paths}, desktop, steamvr};
 use alvr_common::{ALVR_VERSION, semver::Version};
 use serde::Serialize;
 use std::{
@@ -44,7 +44,7 @@ const INTEL: u32 = 0x8086;
 const NVIDIA: u32 = 0x10de;
 
 /// The screenshot sources `source_ready` knows, in the order the tool's error lists them.
-pub const SOURCES: &[&str] = &["headset", "compositor"];
+pub const SOURCES: &[&str] = &["headset", "compositor", "desktop"];
 
 /// Ok, or the first of `names` that failed its startup check.
 pub(crate) fn failed_check(r: &Readiness, names: &[&str]) -> Result<(), String> {
@@ -69,6 +69,7 @@ pub fn source_ready(source: &str, r: &Readiness) -> Result<(), String> {
             holds(r.steamvr_running, "SteamVR is not running")?;
             failed_check(r, &["openvr_client"])
         }
+        "desktop" => failed_check(r, &["desktop_portal"]),
         _ => Err("unknown source".to_owned()),
     }
 }
@@ -149,6 +150,7 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         let lib = dir.join("bin/linux64/libopenvr_api.so");
         unsafe { libloading::Library::new(&lib) }.map(|_| lib.display().to_string()).map_err(|e| e.to_string())
     });
+    let portal = desktop::check();
     let decoder = openh264::decoder::Decoder::new().map(|_| "OpenH264 decoder".to_owned()).map_err(|e| e.to_string());
     let (gpu, vendor) = gpu_verdict(&gpu_vendors(), cfg.steam.env.is_empty());
     let encoder = vendor
@@ -174,6 +176,11 @@ pub fn startup_checks(cfg: &Config, paths: &Paths) -> Vec<Check> {
         check("h264_encoder", encoder, "install VA-API drivers with H.264 encoding"),
         check("openvr_client", openvr, "reinstall SteamVR"),
         check("screenshot_decoder", decoder, "rebuild with the openh264 crate"),
+        check(
+            "desktop_portal",
+            portal,
+            "install xdg-desktop-portal with the backend for your desktop (for example -kde, -gnome, -gtk or -wlr)",
+        ),
     ]
 }
 
@@ -334,9 +341,9 @@ mod tests {
     use super::*;
     use crate::{config::{Config, Paths}, server::VrServer};
 
-    const ALL_CHECKS: [&str; 10] = [
+    const ALL_CHECKS: [&str; 11] = [
         "config", "steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input",
-        "gpu_direct_mode", "h264_encoder", "openvr_client", "screenshot_decoder",
+        "gpu_direct_mode", "h264_encoder", "openvr_client", "screenshot_decoder", "desktop_portal",
     ];
 
     fn all_ready() -> Readiness {
@@ -407,12 +414,22 @@ mod tests {
     }
 
     #[test]
+    fn source_ready_desktop_follows_portal_check() {
+        let r = Readiness { failed: [("desktop_portal", "no bus".to_owned())].into(), ..all_ready() };
+        assert!(source_ready("desktop", &r).unwrap_err().contains("desktop_portal"));
+        let r = Readiness { streaming: false, steamvr_running: false, ..all_ready() };
+        assert_eq!(source_ready("desktop", &r), Ok(()));
+    }
+
+    #[test]
     fn screenshot_listed_while_any_source_ready() {
         let r = Readiness { streaming: false, steamvr_running: true, ..all_ready() };
         assert_eq!(tool_ready("screenshot", &r), Ok(()));
         let r = Readiness { streaming: false, steamvr_running: false, ..all_ready() };
+        assert_eq!(tool_ready("screenshot", &r), Ok(()), "the desktop source needs neither");
+        let r = Readiness { failed: [("desktop_portal", "no bus".to_owned())].into(), streaming: false, steamvr_running: false, ..all_ready() };
         let err = tool_ready("screenshot", &r).unwrap_err();
-        assert!(err.contains("headset is not streaming") && err.contains("SteamVR is not running"), "{err}");
+        assert!(err.contains("headset is not streaming") && err.contains("SteamVR is not running") && err.contains("desktop_portal"), "{err}");
     }
 
     #[test]

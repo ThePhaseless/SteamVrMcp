@@ -52,6 +52,8 @@ pub enum Source {
     Headset,
     /// SteamVR's compositor: the scene app's uncompressed textures, side by side.
     Compositor,
+    /// The whole desktop, through xdg-desktop-portal.
+    Desktop,
 }
 
 impl Source {
@@ -59,6 +61,7 @@ impl Source {
         match self {
             Source::Headset => "headset",
             Source::Compositor => "compositor",
+            Source::Desktop => "desktop",
         }
     }
 }

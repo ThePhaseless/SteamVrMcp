@@ -4,6 +4,7 @@ use crate::{
     checks::{self, Check, Readiness},
     clock,
     config::{Config, Paths},
+    desktop,
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot, Source},
     lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
@@ -54,10 +55,26 @@ const OPENVR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Runs `f` on its own thread and returns its result, or None if it is still running after
 /// `timeout`; the thread is then left running (detached).
-fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+pub(crate) fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || tx.send(f()).ok());
     rx.recv_timeout(timeout).ok()
+}
+
+/// A file stem no earlier MCP run used, so a stray old file is never read back.
+fn shot_stem(wall: SystemTime, pid: u32) -> String {
+    let ms = wall.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    format!("vr-{ms}-{pid}")
+}
+
+fn desktop_screenshot(eye: Eye) -> Result<Screenshot> {
+    if eye != Eye::Both {
+        bail!("source desktop is the whole screen: eye must be both");
+    }
+    let t_s = clock::now_s();
+    let png = desktop::screenshot()?;
+    let info = png::Decoder::new(std::io::Cursor::new(&png)).read_info()?.info().clone();
+    Ok(Screenshot { png, width: info.width, height: info.height, source: Source::Desktop.name(), frame_timestamp_ms: None, t_s, at: clock::at(t_s) })
 }
 
 /// The file's bytes once its size is non-zero and the same on two polls 100 ms apart: vrserver writes it on its own schedule.
@@ -463,6 +480,14 @@ pub fn stop_guard(steamvr_running: bool, alvrs: impl FnOnce() -> bool) -> Result
     Ok(())
 }
 
+/// A game that finds no SteamVR would start one from its own process, under its own prefix and process group.
+pub fn launch_guard(steamvr_running: bool) -> Result<()> {
+    if !steamvr_running {
+        bail!("SteamVR is not running; run vr_start first");
+    }
+    Ok(())
+}
+
 pub fn restore_guard(steamvr_running: bool) -> Result<()> {
     if steamvr_running {
         bail!("SteamVR is running; run vr_stop first");
@@ -634,8 +659,10 @@ impl Stack {
 
     /// A screenshot of the headset's stream, or of the compositor's scene textures. The waits run outside the state lock.
     pub fn screenshot(&self, source: Source, eye: Eye) -> Result<Screenshot> {
-        if source == Source::Compositor {
-            return self.compositor_screenshot(eye);
+        match source {
+            Source::Compositor => return self.compositor_screenshot(eye),
+            Source::Desktop => return desktop_screenshot(eye),
+            Source::Headset => (),
         }
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
         grabber.screenshot(&self.api(), eye)
@@ -644,9 +671,9 @@ impl Stack {
     fn compositor_screenshot(&self, eye: Eye) -> Result<Screenshot> {
         // shortcut: assumes vrserver's container can write state_dir (true under $HOME), as for the action manifest
         let dir = self.paths().state_dir.join("screenshots");
-        std::fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        steamvr::private_dir(&dir)?;
         let t_s = clock::now_s();
-        let stem = format!("vr-{}", (t_s * 1000.0) as u64);
+        let stem = shot_stem(SystemTime::now(), std::process::id());
         let (preview, vr) = (dir.join(format!("{stem}-preview")), dir.join(&stem));
         let (p, v) = (preview.clone(), vr.clone());
         let taken = self.read(move |openvr| openvr.take_stereo_screenshot(&p, &v));
@@ -1102,6 +1129,7 @@ impl Stack {
     /// and returns once SteamVR reports a new scene app running.
     pub fn launch_app(&self, a: LaunchArgs) -> Result<AppReport> {
         check_launch(&a).map_err(|e| anyhow!(e))?;
+        launch_guard(steamvr::is_steamvr_running())?;
         let id: u64 = a.app_id.trim().parse().with_context(|| format!("app_id must be a decimal number, not {:?}", a.app_id))?;
         let paths = self.paths();
         let steam = paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
@@ -1706,6 +1734,27 @@ mod tests {
         assert_eq!(game_pid(Some(&scene(9)), |_| None), Err("the scene app's pid is not a running process"), "unreadable comm");
         let big = i32::MAX as u32 + 1;
         assert_eq!(game_pid(Some(&scene(big)), comm), Err("the scene app's pid is not a running process"), "kill() would take it as a group");
+    }
+
+    #[test]
+    fn desktop_takes_both_eyes_only() {
+        for eye in [Eye::Left, Eye::Right] {
+            assert!(test_stack().screenshot(Source::Desktop, eye).unwrap_err().to_string().contains("both"), "{eye:?}");
+        }
+    }
+
+    #[test]
+    fn shot_stems_differ_across_restarts() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        assert_eq!(shot_stem(at, 7), "vr-1700000000123-7");
+        assert_ne!(shot_stem(at, 7), shot_stem(at, 8));
+        assert_ne!(shot_stem(at, 7), shot_stem(at + Duration::from_millis(1), 7));
+    }
+
+    #[test]
+    fn launch_needs_steamvr_running() {
+        assert!(launch_guard(false).unwrap_err().to_string().contains("vr_start"));
+        assert!(launch_guard(true).is_ok());
     }
 
     #[test]
