@@ -397,9 +397,10 @@ impl Stack {
     }
 
     /// Runs the steps at their `at_s` offsets and returns when the last one and the latest animation are done.
-    /// A step that fails is reported and the rest still run; a bad step fails the call before any runs. No lock is held while waiting.
+    /// A step the rig would refuse fails the call before any runs (checked on a copy of the rig); one that fails anyway, because the rig changed meanwhile, is reported and the rest still run. No lock is held while waiting.
     pub async fn run_sequence(&self, steps: Vec<SequenceStep>) -> Result<SequenceReport> {
-        let plan = rig::plan_sequence(steps).map_err(|e| anyhow!(e))?;
+        let rig = self.rig.lock().clone(); // own statement: no lock while planning
+        let plan = rig::plan_sequence(steps, &rig).map_err(|e| anyhow!(e))?;
         let start = tokio::time::Instant::now();
         let (mut end, mut steps) = (start, vec![]);
         for (step, action) in plan {
@@ -954,8 +955,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[tokio::test]
-    async fn sequence_continues_past_a_failed_step_and_waits_for_animations() {
+    fn test_stack() -> Arc<Stack> {
         let paths = Paths {
             steam_dir: None,
             flatpak_steam: false,
@@ -964,17 +964,46 @@ mod tests {
             state_dir: "/nonexistent".into(),
             runtime_dir: "/nonexistent".into(),
         };
-        let stack = Stack::new(Config::default(), paths);
-        let step = |at_s, action: &str, args| SequenceStep { at_s, action: action.into(), args };
+        Stack::new(Config::default(), paths)
+    }
+
+    fn seq_step(at_s: f32, action: &str, args: Value) -> SequenceStep {
+        SequenceStep { at_s, action: action.into(), args }
+    }
+
+    #[tokio::test]
+    async fn sequence_waits_for_animations_and_refuses_a_bad_step_before_any_runs() {
+        let stack = test_stack();
+        let head_y = |s: &Stack| s.rig.lock().tracking(Instant::now(), Duration::ZERO).device_motions[0].1.pose.position.y;
+        let animate = seq_step(0.0, "animate_head", json!({ "waypoints": [{ "position": [0, 1.0, 0] }], "duration_s": 0.3 }));
+        let bad = seq_step(0.1, "set_trigger", json!({ "hand": "left", "value": 7 }));
+        let started = Instant::now();
+        let err = stack.run_sequence(vec![animate.clone(), bad]).await.unwrap_err();
+        assert!(err.to_string().starts_with("step 1:") && started.elapsed() < Duration::from_millis(100), "{err:#}");
+        assert_eq!(head_y(&stack), 1.6, "the animation never started");
+        assert!(stack.run_sequence(vec![seq_step(0.0, "screenshot", json!({}))]).await.is_err());
+
+        let r = stack.run_sequence(vec![seq_step(0.1, "set_trigger", json!({ "hand": "left", "value": 1 })), animate]).await.unwrap();
+        assert!(r.steps.iter().all(|s| s.ok) && r.steps[1].applied_s >= 0.1 && r.total_s >= 0.3 && r.total_s < 2.0, "{r:?}");
+        assert_eq!(head_y(&stack), 1.0);
+    }
+
+    #[tokio::test]
+    async fn sequence_reports_a_step_that_fails_mid_run_and_goes_on() {
+        let stack = test_stack();
+        let off = RigAction::SetControllerState(serde_json::from_value(json!({ "hand": "left", "connected": false })).unwrap());
         let steps = vec![
-            step(0.1, "set_trigger", json!({ "hand": "left", "value": 7 })),
-            step(0.0, "animate_head", json!({ "waypoints": [{ "position": [0, 1.6, 0] }], "duration_s": 0.3 })),
+            seq_step(0.2, "set_trigger", json!({ "hand": "left", "value": 1 })),
+            seq_step(0.3, "set_head_pose", json!({ "position": [0, 1, 0] })),
         ];
-        let r = stack.run_sequence(steps).await.unwrap();
-        assert_eq!(r.steps.iter().map(|s| (s.action.as_str(), s.ok)).collect::<Vec<_>>(), [("animate_head", true), ("set_trigger", false)]);
-        assert!(r.steps[1].error.as_deref().unwrap().contains("value"), "{:?}", r.steps[1]);
-        assert!(r.steps[1].applied_s >= 0.1 && r.total_s >= 0.3 && r.total_s < 0.6, "{r:?}");
-        assert!(stack.run_sequence(vec![step(0.0, "screenshot", json!({}))]).await.is_err());
+        // the controller drops out after the plan was checked
+        let (r, ()) = tokio::join!(stack.run_sequence(steps), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stack.apply(off).unwrap();
+        });
+        let r = r.unwrap();
+        assert_eq!(r.steps.iter().map(|s| s.ok).collect::<Vec<_>>(), [false, true]);
+        assert!(r.steps[0].error.as_deref().unwrap().contains("not tracked"), "{r:?}");
     }
 
     #[test]

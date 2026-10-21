@@ -407,7 +407,10 @@ pub struct SequenceReport {
 const SEQUENCE_STEPS_MAX: usize = 256;
 
 /// Checks every step before anything runs and orders them by `at_s` (equal times keep their order).
-pub fn plan_sequence(steps: Vec<SequenceStep>) -> Result<Vec<(SequenceStep, RigAction)>, String> {
+/// The ordered steps are also applied to a copy of `rig` at their offsets, so a value ALVR or the rig
+/// would refuse (a trigger of 7, an untracked controller) fails the whole sequence with its step number.
+// shortcut: the copy is `rig` as of now; a tool called while the sequence runs can still fail a step mid-run, which is then reported
+pub fn plan_sequence(steps: Vec<SequenceStep>, rig: &Rig) -> Result<Vec<(SequenceStep, RigAction)>, String> {
     if steps.len() > SEQUENCE_STEPS_MAX {
         return Err(format!("at most {SEQUENCE_STEPS_MAX} steps"));
     }
@@ -419,11 +422,15 @@ pub fn plan_sequence(steps: Vec<SequenceStep>) -> Result<Vec<(SequenceStep, RigA
                 return Err(format!("step {i}: at_s must be within 0 and 600"));
             }
             let action = s.parse().map_err(|e| format!("step {i}: {e}"))?;
-            Ok((s, action))
+            Ok((i, s, action))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    plan.sort_by(|a, b| a.0.at_s.total_cmp(&b.0.at_s));
-    Ok(plan)
+    plan.sort_by(|a, b| a.1.at_s.total_cmp(&b.1.at_s));
+    let (mut dry, start) = (rig.clone(), Instant::now());
+    for (i, s, action) in &plan {
+        dry.apply(action.clone(), start + Duration::from_secs_f32(s.at_s)).map_err(|e| format!("step {i}: {e}"))?;
+    }
+    Ok(plan.into_iter().map(|(_, s, a)| (s, a)).collect())
 }
 
 impl PoseArgs {
@@ -456,6 +463,7 @@ fn euler_quat(yaw: f32, pitch: f32, roll: f32) -> Result<Quat, String> {
 }
 
 /// Keys spaced `step_s` apart from `start`; the first key is the pose the animation started at.
+#[derive(Clone)]
 struct Animation {
     start: Instant,
     step_s: f32,
@@ -498,6 +506,7 @@ impl Animation {
 }
 
 /// A head or controller: a resting pose, or an animation that ends in one.
+#[derive(Clone)]
 struct Body {
     pose: Pose,
     animation: Option<Animation>,
@@ -559,7 +568,7 @@ impl Body {
 }
 
 /// What a hand sends besides its pose.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct HandState {
     mode: HandMode,
     /// Set by the last curl or gesture call; kept under a raw skeleton for the next partial curl call.
@@ -568,6 +577,7 @@ struct HandState {
     raw: Option<[Pose; 26]>,
 }
 
+#[derive(Clone)]
 pub struct Rig {
     head: Body,
     /// left, right; a bare hand's palm follows its controller's pose too
@@ -1132,16 +1142,40 @@ mod tests {
     #[test]
     fn sequence_orders_and_bounds() {
         let t = |at_s, hand| step(at_s, "set_trigger", serde_json::json!({ "hand": hand, "value": 0 }));
-        let plan = plan_sequence(vec![t(1.0, "left"), t(0.0, "right"), t(1.0, "right")]).unwrap();
+        let plan = plan_sequence(vec![t(1.0, "left"), t(0.0, "right"), t(1.0, "right")], &Rig::new()).unwrap();
         let order: Vec<_> = plan.iter().map(|(s, _)| (s.at_s, matches!(s.parse(), Ok(RigAction::SetTrigger(TriggerArgs { hand: Hand::Left, .. }))))).collect();
         assert_eq!(order, [(0.0, false), (1.0, true), (1.0, false)], "sorted by at_s, equal times keep their order");
         for bad in [-0.1, 600.1, f32::NAN] {
-            assert!(plan_sequence(vec![t(bad, "left")]).is_err(), "{bad}");
+            assert!(plan_sequence(vec![t(bad, "left")], &Rig::new()).is_err(), "{bad}");
         }
-        assert!(plan_sequence(vec![t(600.0, "left")]).is_ok());
-        assert!(plan_sequence((0..256).map(|_| t(0.0, "left")).collect()).is_ok());
-        assert!(plan_sequence((0..257).map(|_| t(0.0, "left")).collect()).is_err());
-        let err = plan_sequence(vec![t(0.0, "left"), step(1.0, "screenshot", serde_json::json!({}))]).unwrap_err();
+        assert!(plan_sequence(vec![t(600.0, "left")], &Rig::new()).is_ok());
+        assert!(plan_sequence((0..256).map(|_| t(0.0, "left")).collect(), &Rig::new()).is_ok());
+        assert!(plan_sequence((0..257).map(|_| t(0.0, "left")).collect(), &Rig::new()).is_err());
+        let err = plan_sequence(vec![t(0.0, "left"), step(1.0, "screenshot", serde_json::json!({}))], &Rig::new()).unwrap_err();
         assert!(err.starts_with("step 1"), "{err}");
+    }
+
+    #[test]
+    fn sequence_dry_run_refuses_what_the_rig_would() {
+        use serde_json::json as j;
+        let bad = |steps: Vec<SequenceStep>| plan_sequence(steps, &Rig::new()).unwrap_err();
+        let pose = step(0.0, "set_head_pose", j!({ "position": [0, 1, 0] }));
+        let err = bad(vec![pose.clone(), step(0.5, "set_trigger", j!({ "hand": "right", "value": 7 }))]);
+        assert!(err.starts_with("step 1:") && err.contains("value"), "{err}");
+        let err = bad(vec![step(0.0, "set_head_pose", j!({ "position": [0, 1, 0], "quat": [0, 0, 0, 0] }))]);
+        assert!(err.starts_with("step 0:"), "{err}");
+        let err = bad(vec![step(0.0, "animate_head", j!({ "waypoints": [{ "position": [0, 1, 0] }], "duration_s": 0 }))]);
+        assert!(err.contains("duration_s"), "{err}");
+        // state carries through the dry run: the step order is by time, the name is the caller's index
+        let off = step(0.0, "set_controller_state", j!({ "hand": "right", "connected": false }));
+        let err = bad(vec![step(1.0, "set_trigger", j!({ "hand": "right", "value": 1 })), off]);
+        assert!(err.starts_with("step 0:") && err.contains("not tracked"), "{err}");
+        let bare = step(0.0, "set_hand_mode", j!({ "hand": "left", "mode": "hand" }));
+        let err = bad(vec![bare, step(0.1, "press_button", j!({ "hand": "left", "button": "a" }))]);
+        assert!(err.starts_with("step 1:") && err.contains("bare hand"), "{err}");
+        // the live rig is untouched, and a sequence the rig accepts plans
+        let mut rig = Rig::new();
+        assert!(plan_sequence(vec![pose, step(0.0, "set_controller_state", j!({ "hand": "left", "connected": false }))], &rig).is_ok());
+        assert!(rig.apply(RigAction::SetTrigger(TriggerArgs { hand: Hand::Left, value: 1.0 }), Instant::now()).is_ok());
     }
 }

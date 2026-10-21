@@ -287,7 +287,7 @@ impl VrServer {
         json(self.stack.recenter()).map_err(message)
     }
 
-    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first; a bad one fails the call before any runs, while a step that fails when applied is reported and the rest still run. Returns once the last step and the latest animation are done: per step at_s, action, applied_s, ok and error, plus total_s.")]
+    #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: per step at_s, action, applied_s, ok and error, plus total_s.")]
     async fn run_sequence(&self, Parameters(args): Parameters<SequenceArgs>) -> Result<CallToolResult, String> {
         json(self.stack.run_sequence(args.steps).await.map_err(message)?).map_err(message)
     }

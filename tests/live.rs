@@ -435,6 +435,8 @@ fn live_swing_with_trigger() {
     let app = s.launch_app(&id).unwrap();
     thread::sleep(Duration::from_secs(15)); // the menu
     let a = rgb(&s.screenshot(Eye::Left).unwrap().png);
+    thread::sleep(Duration::from_secs(1));
+    let a2 = rgb(&s.screenshot(Eye::Left).unwrap().png); // the menu at rest, to tell menu motion from the swing
     let steps: Vec<SequenceStep> = serde_json::from_value(json!([
         { "at_s": 0.0, "action": "set_trigger", "args": { "hand": "right", "value": 1.0 } },
         { "at_s": 0.0, "action": "animate_controller", "args": {
@@ -454,10 +456,11 @@ fn live_swing_with_trigger() {
     let report = runtime.block_on(s.run_sequence(steps)).unwrap();
     println!("{report:?}");
     let b = rgb(&shooter.join().unwrap().png);
-    assert_eq!(a.len(), b.len());
-    let diff = a.iter().zip(&b).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / a.len() as f64;
-    println!("mean abs diff {diff:.2}");
-    assert!(diff > 8.0, "the swing is not visible: mean abs diff {diff:.2}");
+    assert!(a.len() == b.len() && a.len() == a2.len());
+    let mean_diff = |x: &[u8], y: &[u8]| x.iter().zip(y).map(|(p, q)| p.abs_diff(*q) as f64).sum::<f64>() / x.len() as f64;
+    let (swing, rest) = (mean_diff(&a, &b), mean_diff(&a, &a2));
+    println!("mean abs diff: swing {swing:.2}, at rest {rest:.2}");
+    assert!(swing > 8.0 && swing > rest + 4.0, "the swing is not visible: swing {swing:.2}, at rest {rest:.2}");
     assert!(report.steps.len() == 3 && report.steps.iter().all(|st| st.ok), "{report:?}");
     assert!(report.total_s >= 1.6, "{report:?}");
 
@@ -465,6 +468,9 @@ fn live_swing_with_trigger() {
     assert!(set["warning"].is_null(), "{set}");
     println!("{}", s.recenter());
     thread::sleep(Duration::from_secs(2));
+    // ALVR logs the area it received (server_core connection.rs:1274): the half extents of 3 x 2
+    let logs = s.logs(LogQuery { source: Some("alvr".into()), contains: Some("Received new playspace with size".into()), min_level: None, limit: Some(10) }).unwrap();
+    assert!(logs.iter().any(|l| l.text.contains("size: [1.5, 1]")), "{logs:?}");
     assert!(s.status().headset.unwrap().streaming);
     assert!(s.tracked_state(false).is_ok());
     let stopped = s.stop_app().unwrap();
