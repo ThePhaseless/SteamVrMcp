@@ -70,6 +70,13 @@ struct SettingsArgs {
 }
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+struct LaunchArgs {
+    /// Decimal: a Steam app id (e.g. "620980"), a non-Steam shortcut's 32-bit app id or its 64-bit game id.
+    app_id: String,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(crate = "rmcp::schemars")]
 enum Flavour {
@@ -273,6 +280,16 @@ impl VrServer {
     #[tool(description = "ALVR log events (kept since vr_start, newest 1000) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
     async fn get_logs(&self, Parameters(args): Parameters<LogQuery>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.logs(args)?)).await.map_err(message)
+    }
+
+    #[tool(description = "Launch a Steam app or non-Steam shortcut through Steam after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version) and scene_pid. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines.")]
+    async fn launch_app(&self, Parameters(args): Parameters<LaunchArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.launch_app(&args.app_id)?)).await.map_err(message)
+    }
+
+    #[tool(description = "Stop the scene app SteamVR reports: SIGTERM to its pid, SIGKILL after 15 s. Returns stopped_pid. A Proton game's other wine processes may outlive it.")]
+    async fn stop_app(&self) -> Result<CallToolResult, String> {
+        self.run(|s| json(s.stop_app()?)).await.map_err(message)
     }
 
     #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs.")]

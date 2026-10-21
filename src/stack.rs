@@ -99,6 +99,12 @@ pub struct SettingValue {
     pub value: Value,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AppReport {
+    pub app: steamvr::AppInfo,
+    pub scene_pid: u32,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct SettingsReport {
     /// SteamVR restarted at least once.
@@ -489,6 +495,13 @@ impl Stack {
         let steamvr_running = steamvr::is_steamvr_running();
         let mut restart_adopted = false;
         if !steamvr_running {
+            if steamvr::has_leftovers(&steamvr::alive_vr_processes()) {
+                if !steamvr::kill_vr_processes() {
+                    bail!("SteamVR processes still running after SIGKILL: {:?}", steamvr::alive_vr_processes());
+                }
+                // SteamVR has exited, so it no longer rewrites the file
+                setup::undo_safe_mode_blocks(&self.paths)?;
+            }
             report.unblocked_safe_mode = setup::prepare(&self.paths, &values, &hostname)?.unblocked_safe_mode;
         } else if self.api.ping() {
             self.check_version()?;
@@ -510,6 +523,8 @@ impl Stack {
                 state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths.runtime_dir)?);
             }
         }
+        let steam_dir = self.paths.steam_dir.as_deref();
+        let log_from = steam_dir.map_or(0, steamvr::console_log_len);
         if !steamvr_running {
             report.started_steam = steamvr::launch(&self.cfg, STEAMVR_URL)?;
             self.state.lock().started_steam |= report.started_steam;
@@ -521,7 +536,7 @@ impl Stack {
         }
         let timeout = Duration::from_secs(self.cfg.timeouts.streaming_s);
         let deadline = Instant::now() + timeout;
-        if !steamvr::wait_for(timeout, || self.api.ping()) {
+        if !steamvr::wait_launched(steam_dir, log_from, timeout, || self.api.ping())? {
             bail!("ALVR server did not answer on port {} within {} s", self.api.port, timeout.as_secs());
         }
         self.check_version()?;
@@ -653,6 +668,52 @@ impl Stack {
         }
         let restarts = self.state.lock().restarts.saturating_sub(restarts);
         Ok(SettingsReport { restarted: restarts > 0, restarts, streaming })
+    }
+
+    /// Launches a Steam app or non-Steam shortcut (`id` in decimal) through Steam and returns once
+    /// SteamVR reports a new scene app running.
+    pub fn launch_app(&self, id: &str) -> Result<AppReport> {
+        let id: u64 = id.trim().parse().with_context(|| format!("app_id must be a decimal number, not {id:?}"))?;
+        let steam = self.paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
+        let app = steamvr::find_app(steam, id)?;
+        // SteamVR Home is a scene app too, so wait for a scene pid that was not there before
+        // shortcut: relaunching an app that already runs times out, as Steam only focuses it; check its process if that matters
+        let before = self.scene_app().map(|a| a.pid);
+        let log_from = steamvr::console_log_len(steam);
+        steamvr::launch(&self.cfg, &format!("steam://rungameid/{}", app.game_id))?;
+        let timeout = Duration::from_secs(self.cfg.timeouts.app_s);
+        let mut scene_pid = 0;
+        let running = steamvr::wait_launched(Some(steam), log_from, timeout, || {
+            let scene = self.scene_app().filter(|a| a.state == "running" && a.pid != 0 && Some(a.pid) != before);
+            scene_pid = scene.map_or(0, |a| a.pid);
+            scene_pid != 0
+        })?;
+        if !running {
+            bail!(
+                "{} ({}) has no running VR scene after {} s; compatibility tool: {}; last vrserver log lines:\n{}",
+                app.name,
+                app.game_id,
+                timeout.as_secs(),
+                app.compat_tool.as_deref().unwrap_or("none"),
+                steamvr::log_tail(steam, "vrserver", 20).join("\n")
+            );
+        }
+        Ok(AppReport { app, scene_pid })
+    }
+
+    /// Stops the scene app: SIGTERM, then SIGKILL after 15 s.
+    // shortcut: kills only the pid SteamVR reports, never by pattern; a Proton game's wine process tree may outlive it, kill the tree if a stray process blocks the next launch
+    pub fn stop_app(&self) -> Result<Value> {
+        let pid = self.scene_app().map(|a| a.pid).filter(|&pid| pid != 0).context("no scene app is running")?;
+        let gone = || !std::path::Path::new(&format!("/proc/{pid}")).exists();
+        steamvr::terminate(pid, libc::SIGTERM);
+        if !steamvr::wait_for(Duration::from_secs(15), gone) {
+            steamvr::terminate(pid, libc::SIGKILL);
+            if !steamvr::wait_for(Duration::from_secs(5), gone) {
+                bail!("scene app {pid} still runs 5 s after SIGKILL");
+            }
+        }
+        Ok(serde_json::json!({ "stopped_pid": pid }))
     }
 
     /// The Index flavour (`steamvr_input_2_0` off) or the skeletal-tracker flavour (on).

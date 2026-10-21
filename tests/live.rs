@@ -387,6 +387,35 @@ fn live_beat_saber_menu_fps() {
     assert!(presents > 0 && ratio < 0.10, "ratio {ratio:.3}");
 }
 
+/// Proves done-when 2: launch_app reaches the game's menu and a screenshot shows it. Needs env
+/// VR_TEST_GAME_ID: the Beat Saber Steam app id or its non-Steam shortcut (game) id.
+#[test]
+#[ignore]
+fn live_launch_app_reaches_menu() {
+    let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
+    let s = ensure_streaming();
+    let report = s.launch_app(&id).unwrap();
+    println!("{report:?}");
+    assert!(report.scene_pid > 0);
+    // Beat Saber is a Windows game; this needs an explicit CompatToolMapping entry, as a shortcut has
+    assert!(report.app.compat_tool.is_some(), "no compatibility tool reported: {report:?}");
+    thread::sleep(Duration::from_secs(15));
+    let shot = s.screenshot(Eye::Left).unwrap();
+    let mut reader = png::Decoder::new(std::io::Cursor::new(&shot.png)).read_info().unwrap();
+    let mut rgb = vec![0; reader.output_buffer_size().unwrap()];
+    reader.next_frame(&mut rgb).unwrap();
+    let mean = rgb.iter().map(|&b| b as f64).sum::<f64>() / rgb.len() as f64;
+    let stddev = (rgb.iter().map(|&b| (b as f64 - mean).powi(2)).sum::<f64>() / rgb.len() as f64).sqrt();
+    println!("menu pixel stddev {stddev:.2}");
+    assert!(stddev > 10.0, "menu screenshot looks blank: stddev {stddev:.2}");
+    let stopped = s.stop_app().unwrap();
+    let pid = stopped["stopped_pid"].as_u64().unwrap() as u32;
+    assert_eq!(pid, report.scene_pid);
+    // SteamVR may bring up its Home scene afterwards; the stopped game's pid must be gone from the scene
+    let gone = steamvr::wait_for(Duration::from_secs(20), || s.scene_app().is_some_and(|a| a.state == "none" || a.pid != pid));
+    assert!(gone, "scene app after stop_app: {:?}", s.scene_app());
+}
+
 /// examples/xr_probe as a child, with its newest stdout line. SIGTERM on drop.
 struct Probe {
     child: Child,

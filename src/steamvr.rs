@@ -3,6 +3,7 @@ use alvr_common::{
     anyhow::{Context, Result, bail},
     error,
 };
+use serde::Serialize;
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -82,6 +83,203 @@ pub fn is_new_vrserver(old: &[u32], now: &[u32]) -> bool {
     now.iter().any(|pid| !old.contains(pid))
 }
 
+/// True when SteamVR processes outlive vrserver: Steam then refuses to launch SteamVR again
+/// (console_log: WaitingPrevProcess, AppError_16), so start() kills them first.
+pub fn has_leftovers(alive: &[&str]) -> bool {
+    !alive.is_empty() && !alive.contains(&"vrserver")
+}
+
+/// The VR_PROCESS_NAMES with a running process.
+pub fn alive_vr_processes() -> Vec<&'static str> {
+    VR_PROCESS_NAMES.iter().copied().filter(|n| !pids_named(n).is_empty()).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppKind {
+    Steam,
+    Shortcut,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AppInfo {
+    pub app_id: u32,
+    /// What steam://rungameid/ takes.
+    pub game_id: u64,
+    pub kind: AppKind,
+    pub name: String,
+    /// Steam's CompatToolMapping entry, e.g. "proton_experimental"; none for native games and Steam's default.
+    pub compat_tool: Option<String>,
+}
+
+/// Steam's game id for a non-Steam shortcut.
+pub fn shortcut_game_id(appid: u32) -> u64 {
+    (appid as u64) << 32 | 0x0200_0000
+}
+
+// shortcut: line-oriented VDF scan without escape handling; switch to a parser if Valve changes the format or a value holds a quote
+/// The quoted tokens of a text VDF line.
+fn tokens(line: &str) -> Vec<&str> {
+    line.split('"').skip(1).step_by(2).collect()
+}
+
+/// The first `"key" "value"` pair's value with this key.
+fn vdf_value<'a>(vdf: &'a str, key: &str) -> Option<&'a str> {
+    vdf.lines().find_map(|l| match tokens(l)[..] {
+        [k, v] if k == key => Some(v),
+        _ => None,
+    })
+}
+
+/// Every library's `path` in libraryfolders.vdf.
+pub fn library_dirs(libraryfolders_vdf: &str) -> Vec<PathBuf> {
+    libraryfolders_vdf
+        .lines()
+        .filter_map(|l| match tokens(l)[..] {
+            ["path", v] => Some(PathBuf::from(v)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The tool name under CompatToolMapping / `<app_id>` in config.vdf.
+pub fn compat_tool(config_vdf: &str, app_id: u32) -> Option<String> {
+    let id = app_id.to_string();
+    let lines = config_vdf.lines().skip_while(|l| tokens(l) != ["CompatToolMapping"]).skip(1);
+    let (mut depth, mut in_app) = (0, false);
+    for line in lines {
+        match (line.trim(), &tokens(line)[..]) {
+            ("{", _) => depth += 1,
+            ("}", _) if depth == 1 => return None,
+            ("}", _) => (depth, in_app) = (depth - 1, false),
+            (_, [k]) if depth == 1 => in_app = *k == id,
+            (_, ["name", v]) if depth == 2 && in_app => return Some(v.to_string()),
+            _ => (),
+        }
+    }
+    None
+}
+
+/// The (appid, AppName) of each entry in Steam's binary shortcuts.vdf; a truncated file yields what came before.
+pub fn parse_shortcuts(bytes: &[u8]) -> Vec<(u32, String)> {
+    fn walk(b: &[u8], out: &mut Vec<(u32, String)>) -> Option<()> {
+        let (mut i, mut id, mut name) = (0, None, None);
+        let cstr = |i: &mut usize| {
+            let len = b.get(*i..)?.iter().position(|&c| c == 0)?;
+            *i += len + 1;
+            Some(String::from_utf8_lossy(&b[*i - len - 1..*i - 1]).into_owned())
+        };
+        while let Some(&kind) = b.get(i) {
+            i += 1;
+            if kind == 0x08 {
+                // the end of a map; an entry has both fields once its first nested map (tags) ends
+                if let (Some(id), Some(name)) = (id.take(), name.take()) {
+                    out.push((id, name));
+                }
+                continue;
+            }
+            let key = cstr(&mut i)?;
+            match kind {
+                0x00 => (),
+                0x01 => name = Some(cstr(&mut i)?).filter(|_| key.eq_ignore_ascii_case("appname")).or(name),
+                0x02 => {
+                    let v = i32::from_le_bytes(b.get(i..i + 4)?.try_into().ok()?);
+                    i += 4;
+                    if key.eq_ignore_ascii_case("appid") {
+                        id = Some(v as u32);
+                    }
+                }
+                _ => return None, // shortcuts.vdf uses only maps, strings and int32
+            }
+        }
+        Some(())
+    }
+    let mut out = vec![];
+    walk(bytes, &mut out);
+    out
+}
+
+/// `id`: a Steam app id, a 32-bit shortcut app id or a 64-bit shortcut game id.
+pub fn find_app(steam_dir: &Path, id: u64) -> Result<AppInfo> {
+    let app_id = if id > u32::MAX as u64 { (id >> 32) as u32 } else { id as u32 };
+    let compat_tool = || compat_tool(&fs::read_to_string(steam_dir.join("config/config.vdf")).unwrap_or_default(), app_id);
+    if id <= u32::MAX as u64 {
+        let libraries = fs::read_to_string(steam_dir.join("steamapps/libraryfolders.vdf")).unwrap_or_default();
+        for lib in [steam_dir.to_path_buf()].into_iter().chain(library_dirs(&libraries)) {
+            if let Ok(manifest) = fs::read_to_string(lib.join(format!("steamapps/appmanifest_{app_id}.acf"))) {
+                let name = vdf_value(&manifest, "name").unwrap_or_default().to_owned();
+                return Ok(AppInfo { app_id, game_id: id, kind: AppKind::Steam, name, compat_tool: compat_tool() });
+            }
+        }
+    }
+    let game_id = shortcut_game_id(app_id);
+    if id == app_id as u64 || id == game_id {
+        for user in fs::read_dir(steam_dir.join("userdata")).into_iter().flatten().flatten() {
+            let shortcuts = fs::read(user.path().join("config/shortcuts.vdf")).unwrap_or_default();
+            if let Some((_, name)) = parse_shortcuts(&shortcuts).into_iter().find(|(a, _)| *a == app_id) {
+                return Ok(AppInfo { app_id, game_id, kind: AppKind::Shortcut, name, compat_tool: compat_tool() });
+            }
+        }
+    }
+    bail!("no Steam app or non-Steam shortcut with id {id}")
+}
+
+fn console_log(steam_dir: &Path) -> PathBuf {
+    steam_dir.join("logs/console_log.txt")
+}
+
+/// Where Steam's console log ends now; read from here after a launch.
+pub fn console_log_len(steam_dir: &Path) -> u64 {
+    fs::metadata(console_log(steam_dir)).map_or(0, |m| m.len())
+}
+
+/// What Steam wrote to its console log after `from`; all of it when the log is now shorter (rotated).
+pub fn console_log_since(steam_dir: &Path, from: u64) -> String {
+    let Ok(bytes) = fs::read(console_log(steam_dir)) else { return String::new() };
+    let from = if (bytes.len() as u64) < from { 0 } else { from as usize };
+    String::from_utf8_lossy(&bytes[from..]).into_owned()
+}
+
+/// The AppID of a launch Steam holds at a desktop dialog: a ShowInterstitials wait with no
+/// "continues" after it. Steam logs that wait for every launch and continues at once when no dialog shows.
+pub fn pending_interstitial(console_log: &str) -> Option<u32> {
+    let mut pending: Vec<&str> = vec![];
+    for line in console_log.lines() {
+        let Some((action, rest)) = line.split_once("GameAction [").and_then(|(_, r)| r.split_once(']')) else { continue };
+        if rest.contains("LaunchApp waiting for user response to ShowInterstitials") {
+            pending.push(action);
+        } else if rest.contains("LaunchApp continues with user response \"ShowInterstitials\"") {
+            pending.retain(|a| *a != action);
+        }
+    }
+    pending.last()?.strip_prefix("AppID ")?.split(',').next()?.parse().ok()
+}
+
+/// How long a ShowInterstitials wait may last before it counts as a dialog: seen live, Steam continued after up to 5 s.
+const DIALOG_GRACE: Duration = Duration::from_secs(10);
+
+/// wait_for for a launch through Steam, which fails fast once Steam waits on a desktop dialog
+/// (console log lines after `log_from`).
+pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, timeout: Duration, mut done: impl FnMut() -> bool) -> Result<bool> {
+    let (mut since, mut blocked) = (None, None);
+    let finished = wait_for(timeout, || {
+        if done() {
+            return true;
+        }
+        let pending = steam_dir.and_then(|d| pending_interstitial(&console_log_since(d, log_from)));
+        let started = *since.get_or_insert_with(Instant::now);
+        if pending.is_none() {
+            since = None;
+        }
+        blocked = pending.filter(|_| started.elapsed() >= DIALOG_GRACE);
+        blocked.is_some()
+    });
+    if let Some(id) = blocked {
+        bail!("Steam is waiting for a dialog on the desktop (ShowInterstitials for AppID {id}); dismiss it and retry");
+    }
+    Ok(finished)
+}
+
 /// Runs `steam <url>`. Only when Steam is not running yet does it get `steam.env` and `steam.args`,
 /// because a running Steam just forwards the URL. True if this started Steam.
 pub fn launch(cfg: &Config, url: &str) -> Result<bool> {
@@ -159,10 +357,11 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
         setup::undo_safe_mode_blocks(paths)?;
     }
     setup::unblock_safe_mode(&vrsettings)?;
+    let log_from = paths.steam_dir.as_deref().map_or(0, console_log_len);
     launch(cfg, STEAMVR_URL)?;
     // the old server can still answer ping while it hangs in shutdown
     let relaunched = || is_new_vrserver(&old, &pids_named("vrserver")) && api.ping();
-    if !wait_for(Duration::from_secs(cfg.timeouts.streaming_s), relaunched) {
+    if !wait_launched(paths.steam_dir.as_deref(), log_from, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
         bail!("ALVR did not come back within {} s after the SteamVR restart", cfg.timeouts.streaming_s);
     }
     Ok(())
@@ -171,6 +370,118 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Binary VDF as Steam writes shortcuts.vdf: one entry per (appid, AppName), plus a nested tags map.
+    fn shortcuts_vdf(entries: &[(u32, &str)]) -> Vec<u8> {
+        let mut b = b"\x00shortcuts\x00".to_vec();
+        for (i, (id, name)) in entries.iter().enumerate() {
+            b.extend([&[0x00][..], i.to_string().as_bytes(), b"\x00\x02appid\x00"].concat());
+            b.extend((*id as i32).to_le_bytes());
+            b.extend([b"\x01AppName\x00", name.as_bytes(), b"\x00\x01Exe\x00\"/x.exe\"\x00\x00tags\x00\x01", b"0\x00VR\x00\x08\x08"].concat());
+        }
+        b.extend(b"\x08\x08");
+        b
+    }
+
+    #[test]
+    fn shortcut_game_id_matches_steam() {
+        assert_eq!(shortcut_game_id(3000000000), 12884901888033554432);
+        assert_eq!(shortcut_game_id(3_000_000_000), (3_000_000_000u64 << 32) | 0x0200_0000);
+    }
+
+    #[test]
+    fn parse_shortcuts_reads_appid_and_name() {
+        assert_eq!(parse_shortcuts(&shortcuts_vdf(&[(3000000000, "Probe")])), [(3000000000, "Probe".to_owned())]);
+        let two = parse_shortcuts(&shortcuts_vdf(&[(1, "A"), (2, "B")]));
+        assert_eq!(two, [(1, "A".to_owned()), (2, "B".to_owned())]);
+        assert!(parse_shortcuts(b"\x00shortcuts").is_empty(), "truncated");
+    }
+
+    #[test]
+    fn library_dirs_from_vdf() {
+        let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/a\"\n\t\t\"label\"\t\t\"\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"/b\"\n\t}\n}\n";
+        assert_eq!(library_dirs(vdf), [PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    const CONFIG_VDF: &str = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"CompatToolMapping\"\n\t\t{\n\t\t\t\"620980\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t\t\"config\"\t\t\"\"\n\t\t\t}\n\t\t\t\"0\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"proton_9\"\n\t\t\t}\n\t\t}\n\t\t\"Other\"\n\t\t{\n\t\t\t\"7\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"not_a_tool\"\n\t\t\t}\n\t\t}\n\t}\n}\n";
+
+    #[test]
+    fn compat_tool_lookup() {
+        assert_eq!(compat_tool(CONFIG_VDF, 620980).as_deref(), Some("proton_experimental"));
+        assert_eq!(compat_tool(CONFIG_VDF, 1), None);
+        assert_eq!(compat_tool(CONFIG_VDF, 7), None, "outside CompatToolMapping");
+    }
+
+    fn fake_steam(name: &str) -> PathBuf {
+        let steam = std::env::temp_dir().join(format!("vr-test-mcp-{name}-{}", std::process::id()));
+        fs::remove_dir_all(&steam).ok();
+        fs::create_dir_all(steam.join("steamapps")).unwrap();
+        steam
+    }
+
+    #[test]
+    fn unknown_app_is_rejected() {
+        let steam = fake_steam("unknown-app");
+        let e = find_app(&steam, 1).unwrap_err();
+        assert_eq!(e.to_string(), "no Steam app or non-Steam shortcut with id 1");
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn find_app_happy_paths() {
+        let steam = fake_steam("find-app");
+        let lib = steam.join("lib2");
+        fs::create_dir_all(lib.join("steamapps")).unwrap();
+        fs::create_dir_all(steam.join("config")).unwrap();
+        fs::create_dir_all(steam.join("userdata/42/config")).unwrap();
+        let libraries = format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n", lib.display());
+        fs::write(steam.join("steamapps/libraryfolders.vdf"), libraries).unwrap();
+        fs::write(lib.join("steamapps/appmanifest_620980.acf"), "\"AppState\"\n{\n\t\"appid\"\t\t\"620980\"\n\t\"name\"\t\t\"Beat Saber\"\n}\n").unwrap();
+        fs::write(steam.join("config/config.vdf"), CONFIG_VDF).unwrap();
+        fs::write(steam.join("userdata/42/config/shortcuts.vdf"), shortcuts_vdf(&[(3000000000, "Probe")])).unwrap();
+
+        let steam_app = find_app(&steam, 620980).unwrap();
+        assert_eq!((steam_app.app_id, steam_app.game_id, steam_app.kind), (620980, 620980, AppKind::Steam));
+        assert_eq!((steam_app.name.as_str(), steam_app.compat_tool.as_deref()), ("Beat Saber", Some("proton_experimental")));
+        for id in [3000000000, 12884901888033554432] {
+            let shortcut = find_app(&steam, id).unwrap();
+            assert_eq!((shortcut.app_id, shortcut.game_id, shortcut.kind), (3000000000, 12884901888033554432, AppKind::Shortcut), "{id}");
+            assert_eq!((shortcut.name.as_str(), shortcut.compat_tool.as_deref()), ("Probe", None));
+        }
+        assert!(find_app(&steam, (620980u64 << 32) | 1).is_err(), "a 64-bit id must be a shortcut game id");
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn interstitial_pending_until_steam_continues() {
+        let waiting = "[2026-10-21 07:04:37] GameAction [AppID 620980, ActionID 70] : LaunchApp waiting for user response to ShowInterstitials \"\"\n";
+        let continues = "[2026-10-21 07:04:37] GameAction [AppID 620980, ActionID 70] : LaunchApp continues with user response \"ShowInterstitials\"\n";
+        let other = "[2026-10-21 07:04:38] GameAction [AppID 250820, ActionID 71] : LaunchApp waiting for user response to CreatingProcess \"\"\n";
+        assert_eq!(pending_interstitial(waiting), Some(620980));
+        assert_eq!(pending_interstitial(&[waiting, continues].concat()), None, "Steam logs every launch's interstitial step, and continues at once");
+        assert_eq!(pending_interstitial(other), None);
+        assert_eq!(pending_interstitial(""), None);
+    }
+
+    #[test]
+    fn console_log_since_reads_only_new_lines() {
+        let steam = fake_steam("console-log");
+        fs::create_dir_all(steam.join("logs")).unwrap();
+        fs::write(steam.join("logs/console_log.txt"), "old\n").unwrap();
+        let from = console_log_len(&steam);
+        fs::write(steam.join("logs/console_log.txt"), "old\nnew\n").unwrap();
+        assert_eq!(console_log_since(&steam, from), "new\n");
+        fs::write(steam.join("logs/console_log.txt"), "x\n").unwrap();
+        assert_eq!(console_log_since(&steam, from), "x\n", "a rotated log is read from its start");
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn leftover_vr_processes_need_cleanup() {
+        assert!(has_leftovers(&["steamtours", "vrmonitor"]), "Steam refuses the relaunch: WaitingPrevProcess");
+        assert!(!has_leftovers(&[]));
+        assert!(!has_leftovers(&["vrserver", "steamtours"]), "a running SteamVR is adopted, not killed");
+    }
 
     #[test]
     fn log_tail_keeps_the_last_lines() {
