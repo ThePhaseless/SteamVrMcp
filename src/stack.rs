@@ -98,6 +98,8 @@ pub struct StatusReport {
     pub t0_at: String,
     /// The SteamVR lease; none when free, expired or dead.
     pub owner: Option<Owner>,
+    /// `driver_*` sections SteamVR blocked in safe mode, which a start or restart would clear.
+    pub blocked_drivers: Vec<String>,
 }
 
 /// One ALVR session value to set.
@@ -493,9 +495,16 @@ impl Stack {
         *self.on_change.lock() = Some(f);
     }
 
+    /// A finished stop or restore leaves nothing running, so hold nothing.
+    fn release_after_success(&self) {
+        self.release_lease().map_err(|e| error!("{e:#}")).ok();
+    }
+
     pub fn restore(&self) -> Result<()> {
         restore_guard(steamvr::is_steamvr_running())?;
-        setup::restore(&self.paths())
+        setup::restore(&self.paths())?;
+        self.release_after_success();
+        Ok(())
     }
 
     /// A screenshot of the headset's stream. The wait for the frame runs outside the state lock.
@@ -671,9 +680,9 @@ impl Stack {
                 if !steamvr::kill_vr_processes() {
                     bail!("SteamVR processes still running after SIGKILL: {:?}", steamvr::alive_vr_processes());
                 }
-                // SteamVR has exited, so it no longer rewrites the file
-                setup::undo_safe_mode_blocks(&self.paths())?;
             }
+            // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
+            setup::undo_safe_mode_blocks(&self.paths())?;
             report.unblocked_safe_mode = setup::prepare(&self.paths(), &values, &hostname)?.unblocked_safe_mode;
         } else if self.api().ping() {
             self.check_version()?;
@@ -750,10 +759,11 @@ impl Stack {
             // on failure the signals below still stop SteamVR
             self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
-        if !steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
-            // the next start clears the safe-mode block this causes
-            steamvr::kill_vr_processes();
+        let gone = steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) || {
             report.used_signals = true;
+            steamvr::kill_vr_processes()
+        };
+        if gone {
             // SteamVR has exited, so it no longer rewrites the file
             setup::undo_safe_mode_blocks(&self.paths()).map_err(|e| error!("{e:#}")).ok();
         }
@@ -777,6 +787,7 @@ impl Stack {
             .filter(|n| !steamvr::pids_named(n).is_empty())
             .map(|n| n.to_string())
             .collect();
+        self.release_after_success();
         Ok(report)
     }
 
@@ -803,6 +814,7 @@ impl Stack {
             now_at: clock::at(now),
             t0_at: clock::at(0.0),
             owner,
+            blocked_drivers: self.paths().vrsettings_file().map(|f| setup::blocked_drivers(&f)).unwrap_or_default(),
         }
     }
 
@@ -1157,6 +1169,65 @@ mod tests {
         Stack::new(Config::default(), paths)
     }
 
+    /// A temp Steam tree with a blocked driver and, when `restore`, a restore.json that unblocks it.
+    fn blocked_stack(name: &str, restore: bool) -> (Arc<Stack>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-stack-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let (steam_dir, state_dir) = (root.join("steam"), root.join("state"));
+        std::fs::create_dir_all(steam_dir.join("config")).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(steam_dir.join("config/steamvr.vrsettings"), r#"{"driver_lighthouse":{"blocked_by_safe_mode":true}}"#).unwrap();
+        if restore {
+            let state = setup::RestoreState {
+                vrsettings_file: Some(setup::FileState::Contents(r#"{"driver_lighthouse":{}}"#.into())),
+                ..Default::default()
+            };
+            std::fs::write(state_dir.join("restore.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        }
+        let paths = Paths {
+            steam_dir: Some(steam_dir),
+            flatpak_steam: false,
+            steamvr_dir: None,
+            streamer_dir: None,
+            runtime_dir: root.join("run"),
+            state_dir,
+        };
+        (Stack::new(Config::default(), paths), root)
+    }
+
+    #[test]
+    fn vr_stop_clears_safe_mode_blocks_when_steamvr_is_gone() {
+        if !steamvr::alive_vr_processes().is_empty() {
+            return eprintln!("skipped: SteamVR is running");
+        }
+        let (stack, root) = blocked_stack("stop", true);
+        let file = stack.paths().vrsettings_file().unwrap();
+        stack.claim().unwrap();
+        stack.stop().unwrap();
+        assert!(setup::blocked_drivers(&file).is_empty());
+        assert!(stack.status().owner.is_none(), "a finished stop gives up the lease");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_restore_releases_the_lease() {
+        if !steamvr::alive_vr_processes().is_empty() {
+            return eprintln!("skipped: SteamVR is running");
+        }
+        let (stack, root) = blocked_stack("restore", false);
+        stack.claim().unwrap();
+        stack.restore().unwrap();
+        assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_status_reports_blocked_drivers() {
+        let (stack, root) = blocked_stack("status", false);
+        assert_eq!(stack.status().blocked_drivers, ["driver_lighthouse"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn claim_takes_the_lease_and_status_shows_it() {
         let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-lease-{}", std::process::id()));
@@ -1164,12 +1235,12 @@ mod tests {
         stack.paths.lock().runtime_dir = dir.clone();
         assert!(stack.status().owner.is_none());
         assert!(stack.acquire_lease(String::new(), None).is_err());
-        assert!(stack.acquire_lease("x".into(), Some(9)).is_err());
+        assert!(stack.acquire_lease("x".into(), Some(599)).is_err());
         stack.claim().unwrap();
         let owner = stack.status().owner.unwrap();
         assert!(owner.mine && owner.lease.owner.starts_with("mcp-"));
         assert_eq!(stack.readiness().leased_to, None, "ours does not block us");
-        assert_eq!(stack.acquire_lease("driver".into(), Some(60)).unwrap().owner, "driver");
+        assert_eq!(stack.acquire_lease("driver".into(), Some(600)).unwrap().owner, "driver");
         assert!(stack.release_lease().unwrap());
         assert!(stack.status().owner.is_none());
         std::fs::remove_dir_all(&dir).ok();

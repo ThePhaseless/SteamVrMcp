@@ -162,7 +162,19 @@ pub fn reset_safe_mode_blocks(current: &mut Value, snapshot: &Value) {
     }
 }
 
-/// After a signalled stop: undoes the safe-mode blocks SteamVR added, if restore.json recorded the file.
+/// `driver_*` sections SteamVR blocked in safe mode, sorted; empty when the file is unreadable.
+pub fn blocked_drivers(vrsettings: &Path) -> Vec<String> {
+    let Ok(Value::Object(sections)) = read_json(vrsettings) else { return vec![] };
+    let mut names: Vec<_> = sections
+        .iter()
+        .filter(|(name, s)| name.starts_with("driver_") && s.get("blocked_by_safe_mode") == Some(&json!(true)))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// After SteamVR has exited: undoes the safe-mode blocks SteamVR added, if restore.json recorded the file.
 pub fn undo_safe_mode_blocks(paths: &Paths) -> Result<()> {
     let Ok(text) = fs::read_to_string(paths.restore_file()) else { return Ok(()) };
     let state: RestoreState = serde_json::from_str(&text).context("parsing restore.json")?;
@@ -350,6 +362,17 @@ mod tests {
     use alvr_session::{
         CodecType, ControllersEmulationMode, H264Profile, RecenteringMode, settings_schema::Switch,
     };
+
+    #[test]
+    fn blocked_drivers_lists_true_blocks() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-blocked-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("steamvr.vrsettings");
+        fs::write(&file, r#"{"driver_a":{"blocked_by_safe_mode":true},"driver_b":{"blocked_by_safe_mode":false},"steamvr":{"blocked_by_safe_mode":true}}"#).unwrap();
+        assert_eq!(blocked_drivers(&file), ["driver_a"]);
+        assert!(blocked_drivers(&dir.join("missing")).is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
 
     fn applied(cfg: &Config) -> alvr_common::anyhow::Result<ServerSessionManager> {
         let mut m = ServerSessionManager::new(None);

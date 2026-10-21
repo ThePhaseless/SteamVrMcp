@@ -421,10 +421,10 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
             let left: Vec<_> = VR_PROCESS_NAMES.iter().filter(|n| !pids_named(n).is_empty()).collect();
             bail!("SteamVR processes still running after SIGKILL: {left:?}");
         }
-        // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
-        // blocked, so log it and relaunch anyway
-        setup::undo_safe_mode_blocks(paths).map_err(|e| error!("{e:#}")).ok();
     }
+    // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
+    // blocked, so log it and relaunch anyway
+    setup::undo_safe_mode_blocks(paths).map_err(|e| error!("{e:#}")).ok();
     setup::unblock_safe_mode(&vrsettings)?;
     let log_from = paths.steam_dir.as_deref().map_or(0, console_log_len);
     *started_steam = launch(cfg, STEAMVR_URL)?;

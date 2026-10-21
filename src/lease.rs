@@ -12,7 +12,7 @@ use std::{
 };
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(1800);
-pub const TTL_S: RangeInclusive<u64> = 10..=14400;
+pub const TTL_S: RangeInclusive<u64> = 600..=14400;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Lease {
@@ -30,6 +30,7 @@ pub struct Owner {
     pub mine: bool,
 }
 
+// shortcut: pid liveness assumes all MCPs share one pid namespace, use a lock fd held for the lease's life if a sandboxed MCP appears
 pub fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
@@ -58,6 +59,7 @@ fn lock(dir: &Path) -> Result<File> {
     private_dir(dir)?;
     let path = dir.join("owner.lock");
     let file = OpenOptions::new().create(true).write(true).truncate(false).open(&path).with_context(|| path.display().to_string())?;
+    // shortcut: flock EINTR surfaces as an error, retry on Interrupted if it ever shows
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
         return Err(io::Error::last_os_error()).with_context(|| path.display().to_string());
     }

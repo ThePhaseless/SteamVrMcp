@@ -114,7 +114,7 @@ struct SequenceArgs {
 struct AcquireArgs {
     /// Who holds SteamVR, 1 to 64 characters; shown to an agent that finds the lease taken.
     owner: String,
-    /// Seconds until the lease expires, 10 to 14400; default 1800. Any mutating tool renews it once half is left.
+    /// Seconds until the lease expires, 600 to 14400; default 1800. Any mutating tool renews it once half is left.
     ttl_s: Option<u64>,
 }
 
@@ -140,7 +140,7 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries owner (who holds the SteamVR lease, and whether this MCP does; absent when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; absent when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
