@@ -1,5 +1,6 @@
 //! Game log tailing for `[app_logs]`: patterns expand per app, files are followed across truncation and rotation, lines land in a per-app ring.
 use crate::{clock, steamvr};
+use alvr_common::warn;
 use regex::Regex;
 use serde::Serialize;
 use std::{
@@ -14,6 +15,8 @@ use std::{
 pub const LINES_KEPT: usize = 5000;
 pub const PAGE: usize = 500;
 const MAX_READ: u64 = 4 << 20;
+/// The longest unfinished line held back; a log with no newline (binary, or `\r` only) would otherwise grow it by MAX_READ per call.
+const MAX_PARTIAL: usize = 64 << 10;
 
 /// Fills `${compatdata}`, `${prefix}` and `${install}` in a glob pattern. Ok(None): `${install}` has no
 /// value (a shortcut), so the pattern matches nothing. Values are escaped, so their glob characters stay literal.
@@ -38,7 +41,7 @@ pub fn expand(pattern: &str, compatdata: &Path, install: Option<&Path>) -> Resul
     Ok((!missing).then_some(out))
 }
 
-/// Where reading a file stopped: its identity, the offset after the last full line, and the bytes of an unfinished line.
+/// Where reading a file stopped: its identity, the offset after the last byte read, and the bytes of an unfinished line.
 #[derive(Default)]
 pub struct Tail {
     pub id: (u64, u64),
@@ -59,13 +62,20 @@ pub fn read_new(path: &Path, tail: &mut Tail) -> io::Result<Vec<String>> {
     file.seek(SeekFrom::Start(tail.offset))?;
     let mut bytes = std::mem::take(&mut tail.partial);
     tail.offset += file.take(MAX_READ).read_to_end(&mut bytes)? as u64;
-    let Some(last) = bytes.iter().rposition(|&b| b == b'\n') else {
+    let decode = |l: &[u8]| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned();
+    let mut lines = vec![];
+    if let Some(last) = bytes.iter().rposition(|&b| b == b'\n') {
+        tail.partial = bytes.split_off(last + 1);
+        bytes.pop();
+        lines = bytes.split(|&b| b == b'\n').map(decode).collect();
+    } else {
         tail.partial = bytes;
-        return Ok(vec![]);
-    };
-    tail.partial = bytes.split_off(last + 1);
-    bytes.pop();
-    Ok(bytes.split(|&b| b == b'\n').map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned()).collect())
+    }
+    if tail.partial.len() > MAX_PARTIAL {
+        tail.partial.truncate(MAX_PARTIAL);
+        lines.push(decode(&std::mem::take(&mut tail.partial)));
+    }
+    Ok(lines)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -111,7 +121,7 @@ impl App {
             .patterns
             .iter()
             .filter_map(|p| expand(p, &info.compatdata, info.install_dir.as_deref()).ok().flatten())
-            .filter_map(|p| glob::glob(&p).ok())
+            .filter_map(|p| glob::glob(&p).inspect_err(|e| warn!("app {app_id} log pattern {p:?}: {e}")).ok())
             .flatten()
             .flatten()
             .filter(|p| p.is_file())
@@ -125,6 +135,7 @@ impl App {
     fn scan(&mut self, steam_dir: &Path, app_id: u32, start_at_end: bool) {
         let files = self.globbed(steam_dir, app_id);
         let ids: Vec<_> = files.iter().map(|p| p.metadata().map(|m| (m.dev(), m.ino()))).collect();
+        // shortcut: a deleted log's inode reused by a new matched file passes on its old offset, compare a head hash if a game does this
         // A rotated file (Player.log -> Player-prev.log) keeps its tail under its new name, so it is not read twice.
         for (path, id) in files.iter().zip(&ids) {
             if let (false, Ok(id)) = (self.tails.contains_key(path), id)
@@ -151,7 +162,8 @@ impl App {
             self.next_seq += 1;
         }
         self.files = files;
-        self.primed = true;
+        // An unresolved app has no files yet; priming now would read them from the start once it resolves.
+        self.primed = self.info.is_some();
     }
 }
 
@@ -195,6 +207,7 @@ impl AppLogs {
         if let Some(app) = self.apps.get_mut(&app_id) {
             app.lines.clear();
             app.tails.clear();
+            app.info = None; // the game may have moved to another library
             app.primed = false;
         }
         self.poll_app(app_id, steam_dir);
@@ -204,7 +217,7 @@ impl AppLogs {
     pub fn page(&self, app_id: u32, since_seq: u64) -> Result<Page, String> {
         let app = self.apps.get(&app_id).ok_or_else(|| format!("app {app_id} has no entry in [app_logs]"))?;
         let lines: Vec<AppLine> = app.lines.iter().filter(|l| l.seq >= since_seq).take(PAGE).cloned().collect();
-        let next_seq = lines.last().map_or(app.next_seq, |l| l.seq + 1);
+        let next_seq = lines.last().map_or(app.next_seq.max(since_seq), |l| l.seq + 1);
         Ok(Page { app_id, files: app.files.iter().map(|p| p.display().to_string()).collect(), lines, next_seq })
     }
 }
@@ -283,6 +296,19 @@ mod tests {
     }
 
     #[test]
+    fn an_endless_line_is_flushed_truncated() {
+        let dir = tmp("endless");
+        let path = dir.join("bin.log");
+        let mut tail = Tail::default();
+        fs::write(&path, vec![b'x'; MAX_PARTIAL]).unwrap();
+        assert!(read_new(&path, &mut tail).unwrap().is_empty(), "held until it passes the cap");
+        append(&path, vec![b'y'; 10]);
+        let lines = read_new(&path, &mut tail).unwrap();
+        assert_eq!((lines.len(), lines[0].len(), tail.partial.len()), (1, MAX_PARTIAL, 0));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn first_poll_starts_at_end_later_files_from_start() {
         let (steam, install, mut logs) = game("first-poll", &["${install}/*.log"]);
         fs::write(install.join("old.log"), "x\n").unwrap();
@@ -342,6 +368,7 @@ mod tests {
         let second = logs.page(42, 501).unwrap();
         assert_eq!((second.lines[0].seq, second.lines[0].text.as_str(), second.next_seq), (501, "l501", 1001));
         assert_eq!(logs.page(42, 1201).unwrap().next_seq, 1201);
+        assert_eq!(logs.page(42, 9000).unwrap().next_seq, 9000, "a future cursor stays where it is");
         append(&install.join("a.log"), &write(1201..5101));
         logs.poll(Some(&steam));
         let kept = logs.page(42, 0).unwrap();

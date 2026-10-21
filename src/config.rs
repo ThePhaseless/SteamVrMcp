@@ -1,5 +1,5 @@
 use crate::applog;
-use alvr_common::anyhow::{Context, Result};
+use alvr_common::anyhow::{Context, Error, Result, bail};
 use serde::Deserialize;
 use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
 
@@ -52,9 +52,19 @@ impl Config {
     pub fn parse(text: &str) -> Result<Config> {
         let cfg: Config = toml::from_str(text)?;
         for (id, patterns) in &cfg.app_logs {
-            id.parse::<u32>().with_context(|| format!("app_logs key {id:?} is not a decimal app id"))?;
+            let n = id.parse::<u32>().with_context(|| format!("app_logs key {id:?} is not a decimal app id"))?;
+            if n.to_string() != *id {
+                bail!("app_logs key {id:?} must be written as {n}, with no sign or leading zeros");
+            }
             for p in patterns {
-                applog::expand(p, Path::new(""), None).map_err(alvr_common::anyhow::Error::msg).with_context(|| format!("app_logs {id:?}"))?;
+                let context = || format!("app_logs {id:?}");
+                // Proton prefixes hold `dosdevices/z: -> /`, and glob follows directory symlinks, so `**` would walk the whole disk.
+                if p.contains("**") {
+                    bail!("app_logs {id:?}: {p:?} uses `**`; use one `*` per directory level");
+                }
+                // A dummy install dir stands in so the pattern is checked even where `${install}` would be empty.
+                let expanded = applog::expand(p, Path::new(""), Some(Path::new("/x"))).map_err(Error::msg).with_context(context)?;
+                glob::Pattern::new(&expanded.unwrap_or_default()).with_context(|| format!("app_logs {id:?}: {p:?}"))?;
             }
         }
         Ok(cfg)
@@ -180,6 +190,20 @@ mod tests {
     fn config_reads_app_logs() {
         let c = Config::parse("[app_logs]\n\"620980\" = [\"${install}/BepInEx/LogOutput.log\"]").unwrap();
         assert_eq!(c.app_logs["620980"], ["${install}/BepInEx/LogOutput.log"]);
+    }
+
+    #[test]
+    fn config_rejects_unsafe_or_malformed_app_log_patterns() {
+        for (case, want) in [
+            ("\"7\" = [\"${prefix}/**/Player.log\"]", "**"),
+            ("\"7\" = [\"${install}/[abc.log\"]", "[abc"),
+            ("\"07\" = []", "07"),
+            ("\"+7\" = []", "+7"),
+        ] {
+            let e = format!("{:#}", Config::parse(&format!("[app_logs]\n{case}")).unwrap_err());
+            assert!(e.contains(want), "{case}: {e}");
+        }
+        assert!(Config::parse("[app_logs]\n\"7\" = [\"${prefix}/a/*/*/Player.log\", \"${install}/*.log\"]").is_ok());
     }
 
     #[test]
