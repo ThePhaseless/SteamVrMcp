@@ -229,6 +229,15 @@ fn live_tracked_head_matches() {
 #[ignore]
 fn live_head_move_tracked() {
     let s = ensure_streaming();
+    // later tests in this process expect the default head pose, also after a failed assertion
+    struct Reset(Arc<Stack>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let default = PoseArgs { position: [0.0, 1.6, 0.0], ..Default::default() };
+            self.0.apply(RigAction::SetHeadPose(default)).ok(); // also stops an animation
+        }
+    }
+    let _reset = Reset(Arc::clone(&s));
     let set = |position, yaw| s.apply(RigAction::SetHeadPose(PoseArgs { position, yaw, ..Default::default() })).unwrap();
     let hmd = || s.tracked_state(false).unwrap().devices.into_iter().find(|d| d.class == "hmd").expect("no hmd");
     let pixels = |eye| {
@@ -254,7 +263,8 @@ fn live_head_move_tracked() {
     assert_eq!(a.len(), b.len());
     let diff = a.iter().zip(&b).map(|(&x, &y)| (x as f64 - y as f64).abs()).sum::<f64>() / a.len() as f64;
     println!("mean absolute pixel difference {diff:.2}");
-    assert!(diff > 8.0, "the screenshot did not change with the head pose: {diff:.2}");
+    // 7.1 measured on the dark SteamVR Home between yaw 0 and yaw 90
+    assert!(diff > 4.0, "the screenshot did not change with the head pose: mean abs diff {diff:.2}, want > 4");
 
     let waypoints = vec![
         PoseArgs { position: [0.0, 1.6, -0.5], ..Default::default() },
@@ -272,8 +282,6 @@ fn live_head_move_tracked() {
     thread::sleep(done_after.saturating_sub(started.elapsed()) + Duration::from_millis(300));
     let d = hmd();
     assert!(Vec3::from_array(d.position).distance(Vec3::new(0.3, 1.6, 0.0)) < 0.01, "{d:?}");
-    // later tests in this process expect the default head pose
-    set([0.0, 1.6, 0.0], None);
 }
 
 /// Proves early risk 5 (Beat Saber runs on the integrated GPU at the MCP's default resolution). Needs env

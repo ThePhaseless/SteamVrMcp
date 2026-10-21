@@ -3,7 +3,7 @@
 
 use alvr_common::{
     DeviceMotion, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID, Pose,
-    glam::{EulerRot, Quat, Vec3},
+    glam::{EulerRot, Quat, Vec3, Vec4},
 };
 use alvr_packets::{FaceData, TrackingData};
 use rmcp::schemars::JsonSchema;
@@ -76,7 +76,7 @@ pub struct MoveArgs {
 pub struct AnimateArgs {
     /// 1 to 64 poses.
     pub waypoints: Vec<PoseArgs>,
-    /// Seconds, more than 0 and at most 600.
+    /// Seconds, at least 0.01 and at most 600.
     pub duration_s: f32,
 }
 
@@ -156,13 +156,10 @@ impl PoseArgs {
         let euler = [self.yaw, self.pitch, self.roll];
         let orientation = match self.quat {
             Some(_) if euler.iter().any(Option::is_some) => return Err("give yaw/pitch/roll or quat, not both".into()),
-            Some(q) => {
-                let q = Quat::from_array(q);
-                if !q.is_finite() || q.length() < 1e-6 {
-                    return Err("quat must be finite and non-zero".into());
-                }
-                q.normalize()
-            }
+            // try_normalize also refuses a quat whose length overflows to inf
+            Some(q) => Quat::from_vec4(
+                Vec4::from_array(q).try_normalize().ok_or("quat must be finite, non-zero and of finite length")?,
+            ),
             None => {
                 let [yaw, pitch, roll] = euler.map(|a| a.unwrap_or(0.0));
                 euler_quat(yaw, pitch, roll)?
@@ -268,8 +265,9 @@ impl Body {
     }
 
     fn animate(&mut self, anim: &AnimateArgs, origin: Pose, now: Instant) -> Result<Duration, String> {
-        if !(anim.duration_s > 0.0 && anim.duration_s <= 600.0) {
-            return Err("duration_s must be more than 0 and at most 600".into());
+        // below 10 ms the velocities ALVR predicts with become absurd
+        if !(anim.duration_s >= 0.01 && anim.duration_s <= 600.0) {
+            return Err("duration_s must be at least 0.01 and at most 600".into());
         }
         if !(1..=64).contains(&anim.waypoints.len()) {
             return Err("give 1 to 64 waypoints".into());
@@ -371,6 +369,7 @@ mod tests {
     fn pose_args_reject_bad_input() {
         let quat = |q| PoseArgs { quat: Some(q), ..pose_at([0.0; 3]) };
         assert!(quat([0.0; 4]).to_pose().is_err());
+        assert!(quat([1e20, 0.0, 0.0, 1.0]).to_pose().is_err(), "length overflows to inf");
         assert!(quat([0.0, f32::NAN, 0.0, 1.0]).to_pose().is_err());
         let both = PoseArgs { yaw: Some(10.0), ..quat([0.0, 0.0, 0.0, 1.0]) };
         assert_eq!(both.to_pose().unwrap_err(), "give yaw/pitch/roll or quat, not both");
@@ -432,10 +431,11 @@ mod tests {
         let anim = |waypoints: usize, duration_s| {
             RigAction::AnimateHead(AnimateArgs { waypoints: vec![pose_at([0.0, 1.6, 0.0]); waypoints], duration_s })
         };
-        for bad in [anim(1, 0.0), anim(1, 600.5), anim(1, f32::NAN), anim(0, 1.0), anim(65, 1.0)] {
+        for bad in [anim(1, 0.0), anim(1, 1e-6), anim(1, 0.009), anim(1, 600.5), anim(1, f32::NAN), anim(0, 1.0), anim(65, 1.0)] {
             assert!(rig.apply(bad, Instant::now()).is_err());
         }
         assert!(rig.apply(anim(64, 600.0), Instant::now()).is_ok());
+        assert!(rig.apply(anim(1, 0.01), Instant::now()).is_ok());
     }
 
     #[test]
