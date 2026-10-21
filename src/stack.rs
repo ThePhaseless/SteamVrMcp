@@ -207,6 +207,10 @@ impl Stack {
     /// changed. A reader that does not answer within OPENVR_TIMEOUT is left on its thread.
     // shortcut: a reader left stuck keeps OpenVR's process-global client, so the next connect may fail until the MCP restarts; fine while no hang is seen
     fn read<T: Send + 'static>(&self, f: impl FnOnce(&OpenVr) -> Result<T> + Send + 'static) -> Result<T> {
+        // the reader was dropped for a vrserver that is going away; do not reconnect to it
+        if self.restarting.is_locked() {
+            bail!("SteamVR is stopping or restarting");
+        }
         let mut slot = self.reader.lock();
         let vrserver = steamvr::pids_named("vrserver").first().copied();
         let reader = match slot.take() {
@@ -231,6 +235,21 @@ impl Stack {
         .with_context(|| format!("OpenVR did not answer within {} s", OPENVR_TIMEOUT.as_secs()))??;
         *slot = Some((pid, reader));
         result
+    }
+
+    /// Polls the reader's events, so a SteamVR quit from outside drops it instead of SteamVR
+    /// killing the MCP. Skipped while a read holds the reader; the watcher calls it every 1 s.
+    fn pump_reader(&self) {
+        let Some(mut slot) = self.reader.try_lock() else { return };
+        let Some((pid, reader)) = slot.take() else { return };
+        match within(OPENVR_TIMEOUT, move || {
+            let quit = reader.poll_quit();
+            (reader, quit)
+        }) {
+            Some((reader, false)) => *slot = Some((pid, reader)),
+            Some((reader, true)) => dispose_reader(reader),
+            None => warn!("OpenVR events did not answer within {} s; reader left running", OPENVR_TIMEOUT.as_secs()),
+        }
     }
 
     /// Disconnects the reader while vrserver is still up; called before every stop and restart.
@@ -475,6 +494,7 @@ fn watch(stack: Weak<Stack>) {
     let mut last = Readiness::default();
     loop {
         let Some(s) = stack.upgrade() else { return };
+        s.pump_reader();
         let now = s.readiness();
         if now != last {
             if let Some(f) = &*s.on_change.lock() {

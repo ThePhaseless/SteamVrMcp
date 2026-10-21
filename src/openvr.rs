@@ -289,6 +289,21 @@ impl OpenVr {
         })
     }
 
+    /// Drains the event queue. On VREvent_Quit it acknowledges, so SteamVR does not kill this
+    /// process after its quit timeout (openvr.h AcknowledgeQuit_Exiting), and returns true: the
+    /// caller then drops the reader.
+    pub fn poll_quit(&self) -> bool {
+        let mut event = unsafe { zeroed::<VREvent_t>() };
+        let mut quit = false;
+        while call!(self.system, PollNextEvent, &mut event, size_of::<VREvent_t>() as u32) {
+            quit |= event.eventType == EVREventType_VREvent_Quit;
+        }
+        if quit {
+            call!(self.system, AcknowledgeQuit_Exiting);
+        }
+        quit
+    }
+
     pub fn scene_app(&self) -> SceneApp {
         let state = match call!(self.apps, GetSceneApplicationState) {
             EVRSceneApplicationState_Starting => "starting",
