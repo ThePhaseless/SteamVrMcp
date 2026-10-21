@@ -244,11 +244,13 @@ pub fn env_of(pid: u32, key: &str) -> Option<String> {
 
 /// This MCP and its ancestors up to (not including) init.
 pub fn ancestors() -> Vec<u32> {
-    let ppid = |pid: u32| {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
-    };
-    std::iter::successors(Some(std::process::id()), |&pid| ppid(pid).filter(|&p| p > 1)).collect()
+    std::iter::successors(Some(std::process::id()), |&pid| parent_of(pid).filter(|&p| p > 1)).collect()
+}
+
+/// The ppid field of `/proc/<pid>/stat`, read after the last `)` since comm may hold one.
+pub(crate) fn parent_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Every process of a game's tree: its environ has the game's STEAM_COMPAT_DATA_PATH and its app

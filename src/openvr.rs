@@ -184,6 +184,8 @@ pub struct OpenVr {
     skeletons: [VRActionHandle_t; 2],
     // shortcut: whether SteamVR delivers these events to a Background app is unverified live, check once and fall back to None
     head_proximity: Cell<Option<bool>>,
+    /// A drained VREvent_Quit, kept until the reader is dropped.
+    quit: Cell<bool>,
 }
 
 // SAFETY: the function tables are process-global in vrclient and take no thread-local state
@@ -220,6 +222,7 @@ impl OpenVr {
             set: 0,
             skeletons: [0; 2],
             head_proximity: Cell::new(None),
+            quit: Cell::new(false),
         };
         vr.attach(state_dir)?; // on error, dropping vr shuts the client down
         Ok(vr)
@@ -356,8 +359,8 @@ impl OpenVr {
     }
 
     /// Drains the event queue. On VREvent_Quit it acknowledges, so SteamVR does not kill this
-    /// process after its quit timeout (openvr.h AcknowledgeQuit_Exiting), and returns true: the
-    /// caller then drops the reader.
+    /// process after its quit timeout (openvr.h AcknowledgeQuit_Exiting), and returns true, then
+    /// and on every later call: the caller then drops the reader.
     pub fn poll_quit(&self) -> bool {
         let mut event = unsafe { zeroed::<VREvent_t>() };
         let mut quit = false;
@@ -367,8 +370,9 @@ impl OpenVr {
         }
         if quit {
             call!(self.system, AcknowledgeQuit_Exiting);
+            self.quit.set(true);
         }
-        quit
+        self.quit.get()
     }
 
     pub fn scene_app(&self) -> SceneApp {

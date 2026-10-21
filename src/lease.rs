@@ -49,7 +49,7 @@ pub fn read(dir: &Path) -> Option<Lease> {
 
 pub fn holder_text(l: &Lease) -> String {
     format!(
-        "SteamVR is leased to {} (pid {}) until {}; read-only tools stay available, and vr_acquire takes over once it expires",
+        "SteamVR is leased to {} (pid {}) until {}; read-only tools stay available until it runs vr_release or vr_stop, or exits",
         l.owner, l.pid, l.expires_at
     )
 }

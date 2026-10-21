@@ -164,12 +164,12 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; absent when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec) and, while the OpenVR reader is connected, the scene app. The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
     }
 
-    #[tool(description = "Take or renew the lease on this machine's SteamVR under a name of your choice. Every tool that changes anything takes it by itself, so call this only to pick the name or the ttl, or to take over once another agent's lease expired. Refuses while another live MCP holds it. Returns the lease.")]
+    #[tool(description = "Take or renew the lease on this machine's SteamVR under a name of your choice. Every tool that changes anything takes it by itself, so call this only to pick the name or the ttl, or to take over a lease that expired after its MCP stopped managing a session. Refuses while another live MCP holds it. Returns the lease.")]
     async fn vr_acquire(&self, Parameters(args): Parameters<AcquireArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(Owner { lease: s.acquire_lease(args.owner, args.ttl_s)?, mine: true })).await.map_err(message)
     }
@@ -184,7 +184,7 @@ impl VrServer {
         self.run(|s| json(s.start()?)).await.map_err(message)
     }
 
-    #[tool(description = "Shut SteamVR down through ALVR (with signals if ALVR hangs) and disconnect the headset. Closes Steam only if vr_start started it. Refuses a SteamVR that runs without ALVR. Can take minutes.")]
+    #[tool(description = "Shut SteamVR down through ALVR (with signals if ALVR hangs) and disconnect the headset. Closes Steam only if vr_start started it. Ends a game that launch_app via proton started first (stopped_app lists its pids). Refuses a SteamVR that runs without ALVR. Can take minutes.")]
     async fn vr_stop(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.stop()?)).await.map_err(message)
     }
@@ -384,7 +384,7 @@ impl VrServer {
         self.run(move |s| json(s.read_app_log(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Wait until a line of the app's [app_logs] files matches pattern (a regex) or fail_pattern, whichever line comes first, fail_pattern checked first on each line. Returns {result: \"match\" | \"fail\" | \"timeout\", line, next_seq}. Starts at since_seq (default: the oldest line kept, the first since launch_app), so lines logged before the call count. Bad arguments fail at once. Can take minutes (timeout_s, up to 600).")]
+    #[tool(description = "Wait until a line of the app's [app_logs] files matches pattern (a regex) or fail_pattern, whichever line comes first, fail_pattern checked first on each line. Returns {result: \"match\" | \"fail\" | \"timeout\", line, next_seq}; fails with \"failed: app exited\" once the Proton launcher or the scene app running at the call's start is gone. Starts at since_seq (default: the oldest line kept, the first since launch_app), so lines logged before the call count. Bad arguments fail at once. Can take minutes (timeout_s, up to 600).")]
     async fn wait_for_log(&self, Parameters(args): Parameters<WaitForLogArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.wait_for_log(args)?)).await.map_err(message)
     }

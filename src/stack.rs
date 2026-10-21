@@ -63,7 +63,7 @@ pub(crate) fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T
 }
 
 /// A file stem no earlier MCP run used, so a stray old file is never read back.
-fn shot_stem(wall: SystemTime, pid: u32) -> String {
+fn unique_stem(wall: SystemTime, pid: u32) -> String {
     let ms = wall.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     format!("vr-{ms}-{pid}")
 }
@@ -117,6 +117,8 @@ pub struct StartReport {
 #[derive(Debug, Default, Serialize)]
 pub struct StopReport {
     pub remaining_processes: Vec<String>,
+    /// Pids and groups of the `launch_app via proton` game that vr_stop ended before SteamVR.
+    pub stopped_app: Vec<u32>,
     pub closed_steam: bool,
     pub used_signals: bool,
 }
@@ -281,13 +283,13 @@ pub fn wait_plan(a: &WaitForLogArgs, configured: impl Fn(u32) -> bool) -> Result
     let fail = a.fail_pattern.as_deref().map(Regex::new).transpose().map_err(|e| format!("fail_pattern: {e}"))?;
     let timeout_s = a.timeout_s.unwrap_or(60.0);
     if !(1.0..=600.0).contains(&timeout_s) {
-        return Err(format!("timeout_s must be 1 to 600, not {timeout_s}"));
+        return Err(format!("timeout_s must be from 1 to 600, got {timeout_s}"));
     }
     Ok((app_id, pattern, fail, Duration::from_secs_f64(timeout_s)))
 }
 
 fn app_id(id: &str) -> Result<u32> {
-    id.trim().parse().with_context(|| format!("app_id must be a decimal Steam app id, not {id:?}"))
+    id.trim().parse().with_context(|| format!("app_id must be a decimal app id, got {id:?}"))
 }
 
 const LOG_SOURCES: [&str; 5] = ["alvr", "vrserver", "vrcompositor", "vrmonitor", "all"];
@@ -562,7 +564,10 @@ impl Stack {
         let paths = Paths::detect(&cfg);
         *self.api.lock() = api_for(&paths);
         *self.paths.lock() = paths;
-        *self.app_logs.lock() = AppLogs::new(&cfg.app_logs);
+        // a rebuild restarts seq at 1, which strands a caller's since_seq
+        if cfg.app_logs != self.cfg.lock().app_logs {
+            *self.app_logs.lock() = AppLogs::new(&cfg.app_logs);
+        }
         *self.cfg.lock() = cfg;
         true
     }
@@ -622,12 +627,12 @@ impl Stack {
     /// vr_acquire: takes or renews the lease under `owner`, which later claims keep using.
     pub fn acquire_lease(&self, owner: String, ttl_s: Option<u64>) -> Result<Lease> {
         if !(1..=64).contains(&owner.chars().count()) {
-            bail!("owner must be 1 to 64 characters");
+            bail!("owner must be from 1 to 64 characters, got {}", owner.chars().count());
         }
         let ttl = match ttl_s {
             None => lease::DEFAULT_TTL,
             Some(s) if lease::TTL_S.contains(&s) => Duration::from_secs(s),
-            Some(s) => bail!("ttl_s {s} is outside {} to {}", lease::TTL_S.start(), lease::TTL_S.end()),
+            Some(s) => bail!("ttl_s must be from {} to {}, got {s}", lease::TTL_S.start(), lease::TTL_S.end()),
         };
         let taken = lease::acquire(&self.paths().runtime_dir, &owner, ttl)?;
         *self.lease.lock() = (owner, ttl);
@@ -642,6 +647,17 @@ impl Stack {
     /// Called from the watcher thread whenever `readiness` changes.
     pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
         *self.on_change.lock() = Some(f);
+    }
+
+    /// From the watcher: renews our lease while this MCP manages a session, so a holder that only
+    /// calls read-only tools keeps it.
+    fn keep_lease(&self) {
+        let managing = self.state.lock().managing;
+        let (owner, ttl) = self.lease.lock().clone();
+        let dir = self.paths().runtime_dir;
+        if watch_renews(managing, lease::read(&dir).as_ref(), std::process::id(), ttl, SystemTime::now()) {
+            lease::acquire(&dir, &owner, ttl).map_err(|e| warn!("{e:#}")).ok();
+        }
     }
 
     /// A finished stop or restore leaves nothing running, so hold nothing.
@@ -679,7 +695,7 @@ impl Stack {
         let dir = self.paths().state_dir.join("screenshots");
         steamvr::private_dir(&dir)?;
         let t_s = clock::now_s();
-        let stem = shot_stem(SystemTime::now(), std::process::id());
+        let stem = unique_stem(SystemTime::now(), std::process::id());
         let (preview, vr) = (dir.join(format!("{stem}-preview")), dir.join(&stem));
         let (p, v) = (preview.clone(), vr.clone());
         let taken = self.read(move |openvr| openvr.take_stereo_screenshot(&p, &v));
@@ -738,6 +754,8 @@ impl Stack {
     /// Tells SteamVR the headset is worn or removed.
     // shortcut: a SteamVR restart puts the headset "on head" again, keep the value in the rig and resend it at StreamingStarted
     pub fn set_proximity(&self, on_head: bool) -> Result<()> {
+        // the reader sees proximity only as events, so connect it before the event is sent
+        self.read(|_| Ok(())).ok();
         self.state.lock().headset.as_ref().context("no headset")?.set_proximity(on_head);
         Ok(())
     }
@@ -749,7 +767,10 @@ impl Stack {
 
     /// SteamVR's own view of devices and hand skeletons.
     pub fn tracked_state(&self, include_bones: bool) -> Result<openvr::TrackedState> {
-        self.read(move |vr| vr.tracked_state(include_bones))
+        self.read(move |vr| {
+            vr.poll_quit(); // updates head_proximity; a Quit seen here stays flagged for pump_reader
+            vr.tracked_state(include_bones)
+        })
     }
 
     /// None when SteamVR is not running or the reader cannot connect.
@@ -774,7 +795,7 @@ impl Stack {
         let dir = self.paths().runtime_dir.join("audio");
         steamvr::private_dir(&self.paths().runtime_dir)?;
         steamvr::private_dir(&dir)?;
-        let path = dir.join(format!("{}.wav", shot_stem(SystemTime::now(), std::process::id())));
+        let path = dir.join(format!("{}.wav", unique_stem(SystemTime::now(), std::process::id())));
         std::fs::write(&path, audio::wav(&samples)).with_context(|| path.display().to_string())?;
         let seconds = samples.len() as f64 / f64::from(audio::CHANNELS) / f64::from(audio::RATE);
         Ok(serde_json::json!({ "path": path, "seconds": seconds, "sample_rate": audio::RATE, "channels": audio::CHANNELS, "left": left, "right": right, "t_s": t_s, "at": clock::at(t_s) }))
@@ -917,8 +938,13 @@ impl Stack {
         }
         self.state.lock().watchdog_fired = false;
         let started = self.start_inner();
-        if started.is_err() {
-            self.state.lock().managing = false;
+        if let Err(e) = &started {
+            let mut state = self.state.lock();
+            state.managing = false;
+            // the auto-claimed lease stays while leftovers hold the machine; vr_stop frees both
+            if state.headset.is_some() || state.dashboard.is_some() || state.started_steam {
+                bail!("{e:#}; run vr_stop to free SteamVR");
+            }
         }
         started
     }
@@ -1024,7 +1050,8 @@ impl Stack {
         self.state.lock().managing = false;
         let _no_restart = self.restarting.lock();
         self.drop_reader();
-        let mut report = StopReport::default();
+        // a game spawned by the MCP may not quit with SteamVR, and its wineserver blocks the next proton launch
+        let mut report = StopReport { stopped_app: self.stop_launched(), ..Default::default() };
         // ALVR's client spins forever on a TCP stream whose server went away
         // (sockets/src/stream_socket/tcp.rs:137-147), so disconnect it while the server is up
         let headset = self.state.lock().headset.take();
@@ -1186,7 +1213,7 @@ impl Stack {
     pub fn launch_app(&self, a: LaunchArgs) -> Result<AppReport> {
         check_launch(&a).map_err(|e| anyhow!(e))?;
         launch_guard(steamvr::is_steamvr_running())?;
-        let id: u64 = a.app_id.trim().parse().with_context(|| format!("app_id must be a decimal number, not {:?}", a.app_id))?;
+        let id: u64 = a.app_id.trim().parse().with_context(|| format!("app_id must be a decimal app id, got {:?}", a.app_id))?;
         let paths = self.paths();
         let steam = paths.steam_dir.as_deref().context("Steam not found; set steam_dir in config.toml")?;
         let app = steamvr::find_app(steam, id)?;
@@ -1279,6 +1306,24 @@ impl Stack {
         Ok(serde_json::json!({ "stopped_pid": scene, "stopped": stopped }))
     }
 
+    /// Ends the last `launch_app via proton` game and forgets it; keeps it tracked when it outlives SIGKILL.
+    fn stop_launched(&self) -> Vec<u32> {
+        let Some(launched) = self.state.lock().launched.clone() else { return vec![] };
+        match proton::stop(None, Some(&launched)) {
+            Ok(stopped) => {
+                let mut state = self.state.lock();
+                if state.launched.as_ref().is_some_and(|now| Arc::ptr_eq(&now.exited, &launched.exited)) {
+                    state.launched = None;
+                }
+                stopped
+            }
+            Err(e) => {
+                error!("{e:#}");
+                vec![]
+            }
+        }
+    }
+
     /// The app's log lines from `since_seq`, after reading what its files gained.
     pub fn read_app_log(&self, a: ReadAppLogArgs) -> Result<applog::Page> {
         let id = app_id(&a.app_id)?;
@@ -1293,6 +1338,10 @@ impl Stack {
         let (id, pattern, fail, timeout) = wait_plan(&a, |id| self.app_logs.lock().has_app(id)).map_err(|e| anyhow!(e))?;
         let deadline = Instant::now() + timeout;
         let mut cursor = a.since_seq.unwrap_or(0);
+        let launcher = self.state.lock().launched.as_ref().filter(|l| l.app_id == id).map(|l| l.exited.clone());
+        // shortcut: the scene may be another app than `id`, compare the scene's app key if two apps run at once
+        let scene = self.scene_app().filter(|s| s.state == "running");
+        let scene = game_pid(scene.as_ref(), steamvr::comm).ok().map(|pid| (pid, steamvr::comm(pid)));
         loop {
             let steam = self.paths().steam_dir;
             let hit = {
@@ -1311,6 +1360,10 @@ impl Stack {
             };
             if let Some((result, line)) = hit {
                 return Ok(serde_json::json!({ "result": result, "line": line, "next_seq": line.seq + 1 }));
+            }
+            let launcher = launcher.as_ref().and_then(|e| *e.lock());
+            if let Some(why) = app_exited(launcher, scene.as_ref().map(|s| s.0), |pid| steamvr::comm(pid) == scene.as_ref().and_then(|s| s.1.clone())) {
+                bail!("app {id}: failed: app exited ({why}) before a line matched");
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -1452,12 +1505,27 @@ fn dispose_reader(reader: OpenVr) {
     }
 }
 
+/// Whether the watcher renews the lease: only our own (vr_release gave it up for good), only
+/// while we manage a session, and once half the ttl is gone.
+fn watch_renews(managing: bool, held: Option<&Lease>, me: u32, ttl: Duration, now: SystemTime) -> bool {
+    managing && held.is_some_and(|l| l.pid == me && lease::renew_due(l, ttl, now))
+}
+
+/// Why a log wait ends early: the Proton launcher exited, or the scene pid seen at the wait's start is gone.
+fn app_exited(launcher: Option<std::process::ExitStatus>, scene_pid: Option<u32>, alive: impl Fn(u32) -> bool) -> Option<String> {
+    if let Some(status) = launcher {
+        return Some(format!("the Proton launcher exited with {status}"));
+    }
+    scene_pid.filter(|&pid| !alive(pid)).map(|pid| format!("scene pid {pid} is gone"))
+}
+
 /// Recomputes readiness every 1 s and reports changes. Not in `supervise`, which blocks for a whole restart.
 fn watch(stack: Weak<Stack>) {
     let mut last = Readiness::default();
     loop {
         let Some(s) = stack.upgrade() else { return };
         s.pump_reader();
+        s.keep_lease();
         let steam = s.paths().steam_dir;
         s.app_logs.lock().poll(steam.as_deref());
         let now = s.readiness();
@@ -1830,11 +1898,11 @@ mod tests {
     }
 
     #[test]
-    fn shot_stems_differ_across_restarts() {
+    fn unique_stems_differ_across_restarts() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
-        assert_eq!(shot_stem(at, 7), "vr-1700000000123-7");
-        assert_ne!(shot_stem(at, 7), shot_stem(at, 8));
-        assert_ne!(shot_stem(at, 7), shot_stem(at + Duration::from_millis(1), 7));
+        assert_eq!(unique_stem(at, 7), "vr-1700000000123-7");
+        assert_ne!(unique_stem(at, 7), unique_stem(at, 8));
+        assert_ne!(unique_stem(at, 7), unique_stem(at + Duration::from_millis(1), 7));
     }
 
     #[test]
@@ -1974,6 +2042,68 @@ mod tests {
         assert!(plan(args("x", "ok", None, None)).is_err());
         let (app, pattern, fail, timeout) = plan(args(" 7 ", "ok", Some("bad"), None)).unwrap();
         assert_eq!((app, pattern.as_str(), fail.unwrap().as_str(), timeout), (7, "ok", "bad", Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn watch_renews_only_our_lease_while_managing() {
+        let (me, ttl, now) = (10, Duration::from_secs(1800), SystemTime::now());
+        let ours = |left_s| Lease { owner: "a".into(), pid: me, expires_at: clock::rfc3339(now + Duration::from_secs(left_s)) };
+        assert!(watch_renews(true, Some(&ours(100)), me, ttl, now), "half the ttl is gone");
+        assert!(!watch_renews(true, Some(&ours(1700)), me, ttl, now), "fresh");
+        assert!(watch_renews(true, Some(&Lease { expires_at: "garbage".into(), ..ours(0) }), me, ttl, now), "expired or unreadable");
+        assert!(!watch_renews(false, Some(&ours(100)), me, ttl, now), "no session to keep");
+        assert!(!watch_renews(true, None, me, ttl, now), "vr_release gave it up: do not take it back");
+        assert!(!watch_renews(true, Some(&Lease { pid: 11, ..ours(100) }), me, ttl, now), "another MCP's lease");
+    }
+
+    #[test]
+    fn app_exit_ends_a_log_wait() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(256);
+        assert_eq!(app_exited(None, None, |_| true), None);
+        assert_eq!(app_exited(None, Some(5), |_| true), None, "the scene still runs");
+        assert!(app_exited(Some(status), Some(5), |_| true).unwrap().contains("Proton launcher exited"));
+        assert!(app_exited(None, Some(5), |_| false).unwrap().contains("scene pid 5"));
+    }
+
+    #[test]
+    fn wait_for_log_fails_once_the_launched_game_exits() {
+        use std::os::unix::process::ExitStatusExt;
+        let (stack, root) = blocked_stack("wait-exit", false);
+        let (steam, cfg) = (stack.paths().steam_dir.unwrap(), Config::parse("[app_logs]\n\"42\" = [\"${install}/game.log\"]").unwrap());
+        std::fs::create_dir_all(steam.join("steamapps/common/Game")).unwrap();
+        std::fs::write(steam.join("steamapps/appmanifest_42.acf"), "\"AppState\"\n{\n\t\"installdir\"\t\t\"Game\"\n}\n").unwrap();
+        *stack.cfg.lock() = cfg.clone();
+        *stack.app_logs.lock() = AppLogs::new(&cfg.app_logs);
+        let exited = Arc::new(Mutex::new(Some(std::process::ExitStatus::from_raw(256))));
+        stack.state.lock().launched = Some(proton::Launched { pgid: 0, compatdata: root.clone(), app_id: 42, exited });
+        let a = WaitForLogArgs { app_id: "42".into(), pattern: "READY".into(), fail_pattern: None, since_seq: None, timeout_s: Some(5.0) };
+        let started = Instant::now();
+        let e = stack.wait_for_log(a).unwrap_err().to_string();
+        assert!(e.contains("failed: app exited"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_ends_the_launched_game_first() {
+        let (stack, root) = blocked_stack("stop-game", false);
+        let dir = root.join("prefix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = vec![
+            ("PATH".into(), std::env::var_os("PATH").unwrap()),
+            ("STEAM_COMPAT_DATA_PATH".into(), dir.clone().into()),
+            ("STEAM_COMPAT_APP_ID".into(), "9".into()),
+        ];
+        let l = proton::ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env, cwd: dir.clone(), compatdata: dir.clone(), app_id: 9 };
+        let launched = proton::spawn(&l, &dir.join("run.log")).unwrap();
+        stack.state.lock().launched = Some(launched.clone());
+        assert_eq!(stack.stop_launched(), [launched.pgid]);
+        assert!(launched.exited.lock().is_some(), "the game's group got SIGTERM and was reaped");
+        assert!(stack.state.lock().launched.is_none());
+        assert_eq!(stack.stop_launched(), Vec::<u32>::new(), "nothing left to stop");
+        launched.signal(libc::SIGKILL);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

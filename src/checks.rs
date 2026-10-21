@@ -230,16 +230,11 @@ pub fn dashboard_check() -> Check {
     check("alvr_dashboard_absent", dashboard_absent(), "close the ALVR dashboard (or the other vr-test-mcp)")
 }
 
-fn parent_of(pid: u32) -> Option<u32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat[stat.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
-}
-
 /// Our own `alvr_dashboard` child is fine; any other one (the real dashboard, another vr-test-mcp) is not.
 fn dashboard_absent() -> Result<String, String> {
     let others: Vec<String> = steamvr::pids_named("alvr_dashboard")
         .into_iter()
-        .filter(|&pid| parent_of(pid) != Some(std::process::id()))
+        .filter(|&pid| crate::proton::parent_of(pid) != Some(std::process::id()))
         .map(|pid| format!("pid {pid} ({})", steamvr::exe_of(pid).unwrap_or_default().display()))
         .collect();
     if others.is_empty() { Ok("none running".to_owned()) } else { Err(format!("alvr_dashboard running: {}", others.join(", "))) }
