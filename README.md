@@ -6,7 +6,7 @@ An MCP server that gives an agent a virtual SteamVR headset. It drives stock ALV
 
 - Linux desktop session with native Steam. Flatpak Steam is refused.
 - SteamVR, installed and run once.
-- The ALVR streamer at the pinned version, 21.0.0-dev14 (nightly). Any 21.x release works once a stable one ships. Nightlies must match exactly. Download `alvr_streamer_linux` from the ALVR releases page and unpack it anywhere.
+- The ALVR streamer at the pinned version, 21.0.0-dev14 (nightly). Any 21.x release works once a stable one ships. Nightlies must match exactly. ALVR publishes nightlies as releases of the `alvr-org/ALVR-nightly` repository on GitHub. Take one whose version is 21.0.0-dev14 (the crates are pinned to commit `ebec107b`), download `alvr_streamer_linux` and unpack it anywhere.
 - An AMD or Intel GPU for SteamVR. ALVR 21 direct mode works on AMD. On NVIDIA it is broken upstream (ALVR #3421), so an NVIDIA-only machine is refused.
 - VA-API H.264 encoding on that GPU, and a default audio input (ALVR's client opens it at every connection).
 
@@ -14,7 +14,7 @@ An MCP server that gives an agent a virtual SteamVR headset. It drives stock ALV
 
 ## Build
 
-Install your distro's ALSA and PipeWire development packages and clang, for example `alsa-lib-devel`, `pipewire-devel` and `clang` on Fedora, or `libasound2-dev`, `libpipewire-0.3-dev` and `clang` on Debian and Ubuntu. Then:
+You need Rust 1.98 or newer. Install your distro's ALSA and PipeWire development packages and clang, for example `alsa-lib-devel`, `pipewire-devel` and `clang` on Fedora, or `libasound2-dev`, `libpipewire-0.3-dev` and `clang` on Debian and Ubuntu. Then:
 
 ```
 cargo build --release
@@ -25,6 +25,8 @@ The binary is `target/release/vr-test-mcp`. Plain `cargo test` needs no Steam.
 ## Config
 
 Everything is detected. An optional `$XDG_CONFIG_HOME/vr-test-mcp/config.toml` overrides it. Unknown keys are rejected.
+
+The server reads the file at startup and again at each `vr_start`, but applies a new version only while nothing runs. If SteamVR or a session is up, run `vr_stop` before `vr_start` so your edit takes effect. With a malformed file the server keeps running: the `config` check fails, and `vr_start` stays hidden until the file parses.
 
 | Key | Meaning |
 | --- | --- |
@@ -37,7 +39,9 @@ Everything is detected. An optional `$XDG_CONFIG_HOME/vr-test-mcp/config.toml` o
 | `timeouts.streaming_s` | Wait for the headset to stream. Default 240. |
 | `timeouts.app_s` | Wait for a launched app's scene. Default 180. |
 
-`steam.env` and `steam.args` apply only when the MCP starts Steam. If Steam is already running, the MCP uses it as it is and cannot change its environment.
+`steam.env` and `steam.args` apply only when the MCP starts Steam. If Steam is already running, the MCP uses it as it is and cannot change its environment. Steam gets only the desktop session's variables (`HOME`, `PATH`, `DISPLAY`, `WAYLAND_DISPLAY`, `XDG_*`, locale, D-Bus and Pulse) plus `steam.env`. The rest of the agent's environment, API keys included, stays out of Steam and its games.
+
+To find `<vendor:device>`, look for the `[vvvv:dddd]` pair on the GPU's line in `lspci -nn`, or the vendorID and deviceID in `vulkaninfo --summary`.
 
 ```toml
 streamer_dir = "/path/to/alvr_streamer_linux"
@@ -68,7 +72,7 @@ claude mcp add --scope user vr-test-mcp -- <path>/target/release/vr-test-mcp
 
 Do not add the same server to `~/.omp/agent/mcp.json` as well. The server's startup checks only read state, so registering it starts nothing. Logs go to stderr and stdout carries the protocol only.
 
-Only `vr_status` is always listed. Every other tool appears while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes. A call to a gated tool answers `not ready: <reason>`.
+Only `vr_status` and `get_logs` are always listed. Every other tool appears while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes. A call to a gated tool answers `not ready: <reason>`.
 
 ### Host notes
 
@@ -121,6 +125,8 @@ Coordinates are SteamVR standing space (+Y up, -Z forward). Tool arguments use m
 - SteamVR reserves the Index system click for its dashboard. System touch reaches apps.
 - Steam can block a launch on a desktop dialog (`ShowInterstitials` or `ShowLaunchOption`, for example "VR Theater Screen" for an app Steam treats as non-VR). `launch_app` and `vr_start` fail fast and name the dialog. Dismiss it on the desktop.
 - `set_alvr_settings` changes last until the next `vr_start`, which applies the defaults and `config.toml` `alvr_settings` again.
+- `vr_start`, `vr_stop`, `set_alvr_settings`, `set_hand_tracking_flavour`, `launch_app` and `run_sequence` return only when they are done, which can take minutes.
+- `vr_stop` stops only a SteamVR that runs ALVR. If you started SteamVR without ALVR, close it yourself.
 
 ### Restarts are slow
 
@@ -129,6 +135,7 @@ ALVR's TCP stream socket spins at end of stream on loopback (`sockets/src/stream
 - A headset reconnect needs a SteamVR restart.
 - `vr_stop` usually ends SteamVR with signals, which takes about 30 s.
 - A restart-relevant settings change takes about 80 s.
+- If the MCP exits while the headset streams, vrserver keeps one CPU core busy until SteamVR stops.
 
 This is an upstream ALVR issue that is worth reporting.
 
@@ -157,3 +164,5 @@ Not covered: Monado, WiVRn, an OpenXR API layer, Windows, Flatpak Steam, headles
 ## Bumping the ALVR pin
 
 Change `rev` for every `alvr_*` dependency in `Cargo.toml`, install the matching streamer, and run `cargo test`. Then run the live tests, which need a desktop with Steam and a VR game: `cargo test --test live -- --ignored --test-threads=1`, with `VR_TEST_GAME_ID` set to the game's Steam app id or shortcut game id. The `xr_probe` example (`cargo build --release --example xr_probe`) is a native OpenXR sample that the live tests use to check inputs and haptics.
+
+The live tests leave SteamVR running for the next one. Only `live_zz_stop_and_restore` stops it and restores the setup. After running a single live test, run that one too, or call `vr_stop` and `vr_restore`.
