@@ -332,6 +332,10 @@ impl Headset {
     pub fn resume(&self) {
         self.context.resume();
     }
+
+    pub fn set_proximity(&self, on_head: bool) {
+        self.context.send_proximity_state(on_head);
+    }
 }
 
 pub struct Grabber(Arc<Mutex<Shared>>);

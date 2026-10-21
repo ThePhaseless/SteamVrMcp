@@ -62,6 +62,8 @@ pub struct Device {
     pub quat: [f32; 4],
     pub linear_velocity: [f32; 3],
     pub angular_velocity: [f32; 3],
+    /// Only for the hmd: whether SteamVR sees it worn.
+    pub head_proximity: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -286,6 +288,14 @@ impl OpenVr {
             quat,
             linear_velocity: p.vVelocity.v,
             angular_velocity: p.vAngularVelocity.v,
+            // the vendored OpenVR has no Prop_UserHeadProximity_Bool; SteamVR derives this activity level from the /proximity input
+            // shortcut: Timeout (worn but still) counts as worn, check live and tighten if SteamVR reports it after removal
+            head_proximity: (class == "hmd").then(|| {
+                matches!(
+                    call!(self.system, GetTrackedDeviceActivityLevel, index),
+                    EDeviceActivityLevel_k_EDeviceActivityLevel_UserInteraction | EDeviceActivityLevel_k_EDeviceActivityLevel_UserInteraction_Timeout
+                )
+            }),
         })
     }
 

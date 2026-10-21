@@ -56,6 +56,13 @@ struct TrackedStateArgs {
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+struct ProximityArgs {
+    /// true: the headset is worn; false: taken off.
+    on_head: bool,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 struct HapticsArgs {
     /// Only events with t_s after this; pass the last t_s seen to get new ones.
     since_s: Option<f64>,
@@ -307,6 +314,12 @@ impl VrServer {
         json(self.stack.recenter()).map_err(message)
     }
 
+    #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows it as the hmd's head_proximity. Limit: after a SteamVR restart the headset is \"on head\" again, so send it again.")]
+    async fn set_proximity(&self, Parameters(args): Parameters<ProximityArgs>) -> Result<CallToolResult, String> {
+        self.stack.set_proximity(args.on_head).map_err(message)?;
+        json(serde_json::json!({ "ok": true, "on_head": args.on_head })).map_err(message)
+    }
+
     #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: started_t_s and started_at (the session clock when it began), per step at_s, action, applied_s, ok and error, plus total_s. Can take minutes: it lasts as long as its steps.")]
     async fn run_sequence(&self, Parameters(args): Parameters<SequenceArgs>) -> Result<CallToolResult, String> {
         json(self.stack.run_sequence(args.steps).await.map_err(message)?).map_err(message)
@@ -468,12 +481,12 @@ mod tests {
             press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
             set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
             set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release \
-            read_app_log wait_for_log"
+            read_app_log wait_for_log set_proximity"
             .split_whitespace()
             .map(String::from)
             .collect();
         want.sort();
-        assert_eq!((names.len(), names), (37, want));
+        assert_eq!((names.len(), names), (38, want));
     }
 
     #[test]

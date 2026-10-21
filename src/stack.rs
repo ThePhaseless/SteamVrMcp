@@ -614,6 +614,13 @@ impl Stack {
         serde_json::json!({ "ok": true, "note": "In Stage recentering, the MCP's default, ALVR's recenter is the identity: poses stay absolute and nothing moves. Other recentering_mode values re-origin the playspace around the head's last pose." })
     }
 
+    /// Tells SteamVR the headset is worn or removed.
+    // shortcut: a SteamVR restart puts the headset "on head" again, keep the value in the rig and resend it at StreamingStarted
+    pub fn set_proximity(&self, on_head: bool) -> Result<()> {
+        self.state.lock().headset.as_ref().context("no headset")?.set_proximity(on_head);
+        Ok(())
+    }
+
     /// Haptic events the app sent with `t_s` after `since_s`, oldest first; `clear` empties the log.
     pub fn haptics(&self, since_s: f64, clear: bool) -> Vec<HapticEvent> {
         self.state.lock().headset.as_ref().map(|h| h.haptics(Some(since_s), clear)).unwrap_or_default()

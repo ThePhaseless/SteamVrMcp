@@ -69,7 +69,7 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
         | "animate_controller" | "set_controller_state" | "press_button" | "release_button" | "touch_button"
         | "set_trigger" | "set_grip" | "set_thumbstick" | "set_trackpad" | "set_finger_curl" | "set_hand_mode"
         | "set_hand_skeleton" | "set_hand_gesture" | "run_sequence" | "set_playspace" | "recenter"
-        | "get_haptics" => streaming(),
+        | "get_haptics" | "set_proximity" => streaming(),
         "screenshot" => {
             streaming()?;
             checks(&["h264_encoder", "screenshot_decoder"])
@@ -344,6 +344,15 @@ mod tests {
         let r = Readiness { streaming: false, ..all_ready() };
         assert_eq!(tool_ready("set_head_pose", &r), Err("headset is not streaming".to_owned()));
         assert_eq!(tool_ready("set_head_pose", &all_ready()), Ok(()));
+    }
+
+    #[test]
+    fn set_proximity_needs_streaming() {
+        let r = Readiness { streaming: false, ..all_ready() };
+        assert_eq!(tool_ready("set_proximity", &r), Err("headset is not streaming".to_owned()));
+        assert_eq!(tool_ready("set_proximity", &all_ready()), Ok(()));
+        let leased = Readiness { leased_to: Some("x".into()), ..all_ready() };
+        assert!(tool_ready("set_proximity", &leased).is_err());
     }
 
     #[test]
