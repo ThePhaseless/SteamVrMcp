@@ -29,7 +29,8 @@ pub struct Readiness {
     pub running: bool,
 }
 
-const CORE: [&str; 7] =
+/// The checks vr_start needs.
+pub const CORE: [&str; 7] =
     ["config", "steam_native", "steamvr_installed", "alvr_streamer", "alvr_dashboard_absent", "audio_input", "gpu_direct_mode"];
 const AMD: u32 = 0x1002;
 const INTEL: u32 = 0x8086;

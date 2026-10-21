@@ -26,7 +26,7 @@ The binary is `target/release/vr-test-mcp`. Plain `cargo test` needs no Steam.
 
 Everything is detected. An optional `$XDG_CONFIG_HOME/vr-test-mcp/config.toml` overrides it. Unknown keys are rejected.
 
-The server reads the file at startup and again at each `vr_start`, but applies a new version only while nothing runs. If SteamVR or a session is up, run `vr_stop` before `vr_start` so your edit takes effect. With a malformed file the server keeps running: the `config` check fails, and `vr_start` stays hidden until the file parses.
+The server reads the file at startup, at each `vr_start`, and at `vr_status` when the file changed or a core check fails. It applies a new version only while nothing runs, so a fix to a failing check shows up at the next `vr_status` without restarting the MCP. If SteamVR or a session is up, run `vr_stop` first so your edit takes effect. With a malformed file the server keeps running: the `config` check fails, and `vr_start` stays hidden until the file parses.
 
 | Key | Meaning |
 | --- | --- |

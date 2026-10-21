@@ -297,6 +297,8 @@ pub struct Stack {
     starting: Mutex<()>,
     /// Results of the last startup checks.
     checks: Mutex<Vec<Check>>,
+    /// config.toml's text when it was last read, so vr_status notices an edit.
+    config_text: Mutex<Option<String>>,
     /// The OpenVR reader and the vrserver pid it connected to. Its own lock, held across OpenVR
     /// calls (bounded by OPENVR_TIMEOUT), never together with `state`.
     reader: Mutex<Option<(u32, OpenVr)>>,
@@ -346,6 +348,7 @@ impl Stack {
             restarting: Mutex::new(()),
             starting: Mutex::new(()),
             checks: Mutex::default(),
+            config_text: Mutex::new(Config::text()),
             reader: Mutex::new(None),
             on_change: Mutex::new(None),
             rig: Arc::default(),
@@ -371,9 +374,10 @@ impl Stack {
         *self.api.lock()
     }
 
-    /// Re-reads config.toml, applies it while nothing runs, and runs all startup checks again. Only at
-    /// vr_start: some checks are slow.
+    /// Re-reads config.toml, applies it while nothing runs, and runs all startup checks again. At
+    /// vr_start, and at vr_status after an edit or while a core check fails: some checks are slow.
     pub fn recheck(&self) {
+        *self.config_text.lock() = Config::text();
         if let Ok(cfg) = Config::load() {
             self.reload(cfg);
         }
@@ -400,14 +404,18 @@ impl Stack {
         *self.checks.lock() = checks::startup_checks(&self.cfg(), &self.paths());
     }
 
-    /// The kept check results, with `alvr_dashboard_absent` and `config` re-run, so closing a dashboard
-    /// or fixing config.toml un-hides vr_start.
+    /// The kept check results, with `alvr_dashboard_absent` re-run. All checks run again, with
+    /// config.toml re-read, when the file changed or a core check fails, so fixing config.toml or the
+    /// machine un-hides vr_start without an MCP restart.
     pub fn checks(&self) -> Vec<Check> {
-        let fresh = [checks::dashboard_check(), checks::config_check(&Config::load())];
-        let mut checks = self.checks.lock();
-        for check in fresh {
-            checks.iter_mut().filter(|c| c.name == check.name).for_each(|c| *c = check.clone());
+        let core_failing = self.checks.lock().iter().any(|c| !c.ok && checks::CORE.contains(&c.name));
+        let edited = Config::text() != *self.config_text.lock();
+        if core_failing || edited {
+            self.recheck();
         }
+        let mut checks = self.checks.lock();
+        let dashboard = checks::dashboard_check();
+        checks.iter_mut().filter(|c| c.name == dashboard.name).for_each(|c| *c = dashboard.clone());
         checks.clone()
     }
 

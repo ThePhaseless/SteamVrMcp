@@ -35,9 +35,19 @@ impl Default for Timeouts {
 }
 
 impl Config {
+    /// `$XDG_CONFIG_HOME/vr-test-mcp/config.toml`.
+    pub fn file() -> Result<PathBuf> {
+        Ok(dirs::config_dir().context("no config dir")?.join("vr-test-mcp/config.toml"))
+    }
+
+    /// The file's text now; None when it is absent or unreadable.
+    pub fn text() -> Option<String> {
+        fs::read_to_string(Config::file().ok()?).ok()
+    }
+
     /// Reads `$XDG_CONFIG_HOME/vr-test-mcp/config.toml`; a missing file gives the defaults.
     pub fn load() -> Result<Config> {
-        let path = dirs::config_dir().context("no config dir")?.join("vr-test-mcp/config.toml");
+        let path = Config::file()?;
         match fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).with_context(|| format!("{}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
