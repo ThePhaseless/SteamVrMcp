@@ -33,6 +33,14 @@ fn is_restart_hud(hud: &str) -> bool {
 
 const WATCHDOG: Duration = Duration::from_secs(30);
 
+const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
+
+/// A client that was streaming when vrserver went away is stuck in ALVR's TCP EOF spin, so its
+/// pause and drop never return.
+fn must_leak(streaming: bool, vrserver_running: bool) -> bool {
+    streaming && !vrserver_running
+}
+
 /// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
 /// connects only to Disconnected entries (server_core/src/connection.rs:395-405).
 fn client_stuck(session: &SessionConfig, hostname: &str) -> bool {
@@ -64,6 +72,7 @@ pub struct StatusReport {
     pub steamvr_running: bool,
     pub alvr_version: Option<String>,
     pub headset: Option<HeadsetStatus>,
+    pub warning: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -72,6 +81,9 @@ struct State {
     dashboard: Option<Child>,
     started_steam: bool,
     restarts: u32,
+    /// The watchdog restarts SteamVR at most once per start().
+    watchdog_fired: bool,
+    leaked: bool,
     managing: bool,
 }
 
@@ -171,6 +183,15 @@ impl Stack {
     }
 
     pub fn start(&self) -> Result<StartReport> {
+        self.state.lock().watchdog_fired = false;
+        let started = self.start_inner();
+        if started.is_err() {
+            self.state.lock().managing = false;
+        }
+        started
+    }
+
+    fn start_inner(&self) -> Result<StartReport> {
         let mut report = StartReport::default();
         if let Some(h) = self.headset_status().filter(|h| h.streaming) {
             let restarts = self.state.lock().restarts;
@@ -243,7 +264,9 @@ impl Stack {
         // ALVR's client spins forever on a TCP stream whose server went away
         // (sockets/src/stream_socket/tcp.rs:137-147), so disconnect it while the server is up
         let headset = self.state.lock().headset.take();
-        drop(headset);
+        if let Some(h) = headset {
+            self.dispose(h);
+        }
         if self.api.ping() {
             // on failure the signals below still stop SteamVR
             self.api.post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
@@ -289,14 +312,16 @@ impl Stack {
             steamvr_running: steamvr::is_steamvr_running(),
             alvr_version: self.api.version().ok().map(|v| v.trim().to_owned()),
             headset: self.headset_status(),
+            warning: self.state.lock().leaked.then_some(LEAKED),
         }
     }
 
-    /// Replaces the headset with a fresh one, as a new MCP process would connect.
     /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
     pub fn recreate_headset(&self) {
         let old = self.state.lock().headset.take();
-        drop(old); // the old client must stop listening on 9943 before the new one starts
+        if let Some(h) = old {
+            self.dispose(h); // the old client must stop listening on 9943 before the new one starts
+        }
         let new = Headset::start();
         self.state.lock().headset = Some(new);
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
@@ -316,19 +341,45 @@ impl Stack {
         bail!("ALVR sent no session within 5 s")
     }
 
+    /// Drops a headset taken out of the state, or leaks it when ALVR's client could never finish.
+    fn dispose(&self, headset: Headset) {
+        if !must_leak(headset.status().streaming, steamvr::is_steamvr_running()) {
+            drop(headset);
+            return;
+        }
+        // shortcut: ALVR TCP EOF spin on the client after the server exits (sockets/src/stream_socket/tcp.rs:137-147) never returns from pause/drop; the leaked thread spins one core until the MCP exits; drop when fixed upstream
+        warn!("{LEAKED}");
+        self.state.lock().leaked = true;
+        std::mem::forget(headset);
+    }
+
     fn restart_steamvr(&self) {
         let _restart = self.restarting.lock();
         if !self.state.lock().managing {
             return;
         }
-        // as in stop(): a client still streaming when vrserver exits never disconnects
-        // shortcut: holds the state lock while the client disconnects (about a second), fine until status calls must never wait
-        if let Some(h) = &self.state.lock().headset {
+        // as in stop(): a client still streaming when vrserver exits never disconnects, so pause it
+        // first, outside the state lock; a client whose server is already gone is replaced
+        let taken = self.state.lock().headset.take(); // own statement: the guard must not outlive it
+        let headset = taken.and_then(|h| {
+            if must_leak(h.status().streaming, steamvr::is_steamvr_running()) {
+                self.dispose(h);
+                return None;
+            }
             h.pause();
-        }
+            Some(h)
+        });
         let restarted = steamvr::restart_steamvr(&self.cfg, &self.paths, &self.api);
-        if let Some(h) = &self.state.lock().headset {
-            h.resume();
+        let headset = headset.inspect(Headset::resume).unwrap_or_else(Headset::start);
+        let spare = {
+            let mut state = self.state.lock();
+            match state.headset {
+                None => state.headset.replace(headset),
+                Some(_) => Some(headset), // start() made one meanwhile; ours goes, outside the lock
+            }
+        };
+        if let Some(h) = spare {
+            self.dispose(h);
         }
         match restarted {
             Ok(()) => self.state.lock().restarts += 1,
@@ -396,9 +447,10 @@ fn supervise(stack: Weak<Stack>) {
             s.restart_steamvr();
             (events, quiet_since) = (None, None);
             last_hud = s.headset_status().map(|h| h.hud_message).unwrap_or_default();
-        } else if quiet_since.is_some_and(|t| t.elapsed() > WATCHDOG) {
+        } else if quiet_since.is_some_and(|t| t.elapsed() > WATCHDOG) && !s.state.lock().watchdog_fired {
             // seen in the spike: an old client stops listening after a restart
             // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
+            s.state.lock().watchdog_fired = true;
             s.recreate_headset(); // restarts SteamVR too
             (events, quiet_since) = (None, None);
         }
@@ -430,6 +482,13 @@ mod tests {
         assert!(!client_stuck(&session, "h"));
         session.client_connections.insert("h".into(), entry(ConnectionState::Disconnecting));
         assert!(client_stuck(&session, "h"));
+    }
+
+    #[test]
+    fn headset_leaks_only_when_its_server_is_gone_mid_stream() {
+        assert!(!must_leak(true, true), "server alive: the client disconnects cleanly");
+        assert!(must_leak(true, false), "server gone while streaming: pause and drop never return");
+        assert!(!must_leak(false, false), "never streamed: no stream thread to spin");
     }
 
     #[test]
