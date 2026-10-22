@@ -176,10 +176,11 @@ pub fn blocked_drivers(vrsettings: &Path) -> Vec<String> {
 /// After SteamVR has exited (never while a `VR_PROCESS_NAMES` process lives, which rewrites the file):
 /// clears every safe-mode block and returns the driver names. `vr_restore` still puts the snapshot back.
 pub fn undo_safe_mode_blocks(paths: &Paths) -> Result<Vec<String>> {
-    let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
-    if !path.exists() {
+    // without a snapshot vr_restore could not put the blocks back
+    if !paths.restore_file().exists() {
         return Ok(vec![]);
     }
+    let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
     let mut settings = read_json(&path)?;
     let names = clear_safe_mode_blocks(&mut settings);
     if !names.is_empty() {
