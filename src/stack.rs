@@ -1016,7 +1016,10 @@ impl Stack {
                 }
             }
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
-            setup::undo_safe_mode_blocks(&self.paths())?;
+            let unblocked = setup::undo_safe_mode_blocks(&self.paths())?;
+            if !unblocked.is_empty() {
+                report.notes.push(format!("unblocked add-ons: {}", unblocked.join(", ")));
+            }
             report.unblocked_safe_mode = setup::prepare(&self.paths(), &values, &hostname)?.unblocked_safe_mode;
         } else if steamvr::vrserver_has_alvr() && self.api().ping() {
             self.check_version()?;
@@ -1819,6 +1822,20 @@ mod tests {
         stack.stop().unwrap();
         assert!(setup::blocked_drivers(&file).is_empty());
         assert!(stack.status().owner.is_none(), "a finished stop gives up the lease");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn undo_safe_mode_blocks_ignores_the_snapshot_and_names_drivers() {
+        let (stack, root) = blocked_stack("undo", true);
+        let file = stack.paths().vrsettings_file().unwrap();
+        let state = setup::RestoreState {
+            vrsettings_file: Some(setup::FileState::Contents(r#"{"driver_lighthouse":{"blocked_by_safe_mode":true}}"#.into())),
+            ..Default::default()
+        };
+        std::fs::write(stack.paths().restore_file(), serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(setup::undo_safe_mode_blocks(&stack.paths()).unwrap(), ["driver_lighthouse"]);
+        assert!(setup::blocked_drivers(&file).is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 

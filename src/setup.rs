@@ -142,24 +142,23 @@ pub fn unblock_safe_mode(vrsettings: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Sets each `driver_*` section's `blocked_by_safe_mode` to its value in `snapshot`, which SteamVR
-/// sets on other drivers after a signalled exit. `driver_alvr_server` is left alone unless the
-/// snapshot had it blocked: the next start clears it.
-pub fn reset_safe_mode_blocks(current: &mut Value, snapshot: &Value) {
+/// Removes `blocked_by_safe_mode` from every `driver_*` section, and a section left empty. SteamVR
+/// 2.18.4 stops a launch on a desktop dialog while any driver is blocked, whatever the snapshot held.
+/// Returns the sorted names it unblocked.
+pub fn clear_safe_mode_blocks(current: &mut Value) -> Vec<String> {
     let key = VRSETTINGS_KEYS[1].1;
-    let drivers: BTreeSet<String> = [&*current, snapshot]
+    let mut names: Vec<String> = current
+        .as_object()
         .into_iter()
-        .flat_map(|v| v.as_object().into_iter().flat_map(|o| o.keys()))
-        .filter(|name| name.starts_with("driver_"))
-        .cloned()
+        .flatten()
+        .filter(|(name, s)| name.starts_with("driver_") && s.get(key) == Some(&json!(true)))
+        .map(|(name, _)| name.clone())
         .collect();
-    for name in drivers {
-        let original = snapshot.get(&name).and_then(|s| s.get(key)).cloned();
-        if name == VRSETTINGS_KEYS[1].0 && original != Some(json!(true)) {
-            continue;
-        }
-        put(current, &name, key, original);
+    names.sort();
+    for name in &names {
+        put(current, name, key, None);
     }
+    names
 }
 
 /// `driver_*` sections SteamVR blocked in safe mode, sorted; empty when the file is unreadable.
@@ -174,19 +173,19 @@ pub fn blocked_drivers(vrsettings: &Path) -> Vec<String> {
     names
 }
 
-/// After SteamVR has exited: undoes the safe-mode blocks SteamVR added, if restore.json recorded the file.
-pub fn undo_safe_mode_blocks(paths: &Paths) -> Result<()> {
-    let Ok(text) = fs::read_to_string(paths.restore_file()) else { return Ok(()) };
-    let state: RestoreState = serde_json::from_str(&text).context("parsing restore.json")?;
-    let Some(FileState::Contents(original)) = state.vrsettings_file else { return Ok(()) };
+/// After SteamVR has exited (never while a `VR_PROCESS_NAMES` process lives, which rewrites the file):
+/// clears every safe-mode block and returns the driver names. `vr_restore` still puts the snapshot back.
+pub fn undo_safe_mode_blocks(paths: &Paths) -> Result<Vec<String>> {
     let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
     let mut settings = read_json(&path)?;
-    let before = settings.clone();
-    reset_safe_mode_blocks(&mut settings, &serde_json::from_str(&original).context("original steamvr.vrsettings")?);
-    if settings != before {
+    let names = clear_safe_mode_blocks(&mut settings);
+    if !names.is_empty() {
         write_json(&path, &settings)?;
     }
-    Ok(())
+    Ok(names)
 }
 
 fn remove_file(path: &Path) -> Result<()> {
@@ -446,29 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn reset_safe_mode_blocks_follows_snapshot() {
-        let snapshot = json!({
-            "driver_alvr_server": {"blocked_by_safe_mode": false},
-            "driver_a": {"blocked_by_safe_mode": true},
-            "driver_prism": {"keep": 1},
-            "steamvr": {"ipd": 0.063}
-        });
+    fn clear_safe_mode_blocks_removes_every_block() {
         let mut current = json!({
             "driver_alvr_server": {"blocked_by_safe_mode": true},
-            "driver_a": {"blocked_by_safe_mode": false},
             "driver_gamepad": {"blocked_by_safe_mode": true},
             "driver_prism": {"blocked_by_safe_mode": true, "keep": 1},
-            "steamvr": {"ipd": 0.07}
+            "driver_ok": {"blocked_by_safe_mode": false},
+            "steamvr": {"blocked_by_safe_mode": true}
         });
-        reset_safe_mode_blocks(&mut current, &snapshot);
-        assert_eq!(
-            current,
-            json!({
-                "driver_alvr_server": {"blocked_by_safe_mode": true},
-                "driver_a": {"blocked_by_safe_mode": true},
-                "driver_prism": {"keep": 1},
-                "steamvr": {"ipd": 0.07}
-            })
-        );
+        let names = clear_safe_mode_blocks(&mut current);
+        assert_eq!(names, ["driver_alvr_server", "driver_gamepad", "driver_prism"]);
+        assert_eq!(current, json!({"driver_prism": {"keep": 1}, "driver_ok": {"blocked_by_safe_mode": false}, "steamvr": {"blocked_by_safe_mode": true}}));
     }
 }
