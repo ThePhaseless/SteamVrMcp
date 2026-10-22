@@ -836,9 +836,12 @@ impl Stack {
             let args = ButtonArgs { hand: Hand::Right, button: Button::System };
             self.apply(if down { RigAction::PressButton(args) } else { RigAction::ReleaseButton(args) })
         };
-        system(true)?;
+        let pressed = system(true);
         std::thread::sleep(Duration::from_millis(100));
-        system(false)?;
+        // release even after a failed press, so the system button never stays down
+        let released = system(false);
+        pressed?;
+        released?;
         let mut after = Some(true);
         for _ in 0..6 {
             std::thread::sleep(Duration::from_millis(500));
