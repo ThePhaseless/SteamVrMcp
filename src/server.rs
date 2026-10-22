@@ -164,9 +164,14 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. Top-level dashboard_visible says whether SteamVR's dashboard is open (null when unknown: the OpenVR reader is not connected or lacks the interface). The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
-        self.run(|s| json(serde_json::json!({ "checks": s.checks(), "state": s.status() }))).await.map_err(message)
+        self.run(|s| {
+            let dashboard_visible = s.reader_connected().then(|| s.dashboard_visible()).flatten();
+            json(serde_json::json!({ "checks": s.checks(), "state": s.status(), "dashboard_visible": dashboard_visible }))
+        })
+        .await
+        .map_err(message)
     }
 
     #[tool(description = "Take or renew the lease on this machine's SteamVR under a name of your choice. Every tool that changes anything takes it by itself, so call this only to pick the name or the ttl, or to take over a lease that expired after its MCP stopped managing a session. Refuses while another live MCP holds it. Returns the lease.")]
@@ -389,9 +394,14 @@ impl VrServer {
         self.run(move |s| json(s.wait_for_log(args)?)).await.map_err(message)
     }
 
-    #[tool(description = "Launch an app after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version), scene_pid, via and run_log. via \"steam\" (default) starts a Steam app or non-Steam shortcut through Steam; exe, args and env are refused. via \"proton\" runs a Steam app's compatibility tool directly, as Steam would (the app's tool, else Steam's default; through the Steam Linux Runtime when the tool requires it), not for SteamVR itself, with exe (required, relative to the install dir, \\ allowed, must stay inside it), args (passed as given) and env (over the desktop session's, e.g. GPU selection; keys STEAM_COMPAT_*, SteamAppId and SteamGameId are refused, as the MCP sets them). The user's Steam launch options do not apply in proton mode, and Steam shows no dialogs; the launcher's output goes to run_log, and the call fails at once if the launcher exits first. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines. Can take minutes (up to timeouts.app_s, default 180 s).")]
+    #[tool(description = "Launch an app after checking it exists, and return once SteamVR reports its scene running: the app (app_id, game_id, kind, name, compat_tool such as a Proton version), scene_pid, via, run_log and notes (when any). If SteamVR's dashboard is open then, it clicks the right controller's system button once to close it (see close_dashboard). via \"steam\" (default) starts a Steam app or non-Steam shortcut through Steam; exe, args and env are refused. via \"proton\" runs a Steam app's compatibility tool directly, as Steam would (the app's tool, else Steam's default; through the Steam Linux Runtime when the tool requires it), not for SteamVR itself, with exe (required, relative to the install dir, \\ allowed, must stay inside it), args (passed as given) and env (over the desktop session's, e.g. GPU selection; keys STEAM_COMPAT_*, SteamAppId and SteamGameId are refused, as the MCP sets them). The user's Steam launch options do not apply in proton mode, and Steam shows no dialogs; the launcher's output goes to run_log, and the call fails at once if the launcher exits first. Otherwise fails with the reason: a Steam dialog waiting on the desktop, or a timeout with the last vrserver log lines. Can take minutes (up to timeouts.app_s, default 180 s).")]
     async fn launch_app(&self, Parameters(args): Parameters<LaunchArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.launch_app(args)?)).await.map_err(message)
+    }
+
+    #[tool(description = "Close SteamVR's dashboard if it is open: click the right controller's system button once, then wait up to 3 s for it to close. An app started under an open dashboard stays unfocused (OpenXR VISIBLE, not FOCUSED) until then; launch_app does this by itself, so call it after starting a game another way. Never clicks when the dashboard is closed or its state unknown. Returns closed, was_visible (null when unknown) and note; one click only, as a second would reopen it.")]
+    async fn close_dashboard(&self) -> Result<CallToolResult, String> {
+        self.run(|s| json(s.close_dashboard()?)).await.map_err(message)
     }
 
     #[tool(description = "Stop the app: SIGTERM to the scene app SteamVR reports (not SteamVR Home), to the process group of a launch_app via \"proton\", and to every process of this user with the game's STEAM_COMPAT_DATA_PATH and app id (its wine processes); SIGKILL after 15 s. Never signals SteamVR's own processes (app 250820), the MCP's own process group, its ancestors, or pid 0 or 1. Returns stopped_pid (the scene app's, or null) and stopped (every pid and group signalled).")]
@@ -513,13 +523,13 @@ mod tests {
             set_head_pose move_head animate_head set_controller_pose move_controller animate_controller set_controller_state \
             press_button release_button touch_button set_trigger set_grip set_thumbstick set_trackpad \
             set_finger_curl set_hand_mode set_hand_skeleton set_hand_gesture \
-            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app stop_app vr_acquire vr_release \
+            set_playspace recenter run_sequence screenshot get_haptics get_tracked_state launch_app close_dashboard stop_app vr_acquire vr_release \
             read_app_log wait_for_log set_proximity get_frame_timing record_audio audio_level"
             .split_whitespace()
             .map(String::from)
             .collect();
         want.sort();
-        assert_eq!((names.len(), names), (41, want));
+        assert_eq!((names.len(), names), (42, want));
     }
 
     #[test]

@@ -96,7 +96,7 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
         | "animate_controller" | "set_controller_state" | "press_button" | "release_button" | "touch_button"
         | "set_trigger" | "set_grip" | "set_thumbstick" | "set_trackpad" | "set_finger_curl" | "set_hand_mode"
         | "set_hand_skeleton" | "set_hand_gesture" | "run_sequence" | "set_playspace" | "recenter"
-        | "get_haptics" | "set_proximity" => streaming(),
+        | "get_haptics" | "set_proximity" | "close_dashboard" => streaming(),
         "screenshot" => {
             let reasons: Vec<String> = SOURCES.iter().map(|s| source_ready(s, r)).filter_map(Result::err).collect();
             if reasons.len() == SOURCES.len() { Err(reasons.join("; ")) } else { Ok(()) }
@@ -376,6 +376,14 @@ mod tests {
         let r = Readiness { streaming: false, ..all_ready() };
         assert_eq!(tool_ready("set_head_pose", &r), Err("headset is not streaming".to_owned()));
         assert_eq!(tool_ready("set_head_pose", &all_ready()), Ok(()));
+    }
+
+    #[test]
+    fn close_dashboard_needs_streaming_and_the_lease() {
+        let r = Readiness { streaming: false, ..all_ready() };
+        assert_eq!(tool_ready("close_dashboard", &r), Err("headset is not streaming".to_owned()));
+        assert_eq!(tool_ready("close_dashboard", &all_ready()), Ok(()));
+        assert!(tool_ready("close_dashboard", &Readiness { leased_to: Some("x".into()), ..all_ready() }).is_err());
     }
 
     #[test]

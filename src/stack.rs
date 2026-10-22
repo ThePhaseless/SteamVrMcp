@@ -10,7 +10,7 @@ use crate::{
     lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
     proton,
-    rig::{self, AppliedStep, Rig, RigAction, SequenceReport, SequenceStep},
+    rig::{self, AppliedStep, Button, ButtonArgs, Hand, Rig, RigAction, SequenceReport, SequenceStep},
     setup,
     steamvr::{self, STEAMVR_URL, VR_PROCESS_NAMES},
 };
@@ -215,6 +215,27 @@ pub struct AppReport {
     pub via: Via,
     /// The Proton launcher's stdout and stderr; none via Steam.
     pub run_log: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardReport {
+    pub closed: bool,
+    pub was_visible: Option<bool>,
+    pub note: &'static str,
+}
+
+/// Whether to click system, and what to say, from the dashboard state before the click and after
+/// the polls that followed it; a second click would reopen a dashboard that stayed open, so there is only one.
+fn dashboard_outcome(before: Option<bool>, after: Option<bool>) -> (bool, &'static str) {
+    match (before, after) {
+        (Some(true), Some(false)) => (true, "closed the SteamVR dashboard"),
+        (Some(true), Some(true)) => (true, "SteamVR dashboard still open after one system click"),
+        (Some(true), None) => (true, "SteamVR dashboard state unknown after one system click"),
+        (Some(false), _) => (false, "SteamVR dashboard not open, nothing clicked"),
+        (None, _) => (false, "SteamVR dashboard state unknown, nothing clicked"),
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -798,6 +819,38 @@ impl Stack {
         self.read(|vr| Ok(vr.scene_app())).ok()
     }
 
+    /// None when SteamVR is not running, the reader cannot connect or lacks the overlay interface.
+    pub fn dashboard_visible(&self) -> Option<bool> {
+        self.read(|vr| Ok(vr.dashboard_visible())).ok().flatten()
+    }
+
+    /// Clicks the right controller's system button once if SteamVR's dashboard is open, then waits up
+    /// to 3 s for it to close. A game started under an open dashboard stays unfocused until then.
+    pub fn close_dashboard(&self) -> Result<DashboardReport> {
+        let before = self.dashboard_visible();
+        let (click, note) = dashboard_outcome(before, None);
+        if !click {
+            return Ok(DashboardReport { closed: false, was_visible: before, note });
+        }
+        let system = |down| {
+            let args = ButtonArgs { hand: Hand::Right, button: Button::System };
+            self.apply(if down { RigAction::PressButton(args) } else { RigAction::ReleaseButton(args) })
+        };
+        system(true)?;
+        std::thread::sleep(Duration::from_millis(100));
+        system(false)?;
+        let mut after = Some(true);
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(500));
+            after = self.dashboard_visible();
+            if after != Some(true) {
+                break;
+            }
+        }
+        let (_, note) = dashboard_outcome(before, after);
+        Ok(DashboardReport { closed: after == Some(false), was_visible: before, note })
+    }
+
     /// Err when SteamVR is not running, no scene app runs, or the reader cannot connect.
     pub fn frame_stats(&self) -> Result<openvr::FrameStats> {
         self.read(|vr| vr.frame_stats())
@@ -1169,8 +1222,13 @@ impl Stack {
         Ok(report)
     }
 
+    /// Own statement for callers: read() locks the reader again.
+    pub fn reader_connected(&self) -> bool {
+        self.reader.lock().is_some()
+    }
+
     pub fn status(&self) -> StatusReport {
-        let reader_connected = self.reader.lock().is_some(); // own statement: read() locks it again
+        let reader_connected = self.reader_connected();
         let (leaked, last_restart_error) = {
             let state = self.state.lock();
             (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
@@ -1357,7 +1415,14 @@ impl Stack {
                 steamvr::log_tail(steam, "vrserver", 20).join("\n")
             );
         }
-        Ok(AppReport { app, scene_pid, via: a.via, run_log })
+        let mut notes = Vec::new();
+        // a failed click must not fail a launch that already worked
+        match self.close_dashboard() {
+            Ok(d) if d.was_visible == Some(true) => notes.push(d.note.to_owned()),
+            Ok(_) => {}
+            Err(e) => notes.push(format!("dashboard: {e:#}")),
+        }
+        Ok(AppReport { app, scene_pid, via: a.via, run_log, notes })
     }
 
     /// Stops the app: SIGTERM to the scene pid, to the group launch_app started, and to every
@@ -1722,6 +1787,17 @@ fn supervise(stack: Weak<Stack>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_click_decision() {
+        let t = |b, a| dashboard_outcome(b, a);
+        assert_eq!(t(Some(true), Some(false)), (true, "closed the SteamVR dashboard"));
+        assert_eq!(t(Some(true), Some(true)), (true, "SteamVR dashboard still open after one system click"));
+        assert_eq!(t(Some(true), None), (true, "SteamVR dashboard state unknown after one system click"));
+        assert_eq!(t(Some(false), Some(false)), (false, "SteamVR dashboard not open, nothing clicked"));
+        assert_eq!(t(Some(false), Some(true)), (false, "SteamVR dashboard not open, nothing clicked"));
+        assert_eq!(t(None, None), (false, "SteamVR dashboard state unknown, nothing clicked"));
+    }
     use serde_json::json;
 
     #[test]

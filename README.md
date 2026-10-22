@@ -123,6 +123,7 @@ Only `vr_status`, `get_logs`, `vr_acquire` and `vr_release` are always listed. E
 | `set_hand_mode` | Per hand, hold a controller or be a bare tracked hand. |
 | `set_hand_skeleton` | Send raw 26-joint hand data. |
 | `set_hand_gesture` | Pose a hand with a named gesture or custom curls. |
+| `close_dashboard` | Click the right controller's system button once if SteamVR's dashboard is open, which keeps a game unfocused. `launch_app` does it by itself. |
 | `press_button` | Press and hold an Index button. |
 | `release_button` | Release a button. |
 | `touch_button` | Touch or untouch a capacitive sensor. |
@@ -154,6 +155,7 @@ Coordinates are SteamVR standing space (+Y up, -Z forward). Tool arguments use m
 - The first `screenshot {source: "desktop"}` can make the desktop show xdg-desktop-portal's permission prompt. Approve it once. If nobody answers, the call times out and cancels the request.
 - `record_audio` and `audio_level` hear the whole default output, other apps included, not one game. WAV files go to the MCP's private runtime dir, under `audio/`, and stay until logout.
 - SteamVR gives background OpenVR readers no input until the scene app (SteamVR Home) is running. `get_tracked_state` skeletons stay inactive before that.
+- After a SteamVR or Steam restart a launched game can come up with the SteamVR dashboard open, and its OpenXR session stays VISIBLE, not FOCUSED. `launch_app` clicks the right controller's system button once when `vr_status` shows `dashboard_visible: true` (and notes it in `notes`); for a game started another way, call `close_dashboard`.
 - SteamVR reserves the Index system click for its dashboard. System touch reaches apps.
 - Steam can block a launch on a desktop dialog (`ShowInterstitials` or `ShowLaunchOption`, for example "VR Theater Screen" for an app Steam treats as non-VR). `launch_app` and `vr_start` fail fast and name the dialog. Dismiss it on the desktop.
 - A second Steam client running at the same time (Flatpak Steam, for example) can take over Steam's runtime launch service. The Steam that the MCP talks to then stops accepting `steam://` URLs. `vr_start` and `launch_app` fail within 20 s with "Steam did not take ...". Close the other Steam, or start this Steam before it, then restart this Steam.

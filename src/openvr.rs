@@ -180,6 +180,8 @@ pub struct OpenVr {
     apps: *const VR_IVRApplications_FnTable,
     compositor: *const VR_IVRCompositor_FnTable,
     screenshots: *const VR_IVRScreenshots_FnTable,
+    /// Null when vrclient lacks IVROverlay_028, so only dashboard_visible degrades.
+    overlay: *const VR_IVROverlay_FnTable,
     set: VRActionSetHandle_t,
     skeletons: [VRActionHandle_t; 2],
     // shortcut: whether SteamVR delivers these events to a Background app is unverified live, check once and fall back to None
@@ -219,6 +221,7 @@ impl OpenVr {
             apps: ptr::null(),
             compositor: ptr::null(),
             screenshots: ptr::null(),
+            overlay: ptr::null(),
             set: 0,
             skeletons: [0; 2],
             head_proximity: Cell::new(None),
@@ -244,6 +247,7 @@ impl OpenVr {
         self.apps = table(IVRApplications_Version)? as _;
         self.compositor = table(IVRCompositor_Version)? as _;
         self.screenshots = table(IVRScreenshots_Version)? as _;
+        self.overlay = table(IVROverlay_Version).map_or(ptr::null(), |t| t as _);
 
         let dir = state_dir.join("openvr");
         fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
@@ -384,6 +388,11 @@ impl OpenVr {
             _ => "none",
         };
         SceneApp { pid: call!(self.apps, GetCurrentSceneProcessId), state: state.into() }
+    }
+
+    /// Whether SteamVR's dashboard is open; None when the overlay interface is missing.
+    pub fn dashboard_visible(&self) -> Option<bool> {
+        (!self.overlay.is_null()).then(|| call!(self.overlay, IsDashboardVisible))
     }
 
     /// Frame counters of the current scene app since it started.
