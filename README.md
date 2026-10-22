@@ -171,6 +171,7 @@ ALVR's TCP stream socket spins at end of stream on loopback (`sockets/src/stream
 - `vr_stop` usually ends SteamVR with signals, which takes about 30 s.
 - A restart-relevant settings change takes about 80 s.
 - If the MCP exits while the headset streams, vrserver keeps one CPU core busy until SteamVR stops.
+- The virtual headset lives inside the MCP process. When the MCP or the agent session that runs it restarts, a running OpenXR app loses focus (FOCUSED back to SYNCHRONIZED). The next `vr_start` adopts SteamVR and starts a new headset.
 
 This is an upstream ALVR issue that is worth reporting.
 
