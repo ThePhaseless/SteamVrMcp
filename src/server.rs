@@ -184,7 +184,7 @@ impl VrServer {
         self.run(|s| json(serde_json::json!({ "released": s.release_lease()? }))).await.map_err(message)
     }
 
-    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s).")]
+    #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s). The result's dashboard_visible says whether SteamVR's dashboard is open at that moment (null when unknown); SteamVR opens it about 10 s after no scene app runs, so call close_dashboard once your game reaches its scene.")]
     async fn vr_start(&self) -> Result<CallToolResult, String> {
         self.run(|s| json(s.start()?)).await.map_err(message)
     }
@@ -353,7 +353,7 @@ impl VrServer {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
 
-    #[tool(description = "Wait window_s (0.5 to 60, default 5), then report frame timing over it: compositor (SteamVR's GetFrameTimings for frames within window_s of the newest: frames, fps, interval_ms and gpu_ms p50/p95/p99 by nearest rank, dropped, mispresented, reprojected frames), counts (compositor presents, dropped and reprojected frames during the window) and alvr (mean of ALVR's statistics summaries: samples, latencies in ms, client_fps, server_fps, video_mbits_per_sec), t_s and at of the window's end. A part that could not be read is null and its error is in notes. Limit: SteamVR keeps at most 1024 frames.")]
+    #[tool(description = "Wait window_s (0.5 to 60, default 5), then report frame timing over it: compositor (SteamVR's GetFrameTimings for frames within window_s of the newest: frames, fps, interval_ms and gpu_ms p50/p95/p99 by nearest rank, dropped, mispresented, reprojected frames; nominal_hz is the headset's display frequency and throttled is true when fps is under 90% of it, which tells SteamVR throttling to 36/24/18 Hz from a real refresh change; both null when unknown), counts (compositor presents, dropped and reprojected frames during the window) and alvr (mean of ALVR's statistics summaries: samples, latencies in ms, client_fps, server_fps, video_mbits_per_sec), t_s and at of the window's end. A part that could not be read is null and its error is in notes. Limit: SteamVR keeps at most 1024 frames.")]
     async fn get_frame_timing(&self, Parameters(args): Parameters<FrameTimingArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.frame_timing(args.window_s)?)).await.map_err(message)
     }

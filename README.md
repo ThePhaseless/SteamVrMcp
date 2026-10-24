@@ -155,6 +155,7 @@ Coordinates are SteamVR standing space (+Y up, -Z forward). Tool arguments use m
 - The first `screenshot {source: "desktop"}` can make the desktop show xdg-desktop-portal's permission prompt. Approve it once. If nobody answers, the call times out and cancels the request.
 - `record_audio` and `audio_level` hear the whole default output, other apps included, not one game. WAV files go to the MCP's private runtime dir, under `audio/`, and stay until logout.
 - SteamVR gives background OpenVR readers no input until the scene app (SteamVR Home) is running. `get_tracked_state` skeletons stay inactive before that.
+- SteamVR opens its dashboard about 10 s after no scene app runs (`vr_start` reports `dashboard_visible`), so call `close_dashboard` once your game reaches its scene.
 - After a SteamVR or Steam restart a launched game can come up with the SteamVR dashboard open, and its OpenXR session stays VISIBLE, not FOCUSED. `launch_app` clicks the right controller's system button once when `vr_status` shows `dashboard_visible: true` (and notes it in `notes`); for a game started another way, call `close_dashboard`.
 - SteamVR reserves the Index system click for its dashboard. System touch reaches apps.
 - Steam can block a launch on a desktop dialog (`ShowInterstitials` or `ShowLaunchOption`, for example "VR Theater Screen" for an app Steam treats as non-VR). `launch_app` and `vr_start` fail fast and name the dialog. Dismiss it on the desktop.

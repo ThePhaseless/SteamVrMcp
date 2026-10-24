@@ -122,6 +122,15 @@ pub struct CompositorSummary {
     pub dropped: u32,
     pub mispresented: u32,
     pub reprojected: usize,
+    /// The hmd's Prop_DisplayFrequency_Float; filled by the caller, which reads it from the device.
+    pub nominal_hz: Option<f32>,
+    /// fps below 90% of nominal_hz: SteamVR throttling (36/24/18 Hz under load), not a refresh change.
+    pub throttled: Option<bool>,
+}
+
+/// None when the nominal rate is unknown or not positive.
+pub fn throttled(fps: f32, nominal_hz: Option<f32>) -> Option<bool> {
+    nominal_hz.filter(|n| *n > 0.0).map(|n| fps < 0.9 * n)
 }
 
 /// How many frames of SteamVR's history to ask for.
@@ -148,6 +157,8 @@ pub fn summarize(timings: &[FrameTiming], window_s: f64) -> Option<CompositorSum
         dropped: kept.iter().map(|t| t.dropped).sum(),
         mispresented: kept.iter().map(|t| t.mispresented).sum(),
         reprojected: kept.iter().filter(|t| t.reprojected).count(),
+        nominal_hz: None,
+        throttled: None,
     })
 }
 
@@ -395,6 +406,13 @@ impl OpenVr {
         (!self.overlay.is_null()).then(|| call!(self.overlay, IsDashboardVisible))
     }
 
+    /// The hmd's (tracked device 0) display refresh rate; None when the property is unset.
+    pub fn nominal_hz(&self) -> Option<f32> {
+        let mut err = 0;
+        let hz = call!(self.system, GetFloatTrackedDeviceProperty, 0, ETrackedDeviceProperty_Prop_DisplayFrequency_Float, &mut err);
+        (err == 0 && hz > 0.0).then_some(hz)
+    }
+
     /// Frame counters of the current scene app since it started.
     pub fn frame_stats(&self) -> Result<FrameStats> {
         let mut s = unsafe { zeroed::<Compositor_CumulativeStats>() };
@@ -495,6 +513,14 @@ mod tests {
         assert_eq!((s.frames, s.dropped, s.reprojected), (95, 9, 9));
         assert!((s.fps - 90.09).abs() < 0.01, "{}", s.fps);
         assert_eq!((s.gpu_ms.p50, s.gpu_ms.p95, s.gpu_ms.p99), (5.0, 5.0, 5.0));
+    }
+
+    #[test]
+    fn throttled_compares_fps_to_nominal() {
+        assert_eq!(throttled(36.0, Some(90.0)), Some(true));
+        assert_eq!(throttled(89.0, Some(90.0)), Some(false));
+        assert_eq!(throttled(36.0, None), None);
+        assert_eq!(throttled(36.0, Some(0.0)), None);
     }
 
     #[test]

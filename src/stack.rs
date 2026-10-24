@@ -116,6 +116,8 @@ pub struct StartReport {
     pub view_resolution: [u32; 2],
     pub fps: f32,
     pub codec: Option<String>,
+    /// Whether SteamVR's dashboard is open when vr_start returns; null when unknown.
+    pub dashboard_visible: Option<bool>,
     pub notes: Vec<String>,
 }
 
@@ -924,8 +926,8 @@ impl Stack {
                 "reprojected": b.reprojected.saturating_sub(a.reprojected),
             })
         });
-        let compositor = match self.read(|vr| vr.frame_timings()) {
-            Ok(t) => openvr::summarize(&t, window_s),
+        let compositor = match self.read(|vr| Ok((vr.frame_timings()?, vr.nominal_hz()))) {
+            Ok((t, hz)) => openvr::summarize(&t, window_s).map(|c| openvr::CompositorSummary { nominal_hz: hz, throttled: openvr::throttled(c.fps, hz), ..c }),
             Err(e) => {
                 notes.push(format!("compositor: {e:#}"));
                 None
@@ -1022,7 +1024,7 @@ impl Stack {
                 bail!("{e:#}; run vr_stop to free SteamVR");
             }
         }
-        started
+        started.map(|report| StartReport { dashboard_visible: self.dashboard_visible(), ..report })
     }
 
     fn start_inner(&self) -> Result<StartReport> {
@@ -1832,6 +1834,13 @@ mod tests {
         assert_eq!((parsed.via, parsed.exe, parsed.args.len(), parsed.env.len()), (Via::Steam, None, 0, 0));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1", "via": "proton", "exe": "a.exe"})).unwrap();
         assert_eq!(parsed.via, Via::Proton);
+    }
+
+    #[test]
+    fn start_report_serializes_unknown_dashboard_as_null() {
+        let v = serde_json::to_value(StartReport::default()).unwrap();
+        assert_eq!(v["dashboard_visible"], serde_json::Value::Null);
+        assert!(v.as_object().unwrap().contains_key("dashboard_visible"));
     }
 
     #[test]
