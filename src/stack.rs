@@ -168,6 +168,22 @@ fn client_stuck(session: &SessionConfig, hostname: &str) -> bool {
     session.client_connections.get(hostname).is_some_and(|c| c.connection_state != ConnectionState::Disconnected)
 }
 
+/// client_stuck on the session file, which ALVR saves on every client state change (server_io
+/// update_client_connections): read without the API, which a stuck ALVR may not answer. False when unreadable.
+fn stuck_in_session_file(session_file: &Path, hostname: &str) -> bool {
+    let mut session = SessionConfig::default();
+    if let Some(json) = std::fs::read_to_string(session_file).ok().and_then(|t| serde_json::from_str(&t).ok()) {
+        session.merge_from_json(&json).ok();
+    }
+    client_stuck(&session, hostname)
+}
+
+/// Whether `e` holds a socket read that timed out: ALVR took the request and never answered.
+fn timed_out(e: &alvr_common::anyhow::Error) -> bool {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).any(|e| matches!(e.kind(), WouldBlock | TimedOut))
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct StartReport {
     pub already_streaming: bool,
@@ -1317,7 +1333,7 @@ impl Stack {
             let restarts = self.begin_managing(epoch)?; // a stream the MCP left unmanaged gets its supervisor back
             return Ok(StartReport { already_streaming: true, restarts, view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report });
         }
-        self.paths().session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
+        let session_file = self.paths().session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
 
         if !self.cfg().steam.env.is_empty() && !steamvr::is_steamvr_running() && steamvr::is_steam_running() {
             // shortcut: unreadable environ (other user, hidepid) skips the check, fail late as before
@@ -1346,7 +1362,6 @@ impl Stack {
         self.check_stop(epoch)?;
         let hostname = headset::client_hostname()?;
         let values = setup::session_values(&self.cfg())?;
-        let mut restart_adopted = false;
         if !steamvr_running {
             foreign_alvr_guard(false, || self.api().ping(), self.api().port)?;
             if steamvr::has_leftovers(&self.vr.alive()) && !self.vr.kill() {
@@ -1369,24 +1384,25 @@ impl Stack {
             self.check_stop(epoch)?;
             self.check_version()?;
             setup::snapshot(&self.paths())?;
-            self.api().post_json("/api/session/values", &values)?;
-            for action in setup::client_actions() {
-                self.api().post_json("/api/session/client-connections", &(&hostname, action))?;
-            }
             report.adopted = true;
-            // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
-            restart_adopted = client_stuck(&self.session()?, &hostname);
+            // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting, and
+            // such a server may never answer a write, so decide before any POST; drop when fixed upstream
+            let stuck = stuck_in_session_file(&session_file, &hostname);
+            if stuck {
+                self.restart_adopted(epoch, &no_restart, left())?;
+            }
+            match self.adopt_posts(&values, &hostname) {
+                // a POST ALVR took and never answered: stuck too, so restart it and post once more to the fresh ALVR
+                Err(e) if !stuck && timed_out(&e) => {
+                    warn!("{e:#}; restarting the adopted SteamVR");
+                    self.restart_adopted(epoch, &no_restart, left())?;
+                    self.adopt_posts(&values, &hostname)?;
+                }
+                posted => posted?,
+            }
         }
 
-        {
-            let mut state = self.state.lock();
-            if state.stops != epoch {
-                bail!("failed: vr_stop ended the session");
-            }
-            if state.dashboard.is_none() {
-                state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths().runtime_dir)?);
-            }
-        }
+        self.ensure_dashboard(epoch)?;
         let paths = self.paths();
         let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
@@ -1401,9 +1417,6 @@ impl Stack {
 
         self.begin_managing(epoch).map_err(|_| self.stopped_start(launched))?;
         drop(no_restart);
-        if restart_adopted {
-            self.restart_within(false, left())?;
-        }
         let stopped = || self.check_stop(epoch).is_err();
         let (mut seen, mut exited) = (Vec::new(), None);
         let answered = || {
@@ -1458,6 +1471,35 @@ impl Stack {
         }
         report.restarts = self.state.lock().restarts;
         Ok(StartReport { view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report })
+    }
+
+    /// Spawns the alvr_dashboard child unless one runs: ALVR creates the headset at SteamVR start only while it exists.
+    fn ensure_dashboard(&self, epoch: u64) -> Result<()> {
+        let mut state = self.state.lock();
+        if state.stops != epoch {
+            bail!("failed: vr_stop ended the session");
+        }
+        if state.dashboard.is_none() {
+            state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths().runtime_dir)?);
+        }
+        Ok(())
+    }
+
+    /// An adopt's writes to ALVR: vr_start's session values and the headset's client entry.
+    fn adopt_posts(&self, values: &[PathValuePair], hostname: &str) -> Result<()> {
+        self.api().post_json("/api/session/values", &values)?;
+        for action in setup::client_actions() {
+            self.api().post_json("/api/session/client-connections", &(hostname, action))?;
+        }
+        Ok(())
+    }
+
+    /// Restarts an adopted SteamVR whose ALVR is stuck, keeping vr_start's `held` restarting guard. The
+    /// session is handed to the supervisor first: a restart runs only while one is managed.
+    fn restart_adopted(&self, epoch: u64, held: &alvr_common::parking_lot::MutexGuard<'_, ()>, timeout: Duration) -> Result<()> {
+        self.ensure_dashboard(epoch)?;
+        self.begin_managing(epoch)?;
+        self.restart_locked(held, false, timeout)
     }
 
     pub fn stop(&self) -> Result<StopReport> {
@@ -1904,7 +1946,12 @@ impl Stack {
 
     /// restart_steamvr with up to `timeout` for ALVR to come back.
     fn restart_within(&self, fresh_headset: bool, timeout: Duration) -> Result<()> {
-        let _restart = self.restarting.lock();
+        let held = self.restarting.lock();
+        self.restart_locked(&held, fresh_headset, timeout)
+    }
+
+    /// restart_within for a caller that holds `restarting` (`_held`).
+    fn restart_locked(&self, _held: &alvr_common::parking_lot::MutexGuard<'_, ()>, fresh_headset: bool, timeout: Duration) -> Result<()> {
         if !self.state.lock().managing {
             bail!("SteamVR is being stopped; no restart");
         }
@@ -2646,6 +2693,38 @@ mod tests {
         assert!(!client_stuck(&session, "h"));
         session.client_connections.insert("h".into(), entry(ConnectionState::Disconnecting));
         assert!(client_stuck(&session, "h"));
+    }
+
+    #[test]
+    fn adoption_reads_a_stuck_entry_from_the_session_file() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-session-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("session.json");
+        // as ALVR saves it, cut to the part read here
+        let session = |state: &str| {
+            let entry = json!({ "display_name": "Unknown", "current_ip": "127.0.0.1", "manual_ips": ["127.0.0.1"], "trusted": true, "connection_state": state });
+            std::fs::write(&file, json!({ "client_connections": { "h": entry } }).to_string()).unwrap();
+        };
+        session("Disconnecting");
+        assert!(stuck_in_session_file(&file, "h"), "a dead client's EOF spin left it Disconnecting");
+        assert!(!stuck_in_session_file(&file, "other"), "no entry for this headset");
+        session("Streaming");
+        assert!(stuck_in_session_file(&file, "h"), "only a Disconnected entry is connected to again");
+        session("Disconnected");
+        assert!(!stuck_in_session_file(&file, "h"));
+        std::fs::write(&file, "not json").unwrap();
+        assert!(!stuck_in_session_file(&file, "h"), "unreadable: the POSTs decide");
+        assert!(!stuck_in_session_file(&dir.join("missing.json"), "h"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unanswered_adopt_post_counts_as_stuck() {
+        let read = |kind| alvr_common::anyhow::Error::from(std::io::Error::from(kind)).context("POST /api/session/values");
+        assert!(timed_out(&read(std::io::ErrorKind::WouldBlock)), "SO_RCVTIMEO: os error 11");
+        assert!(timed_out(&read(std::io::ErrorKind::TimedOut)));
+        assert!(!timed_out(&read(std::io::ErrorKind::ConnectionRefused)), "ALVR not up: no restart helps");
+        assert!(!timed_out(&anyhow!("POST /api/session/values: HTTP/1.1 400 Bad Request: x")), "ALVR answered");
     }
 
     #[test]
