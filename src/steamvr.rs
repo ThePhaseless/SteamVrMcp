@@ -613,6 +613,9 @@ pub fn steam_env(host: impl IntoIterator<Item = (OsString, OsString)>, extra: &B
 /// Runs `steam <url>` with only the desktop-session environment. Only when Steam is not running yet
 /// does it get `steam.env` and `steam.args`, because a running Steam just forwards the URL. True if this started Steam.
 pub fn launch(cfg: &Config, url: &str) -> Result<bool> {
+    if cfg!(test) {
+        bail!("unit tests never run steam"); // it would start or shut down the user's Steam and SteamVR
+    }
     let start_steam = !is_steam_running();
     let no_extra = BTreeMap::new();
     let mut command = Command::new("steam");
@@ -702,8 +705,12 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, procs: &VrProcs, 
     // blocked, so log it and relaunch anyway
     setup::undo_safe_mode_blocks(paths).map_err(|e| error!("{e:#}")).ok();
     setup::unblock_safe_mode(&vrsettings)?;
+    if stopped() {
+        bail!("failed: vr_stop ended the SteamVR restart");
+    }
     let log_from = paths.steam_dir.as_deref().map_or(0, console_log_len);
     *started_steam = launch(cfg, STEAMVR_URL)?;
+    let launched = Instant::now();
     let handed = (!*started_steam).then_some(STEAMVR_URL);
     // the old server can still answer ping while it hangs in shutdown
     let (mut seen, mut exited) = (Vec::new(), None);
@@ -715,6 +722,7 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, procs: &VrProcs, 
         bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", cfg.timeouts.streaming_s);
     }
     if stopped() {
+        procs.settle(launched); // the stop waiting for this restart then finds the SteamVR Steam starts
         bail!("failed: vr_stop ended the SteamVR restart");
     }
     if let Some(name) = exited {
@@ -1070,5 +1078,17 @@ mod tests {
         assert_eq!(env_mismatches(b"A=1\0B=9\0C=3", &want), ["B=2 but has 9"]);
         // a non-UTF-8 entry elsewhere must not hide a match or a mismatch
         assert_eq!(env_mismatches(b"JUNK=\xff\xfe\0A=1\0B=2\0C=0", &want), ["C=3 but has 0"]);
+    }
+
+    #[test]
+    fn a_restart_that_vr_stop_ended_never_relaunches() {
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-steamvr-restart-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(root.join("steam/config")).unwrap();
+        fs::write(root.join("steam/config/steamvr.vrsettings"), "{}").unwrap();
+        let paths = Paths { steam_dir: Some(root.join("steam")), flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
+        let e = restart_steamvr(&Config::default(), &paths, &Api { port: 1 }, &VrProcs::NONE, || true, &mut false).unwrap_err();
+        assert_eq!(e.to_string(), "failed: vr_stop ended the SteamVR restart", "stopped before launch(), which unit tests refuse");
+        fs::remove_dir_all(&root).ok();
     }
 }

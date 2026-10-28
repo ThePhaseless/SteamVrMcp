@@ -1651,14 +1651,25 @@ impl Stack {
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
         let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), &self.vr, stopped, &mut started_steam);
-        let headset = headset.inspect(Headset::resume).unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
-        let spare = {
+        // after a vr_stop no client comes back: the stop waiting for this restart would have to dispose it
+        let managing = self.state.lock().managing;
+        let headset = match headset_step(managing, headset.is_some()) {
+            HeadsetStep::Resume => headset.inspect(Headset::resume),
+            HeadsetStep::StartNew => Some(Headset::start(Arc::clone(&self.rig))),
+            HeadsetStep::Skip => {
+                if let Some(h) = headset {
+                    self.dispose(h);
+                }
+                None
+            }
+        };
+        let spare = headset.and_then(|headset| {
             let mut state = self.state.lock();
             match state.headset {
                 None => state.headset.replace(headset),
                 Some(_) => Some(headset), // start() made one meanwhile; ours goes, outside the lock
             }
-        };
+        });
         if let Some(h) = spare {
             self.dispose(h);
         }
