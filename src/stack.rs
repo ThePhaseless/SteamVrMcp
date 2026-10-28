@@ -603,6 +603,8 @@ pub struct Stack {
     restarting: Mutex<()>,
     /// Held for a whole vr_start, so a second one refuses.
     starting: Mutex<()>,
+    /// Held while vr_stop or a SteamVR restart takes SteamVR down, so read() does not reconnect to a vrserver going away.
+    vr_down: Mutex<()>,
     /// Results of the last startup checks.
     checks: Mutex<Vec<Check>>,
     /// config.toml's text when it was last read, so vr_status notices an edit.
@@ -703,6 +705,7 @@ impl Stack {
             state: Mutex::default(),
             restarting: Mutex::new(()),
             starting: Mutex::new(()),
+            vr_down: Mutex::new(()),
             checks: Mutex::default(),
             config_text: Mutex::new(Config::text()),
             reader: Mutex::new(None),
@@ -1166,7 +1169,7 @@ impl Stack {
         let mut slot = self.reader.lock();
         // the reader was dropped for a vrserver that is going away; do not reconnect to it. Checked with
         // the slot held: a stop or restart that begins later drops the reader only after this read
-        if self.restarting.is_locked() {
+        if self.vr_down.is_locked() {
             bail!("SteamVR is stopping or restarting");
         }
         let vrserver = steamvr::pids_named("vrserver").first().copied();
@@ -1468,6 +1471,7 @@ impl Stack {
         // an in-flight vr_start bails at its next check; what it left (headset, dashboard, the SteamVR it launched) goes below
         let _no_start = self.starting.lock();
         let _no_restart = self.restarting.lock();
+        let _vr_down = self.vr_down.lock();
         self.drop_reader();
         // a game spawned by the MCP may not quit with SteamVR, and its wineserver blocks the next proton launch
         let mut report = StopReport { stopped_app: self.stop_launched(), ..Default::default() };
@@ -1904,6 +1908,7 @@ impl Stack {
             self.dispose(old); // the old client must stop listening on 9943 before the new one starts
         }
         let headset = taken.and_then(|h| self.paused(h));
+        let _vr_down = self.vr_down.lock();
         self.drop_reader();
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
@@ -2682,6 +2687,17 @@ mod tests {
         assert!(stack.launch_app(a).unwrap_err().to_string().contains("wedged"), "fails at once, not at its deadline"); // test_stack has no Steam: never launches
         stack.openvr_calls.fetch_sub(1, SeqCst); // the stuck call returned after all
         assert!(!stack.read(|_| Ok(())).unwrap_err().to_string().contains("wedged"));
+    }
+
+    #[test]
+    fn reads_refuse_only_while_steamvr_is_taken_down() {
+        let stack = test_stack();
+        let restarting = stack.restarting.lock(); // as vr_start's adopt setup and set_alvr_settings' apply hold it
+        let e = stack.read(|_| Ok(())).unwrap_err().to_string();
+        assert!(!e.contains("stopping or restarting"), "{e}");
+        drop(restarting);
+        let _down = stack.vr_down.lock(); // as vr_stop and restart_within hold it around drop_reader
+        assert_eq!(stack.read(|_| Ok(())).unwrap_err().to_string(), "SteamVR is stopping or restarting");
     }
 
     #[test]
