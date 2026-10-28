@@ -632,10 +632,10 @@ impl Stack {
 
     /// The kept check results plus the runtime state, read now.
     pub fn readiness(&self) -> Readiness {
-        let (streaming, ours_running) = {
+        let (streaming, ours_running, launched) = {
             let state = self.state.lock();
             let streaming = state.headset.as_ref().is_some_and(|h| h.status().streaming);
-            (streaming, state.managing || state.headset.is_some() || state.dashboard.is_some() || state.started_steam)
+            (streaming, state.managing || state.headset.is_some() || state.dashboard.is_some() || state.started_steam, state.launched.is_some())
         };
         let steamvr_running = steamvr::is_steamvr_running();
         let alvr_api = self.api().ping();
@@ -649,6 +649,7 @@ impl Stack {
             leased_to: lease::blocking(lease::read(&self.paths().runtime_dir).as_ref(), std::process::id(), SystemTime::now(), lease::alive)
                 .map(lease::holder_text),
             app_logs: !self.cfg.lock().app_logs.is_empty(),
+            launched,
         }
     }
 
