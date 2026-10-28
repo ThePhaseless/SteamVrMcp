@@ -434,6 +434,26 @@ impl VrServer {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
+    /// `not ready: <reason>` when `tool` may not run now; otherwise takes the lease for a mutating tool.
+    async fn refusal(&self, tool: &str) -> Result<Option<String>, ErrorData> {
+        // at each vr_start config.toml is re-read (applied while nothing runs) and the static checks run
+        // again, so a fixed problem does not need an MCP restart
+        let r = self.readiness(tool == "vr_start").await?;
+        if let Err(reason) = checks::tool_ready(tool, &r) {
+            return Ok(Some(format!("not ready: {reason}")));
+        }
+        if !checks::READ_ONLY.contains(&tool) {
+            let stack = Arc::clone(&self.stack);
+            let claimed = tokio::task::spawn_blocking(move || stack.claim())
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            if let Err(e) = claimed {
+                return Ok(Some(format!("not ready: {e:#}")));
+            }
+        }
+        Ok(None)
+    }
+
     /// Makes the watcher thread send `notifications/tools/list_changed` through `notify`.
     fn forward_changes<F: Future<Output = ()> + Send + 'static>(&self, notify: impl Fn() -> F + Send + Sync + 'static) {
         let runtime = tokio::runtime::Handle::current();
@@ -492,20 +512,8 @@ impl ServerHandler for VrServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        // at each vr_start config.toml is re-read (applied while nothing runs) and the static checks run
-        // again, so a fixed problem does not need an MCP restart
-        let r = self.readiness(request.name == "vr_start").await?;
-        if let Err(reason) = checks::tool_ready(&request.name, &r) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {reason}"))]).into());
-        }
-        if !checks::READ_ONLY.contains(&&*request.name) {
-            let stack = Arc::clone(&self.stack);
-            let claimed = tokio::task::spawn_blocking(move || stack.claim())
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            if let Err(e) = claimed {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {e:#}"))]).into());
-            }
+        if let Some(refused) = self.refusal(&request.name).await? {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(refused)]).into());
         }
         self.router.call(ToolCallContext::new(self, request, context)).await
     }
@@ -535,6 +543,24 @@ mod tests {
             .collect();
         want.sort();
         assert_eq!((names.len(), names), (42, want));
+    }
+
+    #[tokio::test]
+    async fn a_foreign_live_lease_refuses_mutating_calls_only() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-server-lease-{}", std::process::id()));
+        crate::steamvr::private_dir(&dir).unwrap();
+        let other = crate::lease::Lease {
+            owner: "other agent".into(),
+            pid: std::os::unix::process::parent_id(), // alive, and not us
+            expires_at: crate::clock::rfc3339(std::time::SystemTime::now() + std::time::Duration::from_secs(600)),
+        };
+        std::fs::write(dir.join("owner.json"), serde_json::to_vec(&other).unwrap()).unwrap();
+        let server = VrServer::new(Stack::for_tests(dir.clone()));
+        let refused = server.refusal("vr_stop").await.unwrap().unwrap_or_default();
+        assert!(refused.starts_with("not ready: ") && refused.contains("leased to other agent"), "{refused}");
+        assert_eq!(server.refusal("vr_status").await.unwrap(), None, "read-only tools stay open");
+        assert_eq!(crate::lease::read(&dir), Some(other), "the holder's lease is untouched");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

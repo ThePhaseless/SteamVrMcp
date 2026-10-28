@@ -578,6 +578,15 @@ impl Stack {
         stack
     }
 
+    /// A stack with no Steam, its lease in `runtime_dir`, and an API port no live ALVR answers on.
+    #[cfg(test)]
+    pub(crate) fn for_tests(runtime_dir: PathBuf) -> Arc<Stack> {
+        let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: "/nonexistent".into(), runtime_dir };
+        let stack = Stack::new(Config::default(), paths);
+        *stack.api.lock() = Api { port: 1 };
+        stack
+    }
+
     fn cfg(&self) -> Config {
         self.cfg.lock().clone()
     }
