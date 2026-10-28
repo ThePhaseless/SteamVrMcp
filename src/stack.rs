@@ -683,8 +683,11 @@ impl Stack {
         stack.run_checks();
         let weak = Arc::downgrade(&stack);
         thread::spawn(move || supervise(weak));
-        let weak = Arc::downgrade(&stack);
-        thread::spawn(move || watch(weak));
+        // a test drives the watcher's parts itself: on its own it ends a test's managed session once no SteamVR runs
+        if !cfg!(test) {
+            let weak = Arc::downgrade(&stack);
+            thread::spawn(move || watch(weak));
+        }
         stack
     }
 
@@ -1415,7 +1418,8 @@ impl Stack {
             let state = self.state.lock();
             state.managing || state.started_steam
         };
-        stop_guard(steamvr::is_steamvr_running(), || ours || self.api().ping() || steamvr::vrserver_has_alvr())?;
+        // the Stack's VrProcs: a unit test never sees the user's SteamVR
+        stop_guard(self.vr.vrserver_running(), || ours || self.api().ping() || steamvr::vrserver_has_alvr())?;
         {
             let mut state = self.state.lock();
             state.managing = false;
@@ -2508,6 +2512,7 @@ mod tests {
         assert_eq!(stop_guard(true, || false).unwrap_err().to_string(), "SteamVR is running without ALVR; close it yourself");
         assert!(stop_guard(true, || true).is_ok());
         assert!(stop_guard(false, || panic!("not asked while SteamVR is down")).is_ok());
+        assert!(!steamvr::VrProcs::NONE.vrserver_running(), "a test stack's stop never sees the user's vrserver");
     }
 
     #[test]
