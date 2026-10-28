@@ -2310,7 +2310,7 @@ mod tests {
 
     #[test]
     fn vr_release_refuses_while_this_mcp_runs_a_session() {
-        let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-release-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-vr-release-{}", std::process::id()));
         let stack = test_stack();
         stack.paths.lock().runtime_dir = dir.clone();
         *stack.api.lock() = Api { port: 1 }; // the supervisor runs while managing: keep it off a live ALVR
