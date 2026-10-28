@@ -1,7 +1,7 @@
 use crate::{alvr_api::Api, config::{Config, Paths}, setup};
 use alvr_common::{
     anyhow::{Context, Result, bail},
-    error,
+    error, warn,
 };
 use serde::Serialize;
 use std::{
@@ -59,6 +59,28 @@ pub fn running<'a>(names: &[&'a str]) -> Vec<&'a str> {
 /// `/proc/<pid>/comm`: the process name.
 pub fn comm(pid: u32) -> Option<String> {
     Some(fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim_end().to_owned())
+}
+
+/// The state letter and start time of `pid`, from `/proc/<pid>/stat`.
+pub fn stat(pid: u32) -> Option<(char, u64)> {
+    parse_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The state letter (field 3) and start time in clock ticks (field 22); the comm before them may hold spaces and parens.
+fn parse_stat(stat: &str) -> Option<(char, u64)> {
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    Some((state, fields.nth(18)?.parse().ok()?))
+}
+
+/// Every SteamVR process as (pid, start time), so a later check finds it whatever its comm becomes.
+pub fn vr_snapshot() -> Vec<(u32, u64)> {
+    VR_PROCESS_NAMES.iter().flat_map(|n| pids_named(n)).filter_map(|pid| Some((pid, stat(pid)?.1))).collect()
+}
+
+/// The `snapshot` pids still the same process (start time) and not a zombie, whatever their name now.
+pub fn survivors(snapshot: &[(u32, u64)], stat: impl Fn(u32) -> Option<(char, u64)>) -> Vec<u32> {
+    snapshot.iter().filter(|&&(pid, start)| stat(pid).is_some_and(|(state, t)| t == start && state != 'Z')).map(|&(pid, _)| pid).collect()
 }
 
 pub fn exe_of(pid: u32) -> Option<PathBuf> {
@@ -123,22 +145,39 @@ pub fn wait_gone(names: &[&str], timeout: Duration) -> bool {
     wait_for(timeout, || running(names).is_empty())
 }
 
-/// The first key seen on an earlier poll that is no longer `alive`. `seen` carries the keys across
-/// polls; `appeared` adds this poll's.
-pub fn gone_after_seen<K: Copy + PartialEq>(seen: &mut Vec<K>, appeared: impl IntoIterator<Item = K>, alive: impl Fn(K) -> bool) -> Option<K> {
+/// The first key seen on an earlier poll that has not been `alive` for `grace` up to `now`. `seen` carries
+/// the keys and since when each is missing across polls; `appeared` adds this poll's.
+pub fn gone_after_seen<K: Copy + PartialEq>(
+    seen: &mut Vec<(K, Option<Instant>)>, appeared: impl IntoIterator<Item = K>, alive: impl Fn(K) -> bool, now: Instant, grace: Duration,
+) -> Option<K> {
     for k in appeared {
-        if !seen.contains(&k) {
-            seen.push(k);
+        if !seen.iter().any(|&(s, _)| s == k) {
+            seen.push((k, None));
         }
     }
-    seen.iter().copied().find(|&k| !alive(k))
+    for (k, missing) in seen.iter_mut() {
+        *missing = if alive(*k) { None } else { missing.or(Some(now)) };
+    }
+    seen.iter().find(|(_, m)| m.is_some_and(|t| now.duration_since(t) >= grace)).map(|&(k, _)| k)
 }
 
-/// vrserver or vrmonitor once it ran during this wait (`seen`) and is gone: SteamVR quit or crashed.
-pub fn vr_exited(seen: &mut Vec<&'static str>) -> Option<&'static str> {
+/// How long vrserver or vrmonitor stays gone before it counts as exited: a relaunching vrserver leaves a ~0.2 s gap.
+pub const VR_EXIT_GRACE: Duration = Duration::from_secs(3);
+
+/// vrserver or vrmonitor once it ran during this wait (`seen`) and stayed gone for VR_EXIT_GRACE: SteamVR quit or crashed.
+pub fn vr_exited(seen: &mut Vec<(&'static str, Option<Instant>)>) -> Option<&'static str> {
     // one /proc pass for both names: this runs on every poll of a minutes-long wait
     let up = running(&["vrserver", "vrmonitor"]);
-    gone_after_seen(seen, up.iter().copied(), |n| up.contains(&n))
+    let gone = gone_after_seen(seen, up.iter().copied(), |n| up.contains(&n), Instant::now(), VR_EXIT_GRACE);
+    if let Some(name) = gone {
+        // names the mechanism next time: what of SteamVR still runs, under which comm and state
+        let left: Vec<_> = proc_pids()
+            .filter(|p| fs::read(format!("/proc/{p}/cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains("SteamVR/bin")))
+            .map(|p| (p, comm(p).unwrap_or_default(), stat(p).map(|(state, _)| state)))
+            .collect();
+        warn!("{name} gone for {} s; SteamVR/bin processes (pid, comm, state): {left:?}", VR_EXIT_GRACE.as_secs());
+    }
+    gone
 }
 
 /// `pid` as kill() takes it, when that names one process the MCP may signal: 0 and anything above
@@ -654,14 +693,48 @@ mod tests {
 
     #[test]
     fn a_process_seen_then_gone_ends_the_wait() {
+        let (now, no_grace) = (Instant::now(), Duration::ZERO);
         let mut seen = Vec::new();
-        assert_eq!(gone_after_seen(&mut seen, [], |_: &str| false), None, "never seen: still starting");
-        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor"], |n| n == "vrmonitor"), None);
-        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor", "vrserver"], |_| true), None);
-        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor"], |n| n == "vrmonitor"), Some("vrserver"));
+        assert_eq!(gone_after_seen(&mut seen, [], |_: &str| false, now, no_grace), None, "never seen: still starting");
+        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor"], |n| n == "vrmonitor", now, no_grace), None);
+        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor", "vrserver"], |_| true, now, no_grace), None);
+        assert_eq!(gone_after_seen(&mut seen, ["vrmonitor"], |n| n == "vrmonitor", now, no_grace), Some("vrserver"));
         let mut pids = Vec::new();
-        assert_eq!(gone_after_seen(&mut pids, Some(42), |_| true), None);
-        assert_eq!(gone_after_seen(&mut pids, None, |p| p != 42), Some(42), "the scene pid went away while the scene showed none");
+        assert_eq!(gone_after_seen(&mut pids, Some(42), |_| true, now, no_grace), None);
+        assert_eq!(gone_after_seen(&mut pids, None, |p| p != 42, now, no_grace), Some(42), "the scene pid went away while the scene showed none");
+    }
+
+    #[test]
+    fn a_brief_gap_does_not_end_the_wait() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut seen = Vec::new();
+        assert_eq!(gone_after_seen(&mut seen, ["vrserver"], |_| true, at(0), VR_EXIT_GRACE), None);
+        assert_eq!(gone_after_seen(&mut seen, [], |_| false, at(100), VR_EXIT_GRACE), None, "vrserver relaunching: a new pid follows within 0.2 s");
+        assert_eq!(gone_after_seen(&mut seen, ["vrserver"], |_| true, at(300), VR_EXIT_GRACE), None);
+        assert_eq!(gone_after_seen(&mut seen, [], |_| false, at(3200), VR_EXIT_GRACE), None, "the gap starts over after vrserver came back");
+        assert_eq!(gone_after_seen(&mut seen, [], |_| false, at(6100), VR_EXIT_GRACE), None);
+        assert_eq!(gone_after_seen(&mut seen, [], |_| false, at(6200), VR_EXIT_GRACE), Some("vrserver"), "gone for the whole grace");
+    }
+
+    #[test]
+    fn stat_reads_state_and_start_time_past_the_comm() {
+        let stat = "4242 (vr server) (x)) S 1 4242 4242 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 12 0 987654 123456789 2000 18446744073709551615";
+        assert_eq!(parse_stat(stat), Some(('S', 987654)));
+        assert_eq!(parse_stat("7 (vrserver) Z 1 7"), None, "truncated");
+        assert_eq!(parse_stat(""), None);
+    }
+
+    #[test]
+    fn survivors_are_the_same_live_processes_whatever_their_name() {
+        let stat = |pid| match pid {
+            1 => Some(('S', 100)), // renamed itself, still running: pids_named misses it
+            2 => Some(('Z', 200)), // exited, not yet reaped
+            3 => Some(('R', 999)), // the pid now names another process
+            _ => None,             // gone
+        };
+        assert_eq!(survivors(&[(1, 100), (2, 200), (3, 300), (4, 400)], stat), [1]);
+        assert!(survivors(&[], stat).is_empty());
     }
 
     #[test]

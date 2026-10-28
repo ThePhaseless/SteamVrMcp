@@ -1191,14 +1191,22 @@ impl Stack {
         if let Some(h) = headset {
             self.dispose(h);
         }
+        // by pid: the name checks below missed a vrserver that lived on 30 s and needed SIGKILL
+        let snapshot = steamvr::vr_snapshot();
         if self.api().ping() {
             // on failure the signals below still stop SteamVR
             self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
-        let gone = steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) || {
+        let mut gone = steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) || {
             report.used_signals = true;
             steamvr::kill_vr_processes()
         };
+        let survivors = || steamvr::survivors(&snapshot, steamvr::stat);
+        if !survivors().is_empty() {
+            report.used_signals = true;
+            survivors().into_iter().for_each(|pid| steamvr::terminate(pid, libc::SIGKILL));
+            gone = steamvr::wait_for(steamvr::KILL_WAIT, || survivors().is_empty()) && gone;
+        }
         if gone {
             // SteamVR has exited, so it no longer rewrites the file
             setup::undo_safe_mode_blocks(&self.paths()).map_err(|e| error!("{e:#}")).ok();
@@ -1222,6 +1230,7 @@ impl Stack {
             .iter()
             .filter(|n| !steamvr::pids_named(n).is_empty())
             .map(|n| n.to_string())
+            .chain(survivors().into_iter().map(|pid| format!("pid {pid} ({})", steamvr::comm(pid).unwrap_or_default())))
             .collect();
         self.release_if_clean(&report);
         Ok(report)
@@ -1283,7 +1292,7 @@ impl Stack {
     }
 
     /// steamvr::vr_exited, except during a SteamVR restart, which stops SteamVR on purpose: it starts the watch over.
-    fn vr_exited(&self, seen: &mut Vec<&'static str>) -> Option<&'static str> {
+    fn vr_exited(&self, seen: &mut Vec<(&'static str, Option<Instant>)>) -> Option<&'static str> {
         if self.restarting.is_locked() {
             seen.clear();
             return None;
@@ -1397,7 +1406,7 @@ impl Stack {
             scene_pid = pid.filter(|_| scene.as_ref().is_some_and(|a| a.state == "running")).unwrap_or(0);
             // a new scene pid, in any state, whose process is gone again: the game quit or crashed
             // shortcut: a scene pid that hands off to a child process reads as a crash, ignore an exit while a new scene pid follows within a grace if a game does this
-            scene_exited = steamvr::gone_after_seen(&mut seen, pid, |p| steamvr::comm(p).is_some());
+            scene_exited = steamvr::gone_after_seen(&mut seen, pid, |p| steamvr::comm(p).is_some(), Instant::now(), Duration::ZERO);
             scene_pid != 0 || launcher_exited().is_some() || scene_exited.is_some()
         };
         let running = match a.via {
@@ -2035,7 +2044,7 @@ mod tests {
     #[test]
     fn a_steamvr_restart_resets_the_exit_watch() {
         let stack = test_stack();
-        let mut seen = vec!["vrserver", "vrmonitor"];
+        let mut seen = vec![("vrserver", None), ("vrmonitor", None)];
         let _restart = stack.restarting.lock();
         assert_eq!(stack.vr_exited(&mut seen), None, "the restart stops them on purpose");
         assert!(seen.is_empty());
