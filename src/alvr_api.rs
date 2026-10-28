@@ -52,9 +52,16 @@ impl Api {
         let mut stream = TcpStream::connect_timeout(&addr, timeout.min(Duration::from_secs(1)))
             .with_context(|| format!("ALVR API not reachable on port {}", self.port))?;
         stream.set_read_timeout(Some(timeout))?;
-        stream.write_all(build_request(method, path, body).as_bytes())?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(build_request(method, path, body).as_bytes()).with_context(|| format!("{method} {path}: sending the request to ALVR"))?;
         let mut response = String::new();
-        stream.take(MAX_MESSAGE as u64 + 1).read_to_string(&mut response)?;
+        if let Err(e) = stream.take(MAX_MESSAGE as u64 + 1).read_to_string(&mut response) {
+            let why = match e.kind() {
+                ErrorKind::WouldBlock | ErrorKind::TimedOut => format!("ALVR accepted the connection but did not answer within {} s", timeout.as_secs_f64()),
+                _ => "reading ALVR's response".into(),
+            };
+            return Err(anyhow!(e).context(format!("{method} {path}: {why}")));
+        }
         if response.len() > MAX_MESSAGE {
             bail!("{method} {path}: response over {MAX_MESSAGE} bytes");
         }
@@ -269,6 +276,14 @@ mod tests {
         assert!(api.send("GET", "/api/ping", None, QUICK).is_err());
         // QUICK, not TIMEOUT: a margin of several seconds keeps a loaded machine from failing it
         assert!(started.elapsed() < TIMEOUT / 2, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_silent_server_errors_with_the_route_and_wait() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // the kernel accepts, nobody answers
+        let api = Api { port: listener.local_addr().unwrap().port() };
+        let e = api.send("GET", "/api/ping", None, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(e.to_string(), "GET /api/ping: ALVR accepted the connection but did not answer within 0.2 s");
     }
 
     #[test]
