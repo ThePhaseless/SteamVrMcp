@@ -32,7 +32,10 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     process::Child,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -48,6 +51,8 @@ fn is_restart_hud(hud: &str) -> bool {
 const WATCHDOG: Duration = Duration::from_secs(30);
 
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
+
+const WEDGED: &str = "OpenVR client wedged (an OpenVR call never returned); restart the MCP";
 
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -140,7 +145,7 @@ pub struct StatusReport {
     pub on_head: bool,
     /// Only while the OpenVR reader is connected, so vr_status never connects one.
     pub scene_app: Option<openvr::SceneApp>,
-    pub warning: Option<&'static str>,
+    pub warning: Option<String>,
     /// The last SteamVR restart that failed, also one the supervisor ran: "<age> s ago: <reason>".
     pub last_restart_error: Option<String>,
     /// Session clock: seconds since MCP start, and the same instant and T0 as RFC 3339 UTC.
@@ -485,6 +490,9 @@ pub struct Stack {
     /// The OpenVR reader and the vrserver pid it connected to. Its own lock, held across OpenVR
     /// calls (bounded by OPENVR_TIMEOUT), never together with `state`.
     reader: Mutex<Option<(u32, OpenVr)>>,
+    /// OpenVR calls started and not returned yet, also those a timeout left on their thread. Above 0
+    /// while the reader lock is held, an earlier call hangs (a wedged vrserver).
+    openvr_calls: Arc<AtomicUsize>,
     on_change: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// The poses every headset sends; outlives headset restarts. Locked only briefly.
     rig: Arc<Mutex<Rig>>,
@@ -555,6 +563,7 @@ impl Stack {
             checks: Mutex::default(),
             config_text: Mutex::new(Config::text()),
             reader: Mutex::new(None),
+            openvr_calls: Arc::default(),
             on_change: Mutex::new(None),
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
@@ -954,8 +963,9 @@ impl Stack {
     }
 
     /// Runs `f` on the OpenVR reader, which connects on first use and again when vrserver's pid
-    /// changed. A reader that does not answer within OPENVR_TIMEOUT is left on its thread.
-    // shortcut: a reader left stuck keeps OpenVR's process-global client, so the next connect may fail until the MCP restarts; fine while no hang is seen
+    /// changed. A reader that does not answer within OPENVR_TIMEOUT is left on its thread, and reads
+    /// fail at once with WEDGED until that call returns.
+    // shortcut: a stuck call keeps OpenVR's process-global client, so only an MCP restart frees it unless the call returns; reset the client in a child process if hangs become common
     fn read<T: Send + 'static>(&self, f: impl FnOnce(&OpenVr) -> Result<T> + Send + 'static) -> Result<T> {
         // the reader was dropped for a vrserver that is going away; do not reconnect to it
         if self.restarting.is_locked() {
@@ -966,15 +976,19 @@ impl Stack {
         let reader = match slot.take() {
             Some((pid, reader)) if Some(pid) == vrserver => Some(reader),
             Some((_, stale)) => {
-                dispose_reader(stale);
+                self.dispose_reader(stale);
                 None
             }
             None => None,
         };
+        // a reconnect would block the full timeout on the stuck client and leave one more thread
+        if self.openvr_wedged() {
+            bail!("{WEDGED}");
+        }
         let pid = vrserver.context("SteamVR is not running")?;
         let steamvr_dir = self.paths().steamvr_dir.clone().context("SteamVR not found; set steamvr_dir in config.toml")?;
         let state_dir = self.paths().state_dir.clone();
-        let (reader, result) = within(OPENVR_TIMEOUT, move || -> Result<_> {
+        let (reader, result) = self.openvr_call(move || -> Result<_> {
             let reader = match reader {
                 Some(r) => r,
                 None => OpenVr::connect(&steamvr_dir, &state_dir)?,
@@ -987,17 +1001,40 @@ impl Stack {
         result
     }
 
+    /// `within(OPENVR_TIMEOUT, f)`, counted in `openvr_calls` until `f` returns, also after a timeout.
+    fn openvr_call<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let calls = Arc::clone(&self.openvr_calls);
+        calls.fetch_add(1, SeqCst);
+        within(OPENVR_TIMEOUT, move || {
+            let out = f();
+            calls.fetch_sub(1, SeqCst);
+            out
+        })
+    }
+
+    /// Whether an earlier OpenVR call still hangs; meaningful only while the reader lock is held.
+    fn openvr_wedged(&self) -> bool {
+        self.openvr_calls.load(SeqCst) > 0
+    }
+
+    /// Drops an OpenVR reader within OPENVR_TIMEOUT, or leaves it on its thread.
+    fn dispose_reader(&self, reader: OpenVr) {
+        if self.openvr_call(move || drop(reader)).is_none() {
+            warn!("OpenVR reader did not disconnect within {} s; left running", OPENVR_TIMEOUT.as_secs());
+        }
+    }
+
     /// Polls the reader's events, so a SteamVR quit from outside drops it instead of SteamVR
     /// killing the MCP. Skipped while a read holds the reader; the watcher calls it every 1 s.
     fn pump_reader(&self) {
         let Some(mut slot) = self.reader.try_lock() else { return };
         let Some((pid, reader)) = slot.take() else { return };
-        match within(OPENVR_TIMEOUT, move || {
+        match self.openvr_call(move || {
             let quit = reader.poll_quit();
             (reader, quit)
         }) {
             Some((reader, false)) => *slot = Some((pid, reader)),
-            Some((reader, true)) => dispose_reader(reader),
+            Some((reader, true)) => self.dispose_reader(reader),
             None => warn!("OpenVR events did not answer within {} s; reader left running", OPENVR_TIMEOUT.as_secs()),
         }
     }
@@ -1005,7 +1042,7 @@ impl Stack {
     /// Disconnects the reader while vrserver is still up; called before every stop and restart.
     fn drop_reader(&self) {
         if let Some((_, reader)) = self.reader.lock().take() {
-            dispose_reader(reader);
+            self.dispose_reader(reader);
         }
     }
 
@@ -1253,8 +1290,14 @@ impl Stack {
         self.reader.lock().is_some()
     }
 
+    /// Whether an OpenVR call hangs: taken under the reader lock, so a read in progress does not count.
+    fn reader_wedged(&self) -> bool {
+        let _slot = self.reader.lock();
+        self.openvr_wedged()
+    }
+
     pub fn status(&self) -> StatusReport {
-        let reader_connected = self.reader_connected();
+        let (reader_connected, wedged) = (self.reader_connected(), self.reader_wedged());
         let (leaked, last_restart_error) = {
             let state = self.state.lock();
             (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
@@ -1271,7 +1314,8 @@ impl Stack {
             headset: self.headset_status(),
             on_head: self.rig.lock().on_head,
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
-            warning: leaked.then_some(LEAKED),
+            warning: Some([leaked.then_some(LEAKED), wedged.then_some(WEDGED)].into_iter().flatten().collect::<Vec<_>>().join("; "))
+                .filter(|w| !w.is_empty()),
             last_restart_error,
             now_t_s: now,
             now_at: clock::at(now),
@@ -1372,6 +1416,10 @@ impl Stack {
     /// and returns once SteamVR reports a new scene app running.
     pub fn launch_app(&self, a: LaunchArgs) -> Result<AppReport> {
         check_launch(&a).map_err(|e| anyhow!(e))?;
+        // its scene wait reads through OpenVR, so a wedged client would only time out
+        if self.reader_wedged() {
+            bail!("{WEDGED}");
+        }
         launch_guard(steamvr::is_steamvr_running())?;
         let id: u64 = a.app_id.trim().parse().with_context(|| format!("app_id must be a decimal app id, got {:?}", a.app_id))?;
         let paths = self.paths();
@@ -1682,13 +1730,6 @@ fn api_for(paths: &Paths) -> Api {
 /// checks() re-runs it each time, and in an observer it fails for as long as another MCP streams.
 fn core_failing(checks: &[Check]) -> bool {
     checks.iter().any(|c| !c.ok && c.name != "alvr_dashboard_absent" && checks::CORE.contains(&c.name))
-}
-
-/// Drops an OpenVR reader within OPENVR_TIMEOUT, or leaves it on its thread.
-fn dispose_reader(reader: OpenVr) {
-    if within(OPENVR_TIMEOUT, move || drop(reader)).is_none() {
-        warn!("OpenVR reader did not disconnect within {} s; left running", OPENVR_TIMEOUT.as_secs());
-    }
 }
 
 /// Whether the watcher renews the lease: only our own (vr_release gave it up for good), only
@@ -2204,6 +2245,23 @@ mod tests {
         assert!(!core_failing(&[failed("alvr_dashboard_absent")]), "another MCP's stream: re-evaluated on its own");
         assert!(core_failing(&[failed("alvr_dashboard_absent"), failed("audio_input")]));
         assert!(!core_failing(&[failed("h264_encoder")]), "not a core check");
+    }
+
+    #[test]
+    fn a_wedged_openvr_call_fails_reads_fast_and_shows_in_vr_status() {
+        let stack = test_stack();
+        assert_eq!(stack.openvr_call(|| 7), Some(7));
+        assert!(!stack.status().warning.is_some_and(|w| w.contains("wedged")), "a call that returned is not counted");
+        stack.openvr_calls.fetch_add(1, SeqCst); // what a call stuck past OPENVR_TIMEOUT leaves
+        let started = Instant::now();
+        let e = stack.read(|_| Ok(())).unwrap_err().to_string();
+        assert!(e.contains("wedged") && e.contains("restart the MCP"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(1), "no new connect, no new thread");
+        assert!(stack.status().warning.is_some_and(|w| w.contains("wedged")));
+        let a = LaunchArgs { app_id: "620".into(), via: Via::Steam, exe: None, args: vec![], env: Default::default() };
+        assert!(stack.launch_app(a).unwrap_err().to_string().contains("wedged"), "fails at once, not at its deadline"); // test_stack has no Steam: never launches
+        stack.openvr_calls.fetch_sub(1, SeqCst); // the stuck call returned after all
+        assert!(!stack.read(|_| Ok(())).unwrap_err().to_string().contains("wedged"));
     }
 
     #[test]
