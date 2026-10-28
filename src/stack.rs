@@ -584,6 +584,8 @@ struct State {
     managing: bool,
     /// Bumped by every vr_stop; a vr_start that saw another value bails at its next check.
     stops: u64,
+    /// vr_stops that bumped `stops` and wait for `starting`; vr_start refuses meanwhile, or it would read the new epoch and run in full.
+    stopping: u32,
     /// Why the session ended without vr_stop, for vr_status; cleared by vr_start and vr_stop.
     ended: Option<&'static str>,
     /// When and why the last SteamVR restart failed.
@@ -1259,6 +1261,9 @@ impl Stack {
         let Some(no_restart) = self.restarting.try_lock() else { bail!("not ready: SteamVR is restarting") };
         let epoch = {
             let mut state = self.state.lock();
+            if state.stopping > 0 {
+                bail!("not ready: vr_stop is running");
+            }
             state.watchdog = Watchdog::default();
             state.ended = None;
             state.stops
@@ -1466,10 +1471,12 @@ impl Stack {
             let mut state = self.state.lock();
             state.managing = false;
             state.stops += 1;
+            state.stopping += 1;
             state.ended = None;
         }
         // an in-flight vr_start bails at its next check; what it left (headset, dashboard, the SteamVR it launched) goes below
         let _no_start = self.starting.lock();
+        self.state.lock().stopping -= 1; // a vr_start now waits for `starting` instead
         let _no_restart = self.restarting.lock();
         let _vr_down = self.vr_down.lock();
         self.drop_reader();
@@ -2539,6 +2546,7 @@ mod tests {
         stack.stop().unwrap();
         let stopped = Instant::now();
         assert!(stopped >= start.join().unwrap(), "stop cleaned up only after the start let go");
+        assert_eq!(stack.state.lock().stopping, 0, "vr_start is allowed again");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2553,6 +2561,10 @@ mod tests {
         assert_eq!(stack.start().unwrap_err().to_string(), "not ready: SteamVR is restarting");
         drop(restarting);
         assert!(stack.state.lock().managing, "a refused start leaves the running session managed");
+        // what vr_stop holds between its epoch bump and taking `starting`
+        stack.state.lock().stopping = 1;
+        assert_eq!(stack.start().unwrap_err().to_string(), "not ready: vr_stop is running");
+        stack.state.lock().stopping = 0;
     }
 
     #[test]
