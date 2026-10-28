@@ -50,6 +50,41 @@ fn is_restart_hud(hud: &str) -> bool {
 
 const WATCHDOG: Duration = Duration::from_secs(30);
 
+/// How long a stream must hold before the watchdog may fire again: one that drops at once would loop SteamVR restarts.
+const WATCHDOG_REARM: Duration = Duration::from_secs(60);
+
+/// Watchdog SteamVR restarts per vr_start; past them vr_status warns instead.
+const WATCHDOG_MAX: u32 = 3;
+
+const WATCHDOG_GAVE_UP: &str = "the headset went quiet again after 3 watchdog SteamVR restarts, which the watchdog no longer repeats; run vr_start";
+
+/// The supervisor's watchdog, reset by vr_start.
+#[derive(Debug, Default)]
+struct Watchdog {
+    fired: bool,
+    restarts: u32,
+    gave_up: bool,
+}
+
+impl Watchdog {
+    /// One supervisor tick: re-armed by a stream that held WATCHDOG_REARM; true when it fires on a headset quiet
+    /// past WATCHDOG, once per arming and WATCHDOG_MAX times per vr_start, after which it gives up.
+    fn fires(&mut self, streaming_for: Option<Duration>, quiet_for: Option<Duration>) -> bool {
+        if streaming_for.is_some_and(|d| d >= WATCHDOG_REARM) {
+            self.fired = false;
+        }
+        if self.fired || !quiet_for.is_some_and(|q| q > WATCHDOG) {
+            return false;
+        }
+        if self.restarts >= WATCHDOG_MAX {
+            self.gave_up = true;
+            return false;
+        }
+        (self.fired, self.restarts) = (true, self.restarts + 1);
+        true
+    }
+}
+
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
 const RESTART_FAILED: &str = "the last SteamVR restart failed and the headset is not streaming; run vr_start";
@@ -544,8 +579,7 @@ struct State {
     dashboard: Option<Child>,
     started_steam: bool,
     restarts: u32,
-    /// The watchdog restarts SteamVR at most once per stream: re-armed by vr_start and whenever the headset streams.
-    watchdog_fired: bool,
+    watchdog: Watchdog,
     leaked: bool,
     managing: bool,
     /// Bumped by every vr_stop; a vr_start that saw another value bails at its next check.
@@ -1222,7 +1256,7 @@ impl Stack {
         let Some(no_restart) = self.restarting.try_lock() else { bail!("not ready: SteamVR is restarting") };
         let epoch = {
             let mut state = self.state.lock();
-            state.watchdog_fired = false;
+            state.watchdog = Watchdog::default();
             state.ended = None;
             state.stops
         };
@@ -1493,7 +1527,17 @@ impl Stack {
             let streaming = state.headset.as_ref().is_some_and(|h| h.status().streaming);
             // the supervisor does not retry a failed restart
             let stuck = state.managing && state.last_restart_error.is_some() && !streaming && !self.starting.is_locked() && !self.restarting.is_locked();
-            let warnings: Vec<&str> = [state.leaked.then_some(LEAKED), wedged.then_some(WEDGED), state.ended, stuck.then_some(RESTART_FAILED)].into_iter().flatten().collect();
+            let gave_up = state.managing && state.watchdog.gave_up && !streaming;
+            let warnings: Vec<&str> = [
+                state.leaked.then_some(LEAKED),
+                wedged.then_some(WEDGED),
+                state.ended,
+                stuck.then_some(RESTART_FAILED),
+                gave_up.then_some(WATCHDOG_GAVE_UP),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             (warnings, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
         };
         let now = clock::now_s();
@@ -2046,11 +2090,12 @@ fn supervise(stack: Weak<Stack>) {
     let mut events = None;
     // since when the API is up but the headset is not streaming
     let mut quiet_since: Option<Instant> = None;
+    let mut streaming_since: Option<Instant> = None;
     let mut last_hud = String::new();
     loop {
         let Some(s) = stack.upgrade() else { return };
         if !s.state.lock().managing {
-            (events, quiet_since) = (None, None);
+            (events, quiet_since, streaming_since) = (None, None, None);
             drop(s);
             thread::sleep(Duration::from_millis(500));
             continue;
@@ -2071,9 +2116,7 @@ fn supervise(stack: Weak<Stack>) {
             },
         }
         let status = s.headset_status().unwrap_or_default();
-        if status.streaming {
-            s.state.lock().watchdog_fired = false;
-        }
+        streaming_since = status.streaming.then(|| streaming_since.unwrap_or_else(Instant::now));
         // a request sent before the events stream attached still shows on the headset's HUD
         restart |= is_restart_hud(&status.hud_message) && !is_restart_hud(&last_hud);
         last_hud = status.hud_message;
@@ -2083,14 +2126,14 @@ fn supervise(stack: Weak<Stack>) {
             quiet_since = None;
         }
 
+        let elapsed = |t: Option<Instant>| t.map(|t| t.elapsed());
         if restart {
             s.restart_steamvr(false).map_err(|e| error!("{e:#}")).ok();
             (events, quiet_since) = (None, None);
             last_hud = s.headset_status().map(|h| h.hud_message).unwrap_or_default();
-        } else if quiet_since.is_some_and(|t| t.elapsed() > WATCHDOG) && !s.state.lock().watchdog_fired {
+        } else if s.state.lock().watchdog.fires(elapsed(streaming_since), elapsed(quiet_since)) {
             // seen in the spike: an old client stops listening after a restart
             // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
-            s.state.lock().watchdog_fired = true;
             s.recreate_headset().map_err(|e| error!("{e:#}")).ok(); // restarts SteamVR too
             (events, quiet_since) = (None, None);
         }
@@ -3148,6 +3191,34 @@ mod tests {
         assert!(!counts_as_quiet(true, true, false), "streaming");
         assert!(!counts_as_quiet(false, false, false), "no events stream");
         assert!(!counts_as_quiet(false, true, true), "a restart holds the headset out of state");
+    }
+
+    #[test]
+    fn the_watchdog_rearms_only_after_a_stream_held_and_gives_up() {
+        let mut w = Watchdog::default();
+        let (quiet, s) = (Some(WATCHDOG + Duration::from_secs(1)), Duration::from_secs);
+        assert!(!w.fires(None, Some(s(10))), "not quiet long enough");
+        assert!(w.fires(None, quiet), "armed by vr_start");
+        assert!(!w.fires(None, quiet), "once per arming");
+        assert!(!w.fires(Some(s(1)), None), "a stream that came up for a tick");
+        assert!(!w.fires(None, quiet), "does not re-arm it");
+        assert!(!w.fires(Some(WATCHDOG_REARM), None));
+        assert!(w.fires(None, quiet), "a stream that held does");
+        assert!(!w.fires(Some(WATCHDOG_REARM), None));
+        assert!(w.fires(None, quiet));
+        assert!(!w.fires(Some(WATCHDOG_REARM), None) && !w.gave_up);
+        assert!(!w.fires(None, quiet), "WATCHDOG_MAX restarts per vr_start");
+        assert!(w.gave_up && w.restarts == WATCHDOG_MAX);
+    }
+
+    #[test]
+    fn vr_status_warns_once_the_watchdog_gave_up() {
+        let stack = test_stack();
+        stack.state.lock().watchdog.gave_up = true;
+        assert_eq!(stack.status().warning, None, "no session");
+        stack.state.lock().managing = true;
+        assert_eq!(stack.status().warning.as_deref(), Some(WATCHDOG_GAVE_UP));
+        stack.state.lock().managing = false;
     }
 
     #[test]
