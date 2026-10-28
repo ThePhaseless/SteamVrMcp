@@ -244,6 +244,11 @@ impl VrProcs {
         self.names.iter().flat_map(|n| pids_named(n)).filter_map(|pid| Some((pid, stat(pid)?.1))).collect()
     }
 
+    /// is_steamvr_running, when these processes include vrserver: never for NONE.
+    pub fn vrserver_running(&self) -> bool {
+        self.names.contains(&"vrserver") && is_steamvr_running()
+    }
+
     /// The names with a running process.
     pub fn alive(&self) -> Vec<&'static str> {
         running(self.names)
