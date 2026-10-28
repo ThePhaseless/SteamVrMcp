@@ -685,8 +685,10 @@ pub fn run_dashboard_child() -> ! {
 }
 
 /// The dashboard's restart: ALVR shuts SteamVR down cleanly, then SteamVR is launched again. The
-/// wait for the relaunch ends early once `stopped`; `started_steam` is set when the relaunch started Steam.
-pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, procs: &VrProcs, stopped: impl Fn() -> bool, started_steam: &mut bool) -> Result<()> {
+/// wait for the relaunch takes up to `timeout` and ends early once `stopped`; `started_steam` is set when the relaunch started Steam.
+pub fn restart_steamvr(
+    cfg: &Config, paths: &Paths, api: &Api, procs: &VrProcs, timeout: Duration, stopped: impl Fn() -> bool, started_steam: &mut bool,
+) -> Result<()> {
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
     let old = pids_named("vrserver");
     let snapshot = procs.snapshot();
@@ -718,8 +720,8 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, procs: &VrProcs, 
         exited = vr_exited(&mut seen);
         stopped() || exited.is_some() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping())
     };
-    if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
-        bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", cfg.timeouts.streaming_s);
+    if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, timeout, relaunched)? {
+        bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", timeout.as_secs());
     }
     if stopped() {
         procs.settle(launched); // the stop waiting for this restart then finds the SteamVR Steam starts
@@ -1087,7 +1089,7 @@ mod tests {
         fs::create_dir_all(root.join("steam/config")).unwrap();
         fs::write(root.join("steam/config/steamvr.vrsettings"), "{}").unwrap();
         let paths = Paths { steam_dir: Some(root.join("steam")), flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
-        let e = restart_steamvr(&Config::default(), &paths, &Api { port: 1 }, &VrProcs::NONE, || true, &mut false).unwrap_err();
+        let e = restart_steamvr(&Config::default(), &paths, &Api { port: 1 }, &VrProcs::NONE, Duration::from_secs(1), || true, &mut false).unwrap_err();
         assert_eq!(e.to_string(), "failed: vr_stop ended the SteamVR restart", "stopped before launch(), which unit tests refuse");
         fs::remove_dir_all(&root).ok();
     }
