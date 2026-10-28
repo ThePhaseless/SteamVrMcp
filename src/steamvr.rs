@@ -278,9 +278,23 @@ pub fn shortcut_game_id(appid: u32) -> u64 {
 }
 
 // shortcut: line-oriented VDF scan without escape handling; switch to a parser if Valve changes the format or a value holds a quote
-/// The quoted tokens of a text VDF line.
+/// A text VDF line up to its `//` comment; a `//` inside quotes is part of a token.
+fn code(line: &str) -> &str {
+    let mut at = 0;
+    for (i, part) in line.split('"').enumerate() {
+        if i % 2 == 0
+            && let Some(c) = part.find("//")
+        {
+            return &line[..at + c];
+        }
+        at += part.len() + 1;
+    }
+    line
+}
+
+/// The quoted tokens of a text VDF line, comment excluded.
 fn tokens(line: &str) -> Vec<&str> {
-    line.split('"').skip(1).step_by(2).collect()
+    code(line).split('"').skip(1).step_by(2).collect()
 }
 
 /// The first `"key" "value"` pair's value with this key.
@@ -319,10 +333,11 @@ pub(crate) fn entry_value<'a>(vdf: &'a str, section: &str, entry: &str, key: &st
     let lines = vdf.lines().skip_while(|l| tokens(l) != [section]).skip(1);
     let (mut depth, mut in_entry) = (0, false);
     for line in lines {
-        match (line.trim(), &tokens(line)[..]) {
+        // in_entry changes only at the next depth-1 key, so a block nested in the entry keeps it
+        match (code(line).trim(), &tokens(line)[..]) {
             ("{", _) => depth += 1,
             ("}", _) if depth == 1 => return None,
-            ("}", _) => (depth, in_entry) = (depth - 1, false),
+            ("}", _) => depth -= 1,
             (_, [k]) if depth == 1 => in_entry = *k == entry,
             (_, [k, v]) if depth == 2 && in_entry && *k == key => return Some(v),
             _ => (),
@@ -825,6 +840,8 @@ mod tests {
         assert_eq!(compat_tool(CONFIG_VDF, 1), None);
         assert_eq!(compat_tool(CONFIG_VDF, 7), None, "outside CompatToolMapping");
         assert_eq!(compat_tool(CONFIG_VDF, 0).as_deref(), Some("proton_9"), "Steam's default");
+        let nested = "\"CompatToolMapping\"\n{\n\t\"620980\"\n\t{\n\t\t\"sub\"\n\t\t{\n\t\t\t\"x\"\t\"y\"\n\t\t}\n\t\t\"name\"\t\"proton_x\"\n\t}\n}\n";
+        assert_eq!(compat_tool(nested, 620980).as_deref(), Some("proton_x"), "a key after a nested block");
     }
 
     fn fake_steam(name: &str) -> PathBuf {
