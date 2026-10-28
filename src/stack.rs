@@ -702,8 +702,9 @@ impl Stack {
         let managing = self.state.lock().managing;
         let (owner, ttl) = self.lease.lock().clone();
         let dir = self.paths().runtime_dir;
+        // the unlocked read only spares the lock on most ticks; renew checks again under it
         if watch_renews(managing, lease::read(&dir).as_ref(), std::process::id(), ttl, SystemTime::now()) {
-            lease::acquire(&dir, &owner, ttl).map_err(|e| warn!("{e:#}")).ok();
+            lease::renew(&dir, &owner, ttl).map_err(|e| warn!("{e:#}")).ok();
         }
     }
 

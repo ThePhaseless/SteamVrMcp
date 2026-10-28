@@ -74,7 +74,21 @@ pub fn acquire(dir: &Path, owner: &str, ttl: Duration) -> Result<Lease> {
     if let Some(holder) = blocking(read(dir).as_ref(), pid, now, alive) {
         bail!("{}", holder_text(holder));
     }
-    let lease = Lease { owner: owner.to_owned(), pid, expires_at: clock::rfc3339(now + ttl) };
+    write(dir, owner, ttl)
+}
+
+/// Renews the lease only while it is still ours, checked under the lock: a vr_release since the caller looked gave it up for good. Whether it renewed.
+pub fn renew(dir: &Path, owner: &str, ttl: Duration) -> Result<bool> {
+    let _lock = lock(dir)?;
+    if read(dir).is_none_or(|l| l.pid != std::process::id()) {
+        return Ok(false);
+    }
+    write(dir, owner, ttl).map(|_| true)
+}
+
+/// Writes our lease; the caller holds the lock.
+fn write(dir: &Path, owner: &str, ttl: Duration) -> Result<Lease> {
+    let lease = Lease { owner: owner.to_owned(), pid: std::process::id(), expires_at: clock::rfc3339(SystemTime::now() + ttl) };
     let (file, tmp) = (dir.join("owner.json"), dir.join("owner.json.tmp"));
     fs::write(&tmp, serde_json::to_vec(&lease)?).with_context(|| tmp.display().to_string())?;
     fs::rename(&tmp, &file).with_context(|| file.display().to_string())?;
@@ -177,6 +191,22 @@ mod tests {
         assert_eq!(acquire(&dir, "driver", Duration::from_secs(60)).unwrap().owner, "driver");
         plant(&dir, &lease(u32::MAX, SystemTime::now() + Duration::from_secs(600)));
         assert_eq!(acquire(&dir, "again", Duration::from_secs(60)).unwrap().owner, "again");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn renew_rewrites_only_our_own_lease() {
+        let dir = dir("renew");
+        assert!(!renew(&dir, "a", Duration::from_secs(60)).unwrap(), "vr_release gave it up: not taken back");
+        assert_eq!(read(&dir), None);
+        let first = acquire(&dir, "a", Duration::from_secs(60)).unwrap();
+        assert!(renew(&dir, "a", Duration::from_secs(600)).unwrap());
+        let renewed = read(&dir).unwrap();
+        assert!(renewed.pid == first.pid && renewed.expires_at > first.expires_at, "{renewed:?}");
+        let other = lease(1, SystemTime::now() + Duration::from_secs(600));
+        plant(&dir, &other);
+        assert!(!renew(&dir, "a", Duration::from_secs(60)).unwrap());
+        assert_eq!(read(&dir), Some(other), "another MCP's lease stays");
         fs::remove_dir_all(&dir).ok();
     }
 
