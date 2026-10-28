@@ -39,8 +39,8 @@ fn dashboard_child_role() {
     }
 }
 
-/// Proves done-when 8 (files) early, and switches the owner's v20 setup to v21 and back.
-/// Touches the real SteamVR and ALVR files; needs ~/.config/vr-test-mcp/config.toml with streamer_dir.
+/// prepare switches SteamVR to the configured ALVR driver, and restore puts every file back as it was.
+/// Touches the real SteamVR and ALVR files; needs `streamer_dir` in config.toml (or a registered ALVR driver).
 #[test]
 #[ignore]
 fn live_prepare_restore_round_trip() {
@@ -61,7 +61,7 @@ fn live_prepare_restore_round_trip() {
         Ok(_) => {
             let drivers = Snap::take(&paths).openvrpaths["external_drivers"].clone();
             if drivers != serde_json::json!([paths.driver_dir().unwrap()]) {
-                problems.push(format!("external_drivers is {drivers}, expected only the v21 driver dir"));
+                problems.push(format!("external_drivers is {drivers}, expected only the configured driver dir"));
             }
             if !paths.vrcompositor().unwrap().is_file() {
                 problems.push("vrcompositor is not a regular file".into());
@@ -70,7 +70,7 @@ fn live_prepare_restore_round_trip() {
         Err(e) => problems.push(format!("prepare failed: {e:#}")),
     }
 
-    // restore even when a check above failed, so the machine is never left on v21
+    // restore even when a check above failed, so the machine is never left switched
     let restored = restore(&paths);
     assert!(problems.is_empty(), "{problems:?}");
     restored.unwrap();
@@ -78,14 +78,13 @@ fn live_prepare_restore_round_trip() {
     assert!(!paths.restore_file().exists());
 }
 
-/// Proves done-when 1 and 8 (processes), early risk 1 (the `alvr_dashboard` child gives early
-/// HMD init: the first connect restarts SteamVR exactly once, then the client streams with no
-/// further restart and ALVR never misses the dashboard) and early risk 4 (the manual 127.0.0.1
-/// entry connects with client discovery off). The no-LAN-address case of risk 4 is not simulated.
+/// vr_start streams and vr_stop cleans up. The `alvr_dashboard` child gives early HMD init: the
+/// first connect restarts SteamVR exactly once, then the client streams with no further restart and
+/// ALVR never misses the dashboard. The manual 127.0.0.1 entry connects with client discovery off.
 /// Limitation: a headset reconnect without a SteamVR restart is not proven; on loopback TCP the
 /// ALVR EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting,
 /// so the MCP restarts SteamVR on every reconnect.
-/// Needs Steam closed and ~/.config/vr-test-mcp/config.toml with streamer_dir.
+/// Needs Steam closed and `streamer_dir` in config.toml (or a registered ALVR driver).
 #[test]
 #[ignore]
 fn live_start_streams_and_stop_cleans() {
@@ -93,7 +92,7 @@ fn live_start_streams_and_stop_cleans() {
     start_streams_and_stop_cleans(false);
 }
 
-/// The same proofs with the user's Steam already running: the MCP must neither start nor close it.
+/// The same checks with the user's Steam already running: the MCP must neither start nor close it.
 /// Needs Steam running (on a GPU that ALVR 21's direct mode supports) and SteamVR closed.
 #[test]
 #[ignore]
@@ -128,7 +127,7 @@ fn start_streams_and_stop_cleans(steam_was_running: bool) {
         assert!(!steamvr::pids_named("alvr_dashboard").is_empty(), "no alvr_dashboard child");
         // the HUD trigger restarts SteamVR even when ALVR missed the dashboard, so check ALVR's own view
         let errors = new_errors();
-        assert!(!errors.contains("No dashboard process found"), "risk 1 failed, ALVR saw no dashboard:\n{errors}");
+        assert!(!errors.contains("No dashboard process found"), "ALVR saw no dashboard:\n{errors}");
 
         let frames = || s.status().headset.unwrap().frames_received;
         let f0 = frames();
@@ -146,7 +145,7 @@ fn start_streams_and_stop_cleans(steam_was_running: bool) {
         println!("status: {:?}", s.status());
     }));
 
-    // stop and restore even when a check failed, so the machine is never left on v21
+    // stop and restore even when a check failed, so the machine is never left switched
     let stopped = s.stop();
     let restored = restore(&paths);
     if let Err(p) = checks {
@@ -160,8 +159,8 @@ fn start_streams_and_stop_cleans(steam_was_running: bool) {
     assert!(!paths.restore_file().exists());
 }
 
-/// Proves done-when 9 (second half): with no config file, the startup checks pass or say exactly
-/// what to set; with the owner's config they all pass. Read-only.
+/// With no config file, every startup check passes or says what to set; with the machine's
+/// config.toml they all pass. Read-only.
 #[test]
 #[ignore]
 fn live_checks_without_config() {
@@ -170,7 +169,7 @@ fn live_checks_without_config() {
     println!("without config ({:?}): {bare:#?}", started.elapsed());
     assert!(bare.iter().all(|c| c.ok || !c.fix.is_empty()), "{bare:#?}");
     let streamer = bare.iter().find(|c| c.name == "alvr_streamer").unwrap();
-    assert!(!streamer.ok && streamer.fix.contains("streamer_dir"), "{streamer:?}");
+    assert!(streamer.ok || streamer.fix.contains("streamer_dir"), "{streamer:?}");
 
     let cfg = Config::load().unwrap();
     let configured = startup_checks(&cfg, &Paths::detect(&cfg));
@@ -197,8 +196,7 @@ fn shared_stack() -> Arc<Stack> {
     Arc::clone(stack)
 }
 
-/// Proves the screenshot path (spec "Screenshots" decoder choice) on a real ALVR 21 VAAPI stream;
-/// part of done-when 2. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+/// The headset screenshot path decodes a real ALVR 21 VA-API stream. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
 #[test]
 #[ignore]
 fn live_screenshot_png() {
@@ -225,8 +223,8 @@ fn live_screenshot_png() {
     }
 }
 
-/// Proves early risk 6 (the host-side OpenVR client reaches vrserver in its container) and the
-/// get_tracked_state half of done-when 3. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
+/// The host-side OpenVR client reaches vrserver in its container, and get_tracked_state shows
+/// the default head pose. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
 #[test]
 #[ignore]
 fn live_tracked_head_matches() {
@@ -240,12 +238,12 @@ fn live_tracked_head_matches() {
     assert!(x.abs() < 0.01 && (y - 1.6).abs() < 0.01 && z.abs() < 0.01, "{:?}", hmds[0]);
     let mut roles: Vec<_> = state.devices.iter().filter(|d| d.class == "controller").map(|d| d.role.as_str()).collect();
     roles.sort();
-    // pose_valid may stay false until Task 6 sends controller poses
+    // pose_valid may stay false until a controller pose is sent
     assert_eq!(roles, ["left", "right"], "{:?}", state.devices);
 }
 
-/// Proves done-when 3: head moves show in get_tracked_state and in the screenshot (and the
-/// deferred Task 4 check that the screenshot changes between two head poses). Needs Steam closed
+/// Head moves show in get_tracked_state and in the screenshot, which changes between two head
+/// poses. Needs Steam closed
 /// or its GPU supported, and SteamVR closed or streaming.
 #[test]
 #[ignore]
@@ -306,7 +304,7 @@ fn live_head_move_tracked() {
     assert!(Vec3::from_array(d.position).distance(Vec3::new(0.3, 1.6, 0.0)) < 0.01, "{d:?}");
 }
 
-/// Proves early risk 2 and done-when 5: Index finger curls, sent as a hand-model skeleton with the
+/// Index finger curls, sent as a hand-model skeleton with the
 /// controller pose, show in SteamVR's skeleton per finger independently, for both hands; index to
 /// pinky also as ALVR's /input/finger/* components (device_curls). Needs Steam closed or its GPU
 /// supported, and SteamVR closed or streaming.
@@ -364,11 +362,12 @@ fn live_finger_curls_per_finger() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Proves early risk 5 (Beat Saber runs on the integrated GPU at the MCP's default resolution). Needs env
-/// VR_TEST_GAME_ID: the Beat Saber Steam app id or its non-Steam shortcut game id.
+/// The game holds its frame rate at the MCP's default resolution: under 10% of frames dropped or
+/// reprojected. Needs env VR_TEST_GAME_ID: a VR game's Steam app id or non-Steam shortcut game id
+/// (the menu tests were written against Beat Saber).
 #[test]
 #[ignore]
-fn live_beat_saber_menu_fps() {
+fn live_game_menu_fps() {
     let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
     let s = ensure_streaming();
     steamvr::launch(&Config::load().unwrap(), &format!("steam://rungameid/{id}")).unwrap();
@@ -387,8 +386,8 @@ fn live_beat_saber_menu_fps() {
     assert!(presents > 0 && ratio < 0.10, "ratio {ratio:.3}");
 }
 
-/// Proves done-when 2: launch_app reaches the game's menu and a screenshot shows it. Needs env
-/// VR_TEST_GAME_ID: the Beat Saber Steam app id or its non-Steam shortcut (game) id.
+/// launch_app reaches the game's menu and a screenshot shows it. Needs env VR_TEST_GAME_ID: a
+/// Windows VR game's Steam app id or non-Steam shortcut (game) id, such as Beat Saber's.
 #[test]
 #[ignore]
 fn live_launch_app_reaches_menu() {
@@ -399,7 +398,7 @@ fn live_launch_app_reaches_menu() {
     assert!(report.scene_pid > 0);
     let comm = steamvr::comm(report.scene_pid);
     assert!(comm.as_deref().is_some_and(|c| !steamvr::VR_PROCESS_NAMES.contains(&c)), "scene pid is SteamVR's own: {comm:?}");
-    // Beat Saber is a Windows game; this needs an explicit CompatToolMapping entry, as a shortcut has
+    // a Windows game runs through Proton; this needs an explicit CompatToolMapping entry, as a shortcut has
     assert!(report.app.compat_tool.is_some(), "no compatibility tool reported: {report:?}");
     thread::sleep(Duration::from_secs(15));
     let shot = s.screenshot(Source::Headset, Eye::Left).unwrap();
@@ -418,9 +417,9 @@ fn live_launch_app_reaches_menu() {
     assert!(gone, "scene app after stop_app: {:?}", s.scene_app());
 }
 
-/// Proves done-when 4: an animated controller swing with the trigger held is visible in game
+/// An animated controller swing with the trigger held is visible in game
 /// (a screenshot taken mid-swing differs from one before), and the playspace and recenter tools
-/// leave the stream running. Needs env VR_TEST_GAME_ID (Beat Saber).
+/// leave the stream running. Needs env VR_TEST_GAME_ID, as live_launch_app_reaches_menu.
 #[test]
 #[ignore]
 fn live_swing_with_trigger() {
@@ -615,7 +614,7 @@ fn rows(hand: Hand) -> Vec<Row> {
     rows
 }
 
-/// Proves early risk 3: every Index input, including the trackpad and left A/B, reaches an OpenXR
+/// Every Index input, including the trackpad and left A/B, reaches an OpenXR
 /// app through ALVR's manual button mappings and SteamVR's Index bindings, for both hands.
 /// SteamVR keeps the system click for its dashboard (seen live: the probe's actions go inactive,
 /// then its session drops to VISIBLE); that counts as arrival, and a second press closes it. Needs Steam closed or its GPU supported,
@@ -664,7 +663,7 @@ fn live_index_inputs_reach_openxr() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Proves done-when 4's haptics half on the probe: the probe's pulse on an A press is recorded
+/// Haptics on the probe: the probe's pulse on an A press is recorded
 /// with its hand and amplitude. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
 #[test]
 #[ignore]
@@ -682,7 +681,7 @@ fn live_haptics_recorded() {
     assert!(recorded, "no left pulse at amplitude 0.8: {events:?}");
 }
 
-/// Proves done-when 6 (Index flavour) on the probe: a bare hand's pinch acts as the trigger in an
+/// Index flavour on the probe: a bare hand's pinch acts as the trigger in an
 /// OpenXR app. Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
 #[test]
 #[ignore]
@@ -716,7 +715,7 @@ fn preferred_fps(fps: f64) -> Vec<SettingValue> {
     vec![SettingValue { path: "session_settings.video.preferred_fps".into(), value: json!(fps) }]
 }
 
-/// Proves done-when 7: a restart-relevant change restarts SteamVR and returns to streaming on its
+/// A restart-relevant change restarts SteamVR and returns to streaming on its
 /// own. Also shows get_logs carrying ALVR's rejection of a bad path and SteamVR's own log lines.
 /// Needs Steam closed or its GPU supported, and SteamVR closed or streaming.
 #[test]
@@ -756,7 +755,7 @@ fn live_restart_relevant_setting_restarts() {
     assert!(!vrserver.is_empty());
 }
 
-/// Proves done-when 6 (skeletal-tracker flavour): SteamVR reports hand-tracker skeletons for both
+/// Skeletal-tracker flavour: SteamVR reports hand-tracker skeletons for both
 /// hands, and switching flavour restarts SteamVR on its own. Needs Steam closed or its GPU
 /// supported, and SteamVR closed or streaming.
 #[test]
