@@ -1403,9 +1403,7 @@ impl Stack {
                 let runs = paths.state_dir.join("runs");
                 steamvr::private_dir(&runs)?;
                 let log = runs.join(format!("{}.log", app.app_id));
-                let launched = proton::spawn(&l, &log)?;
-                exited = Some(launched.exited.clone());
-                self.state.lock().launched = Some(launched);
+                exited = Some(self.spawn_launched(&l, &log)?.exited);
                 run_log = Some(log);
             }
         }
@@ -1449,6 +1447,18 @@ impl Stack {
             Err(e) => notes.push(format!("dashboard: {e:#}")),
         }
         Ok(AppReport { app, scene_pid, via: a.via, run_log, notes })
+    }
+
+    /// Spawns a proton run and keeps it for stop_app and vr_stop. Checks `managing` under the same lock
+    /// as the store, so a concurrent vr_stop either finds the run or ended the session before it spawned.
+    fn spawn_launched(&self, l: &proton::ProtonLaunch, log: &Path) -> Result<proton::Launched> {
+        let mut state = self.state.lock();
+        if !state.managing {
+            bail!("no session is running (vr_stop ended it); run vr_start first");
+        }
+        let launched = proton::spawn(l, log)?;
+        state.launched = Some(launched.clone());
+        Ok(launched)
     }
 
     /// Stops the app: SIGTERM to the scene pid, to the group launch_app started, and to every
@@ -2393,6 +2403,24 @@ mod tests {
         assert!(launched.exited.lock().is_some(), "the game's group got SIGTERM and was reaped");
         assert!(stack.state.lock().launched.is_none());
         assert_eq!(stack.stop_launched(), Vec::<u32>::new(), "nothing left to stop");
+        launched.signal(libc::SIGKILL);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_proton_launch_racing_vr_stop_is_refused_or_seen_by_it() {
+        let (stack, root) = blocked_stack("launch-race", false);
+        let dir = root.join("prefix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env = vec![("PATH".into(), std::env::var_os("PATH").unwrap())];
+        let l = proton::ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env, cwd: dir.clone(), compatdata: dir.clone(), app_id: 9 };
+        // vr_stop already cleared managing and found nothing to stop
+        let e = stack.spawn_launched(&l, &dir.join("run.log")).map(|l| l.signal(libc::SIGKILL)).unwrap_err().to_string();
+        assert!(e.contains("vr_start"), "{e}");
+        assert!(stack.state.lock().launched.is_none(), "nothing spawned that vr_stop would miss");
+        stack.state.lock().managing = true;
+        let launched = stack.spawn_launched(&l, &dir.join("run.log")).unwrap();
+        assert!(stack.state.lock().launched.is_some(), "kept for vr_stop");
         launched.signal(libc::SIGKILL);
         std::fs::remove_dir_all(&root).ok();
     }
