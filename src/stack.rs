@@ -619,7 +619,7 @@ impl Stack {
     /// config.toml re-read, when the file changed or a core check fails, so fixing config.toml or the
     /// machine un-hides vr_start without an MCP restart.
     pub fn checks(&self) -> Vec<Check> {
-        let core_failing = self.checks.lock().iter().any(|c| !c.ok && checks::CORE.contains(&c.name));
+        let core_failing = core_failing(&self.checks.lock());
         let edited = Config::text() != *self.config_text.lock();
         if core_failing || edited {
             self.recheck();
@@ -1657,6 +1657,12 @@ fn api_for(paths: &Paths) -> Api {
     paths.session_file().map_or(Api { port: 8082 }, |f| Api::from_session_file(&f))
 }
 
+/// Whether a kept core check failed, so vr_status re-runs all checks. Not for the dashboard check alone:
+/// checks() re-runs it each time, and in an observer it fails for as long as another MCP streams.
+fn core_failing(checks: &[Check]) -> bool {
+    checks.iter().any(|c| !c.ok && c.name != "alvr_dashboard_absent" && checks::CORE.contains(&c.name))
+}
+
 /// Drops an OpenVR reader within OPENVR_TIMEOUT, or leaves it on its thread.
 fn dispose_reader(reader: OpenVr) {
     if within(OPENVR_TIMEOUT, move || drop(reader)).is_none() {
@@ -2153,6 +2159,14 @@ mod tests {
         assert_eq!(unique_stem(at, 7), "vr-1700000000123-7");
         assert_ne!(unique_stem(at, 7), unique_stem(at, 8));
         assert_ne!(unique_stem(at, 7), unique_stem(at + Duration::from_millis(1), 7));
+    }
+
+    #[test]
+    fn a_foreign_dashboard_alone_does_not_rerun_the_checks() {
+        let failed = |name| Check { name, ok: false, reason: "x".into(), fix: String::new() };
+        assert!(!core_failing(&[failed("alvr_dashboard_absent")]), "another MCP's stream: re-evaluated on its own");
+        assert!(core_failing(&[failed("alvr_dashboard_absent"), failed("audio_input")]));
+        assert!(!core_failing(&[failed("h264_encoder")]), "not a core check");
     }
 
     #[test]
