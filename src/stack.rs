@@ -1519,9 +1519,8 @@ impl Stack {
     /// path real-time, restarts SteamVR and waits for a new stream.
     pub fn set_alvr_settings(&self, values: Vec<SettingValue>) -> Result<SettingsReport> {
         let began = Instant::now();
-        if self.restarting.is_locked() {
-            bail!("not ready: SteamVR is restarting");
-        }
+        // held until the values are applied, so no SteamVR restart or vr_stop takes ALVR down meanwhile
+        let Some(no_restart) = self.restarting.try_lock() else { bail!("not ready: SteamVR is restarting") };
         let values = parse_values(values)?;
         let restart = !values.iter().all(|v| is_real_time(&v.path));
         // without vr_start the session.json is the user's own, with no snapshot for vr_restore
@@ -1532,6 +1531,7 @@ impl Stack {
         self.api().post_json("/api/session/values", &values)?;
         wait_applied(|t| events.next(t), &values, Instant::now() + Duration::from_secs(3))?;
         drop(events);
+        drop(no_restart);
 
         let status = || self.headset_status().unwrap_or_default();
         if !restart {
@@ -2447,6 +2447,17 @@ mod tests {
         assert_eq!(stack.start().unwrap_err().to_string(), "not ready: SteamVR is restarting");
         drop(restarting);
         assert!(stack.state.lock().managing, "a refused start leaves the running session managed");
+    }
+
+    #[test]
+    fn set_alvr_settings_refuses_during_a_restart_and_frees_the_slot_when_it_fails() {
+        let stack = test_stack();
+        let values = || vec![SettingValue { path: STEAMVR_INPUT_2_0.into(), value: json!("index") }];
+        let restarting = stack.restarting.lock();
+        assert_eq!(stack.set_alvr_settings(values()).unwrap_err().to_string(), "not ready: SteamVR is restarting");
+        drop(restarting);
+        assert!(stack.set_alvr_settings(values()).unwrap_err().to_string().contains("run vr_start first"));
+        assert!(!stack.restarting.is_locked(), "a failed call must not keep SteamVR restarts out");
     }
 
     #[test]
