@@ -1074,6 +1074,9 @@ impl Stack {
                 }
             }
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
+            if setup::refresh_stale_snapshot(&self.paths())? {
+                report.notes.push("restore.json predated a SteamVR setup without the MCP's changes; took a fresh snapshot".into());
+            }
             setup::snapshot(&self.paths())?;
             let unblocked = setup::undo_safe_mode_blocks(&self.paths())?;
             if !unblocked.is_empty() {

@@ -2,10 +2,15 @@ mod common;
 
 use common::Snap;
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::symlink, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::PathBuf,
+    sync::Mutex,
+};
 use vr_test_mcp::{
     config::{Config, Paths},
-    setup::{prepare, restore, session_values, snapshot},
+    setup::{prepare, refresh_stale_snapshot, restore, session_values, snapshot},
 };
 
 // The tests set XDG_CONFIG_HOME, which is process-wide.
@@ -185,6 +190,8 @@ fn old_restore_json_still_restores() {
     let mut state: Value = serde_json::from_slice(&fs::read(f.paths.restore_file()).unwrap()).unwrap();
     let obj = state.as_object_mut().unwrap();
     obj.remove("vrsettings_file");
+    obj.remove("paths");
+    obj.remove("session_backups");
     obj.insert(
         "vrsettings".into(),
         json!({"steamvr/forcedDriver": null, "driver_alvr_server/blocked_by_safe_mode": null}),
@@ -203,5 +210,137 @@ fn missing_owner_file_is_named() {
     fs::remove_file(&vrsettings).unwrap();
     let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
     assert!(e.contains(&vrsettings.display().to_string()), "{e}");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+fn prep(paths: &Paths) {
+    prepare(paths, &session_values(&Config::default()).unwrap(), HOST).unwrap();
+}
+
+#[test]
+fn torn_restore_json_stops_prepare() {
+    let f = fixture("torn", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    fs::create_dir_all(&f.paths.state_dir).unwrap();
+    fs::write(f.paths.restore_file(), r#"{"external_drivers": ["#).unwrap();
+    let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
+    assert!(e.contains(&f.paths.restore_file().display().to_string()) && e.contains("delete"), "{e}");
+    assert_eq!(Snap::take(&f.paths), before, "prepare changed nothing");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_uses_the_paths_recorded_at_snapshot() {
+    let f = fixture("recorded", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    prep(&f.paths);
+    // a partial restore unregistered ALVR, or the config changed since: the current Paths know nothing
+    let lost = Paths { steam_dir: None, steamvr_dir: None, streamer_dir: None, ..f.paths.clone() };
+    restore(&lost).unwrap();
+    assert_eq!(Snap::take(&f.paths), before);
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn prepare_refuses_when_the_paths_changed_since_the_snapshot() {
+    let f = fixture("moved", |v20| json!([v20]));
+    prep(&f.paths);
+    let other = f.root.join("steam2");
+    fs::create_dir_all(other.join("config")).unwrap();
+    fs::write(other.join("config/steamvr.vrsettings"), "{}").unwrap();
+    let moved = Paths { steam_dir: Some(other.clone()), ..f.paths.clone() };
+    let e = format!("{:#}", prepare(&moved, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
+    assert!(e.contains("vr_restore") && e.contains(&other.display().to_string()), "{e}");
+    assert_eq!(fs::read_to_string(other.join("config/steamvr.vrsettings")).unwrap(), "{}");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_finishes_after_a_crash_between_compositor_steps() {
+    let f = fixture("crashmid", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    prep(&f.paths);
+    // a restore killed after moving Valve's binary back, before the symlink
+    let compositor = f.paths.vrcompositor().unwrap();
+    fs::rename(&compositor, compositor.with_file_name("vrcompositor.real")).unwrap();
+    restore(&f.paths).unwrap();
+    assert_eq!(Snap::take(&f.paths), before);
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_retried_after_a_failure_finishes_and_is_not_stale() {
+    let f = fixture("retry", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    prep(&f.paths);
+    let bin = f.paths.vrcompositor().unwrap().parent().unwrap().to_owned();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).unwrap();
+    let failed = restore(&f.paths);
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed.is_err(), "the vrcompositor step fails");
+    // the driver list and forcedDriver are back, but the setup is half restored
+    assert!(!refresh_stale_snapshot(&f.paths).unwrap(), "a partial restore is not stale");
+    restore(&f.paths).unwrap();
+    assert_eq!(Snap::take(&f.paths), before);
+    assert!(!f.paths.restore_file().exists());
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_skips_the_rewrap_when_the_wrapper_is_gone() {
+    let f = fixture("nowrapper", |v20| json!([v20]));
+    prep(&f.paths);
+    fs::remove_file(f.root.join("wrapper")).unwrap();
+    let notes = restore(&f.paths).unwrap();
+    let compositor = f.paths.vrcompositor().unwrap();
+    assert!(fs::symlink_metadata(&compositor).unwrap().is_file(), "Valve's binary stays in place");
+    assert!(notes.iter().any(|n| n.contains("vrcompositor")), "{notes:?}");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_puts_back_the_session_old_json_alvr_overwrites() {
+    let f = fixture("sessionold", |v20| json!([v20]));
+    let config = f.paths.session_file().unwrap().parent().unwrap().to_owned();
+    fs::write(config.join("session_old.json"), "mine").unwrap();
+    prep(&f.paths); // `{}` is extrapolated, so ALVR overwrites session_old.json
+    assert_ne!(fs::read_to_string(config.join("session_old.json")).unwrap(), "mine");
+    restore(&f.paths).unwrap();
+    assert_eq!(fs::read_to_string(config.join("session_old.json")).unwrap(), "mine");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_puts_back_the_session_invalid_json_alvr_overwrites() {
+    let f = fixture("sessioninvalid", |v20| json!([v20]));
+    let config = f.paths.session_file().unwrap().parent().unwrap().to_owned();
+    fs::write(config.join("session.json"), "not json").unwrap();
+    fs::write(config.join("session_invalid.json"), "mine").unwrap();
+    prep(&f.paths);
+    assert_eq!(fs::read_to_string(config.join("session_invalid.json")).unwrap(), "not json");
+    restore(&f.paths).unwrap();
+    assert_eq!(fs::read_to_string(config.join("session_invalid.json")).unwrap(), "mine");
+    assert_eq!(fs::read_to_string(config.join("session.json")).unwrap(), "not json");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn a_stale_snapshot_is_replaced() {
+    let f = fixture("stale", |v20| json!([v20]));
+    prep(&f.paths);
+    assert!(!refresh_stale_snapshot(&f.paths).unwrap(), "the MCP's changes are in place");
+    // the session ended without vr_restore; the user put SteamVR back by hand and kept using it
+    let vrpath = f.root.join("xdg/openvr/openvrpaths.vrpath");
+    let mut openvr: Value = serde_json::from_str(&fs::read_to_string(&vrpath).unwrap()).unwrap();
+    openvr["external_drivers"] = json!([f.root.join("alvr20/lib64/alvr")]);
+    fs::write(&vrpath, openvr.to_string()).unwrap();
+    let vrsettings = f.paths.vrsettings_file().unwrap();
+    fs::write(&vrsettings, r#"{"steamvr":{"x":2}}"#).unwrap();
+    let now = Snap::take(&f.paths);
+
+    assert!(refresh_stale_snapshot(&f.paths).unwrap());
+    restore(&f.paths).unwrap();
+    assert_eq!(fs::read_to_string(&vrsettings).unwrap(), r#"{"steamvr":{"x":2}}"#, "the user's changes survive");
+    assert_eq!(Snap::take(&f.paths), now);
     fs::remove_dir_all(&f.root).ok();
 }

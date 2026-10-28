@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    fs,
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
 };
@@ -16,10 +17,20 @@ pub const VRSETTINGS_KEYS: [(&str, &str); 2] =
     [("steamvr", "forcedDriver"), ("driver_alvr_server", "blocked_by_safe_mode")];
 
 const NO_STREAMER: &str = "ALVR streamer not found; set streamer_dir in config.toml";
+const NO_STEAM: &str = "Steam not found; set steam_dir in config.toml";
+const NO_STEAMVR: &str = "SteamVR not found; set steamvr_dir in config.toml";
+/// What ALVR overwrites next to session.json when it loads one it cannot use (server_io/src/lib.rs load_session).
+const SESSION_SIDE_FILES: [&str; 2] = ["session_old.json", "session_invalid.json"];
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(default)]
 pub struct RestoreState {
+    /// Where the files were at snapshot time; restore writes there. None in an old restore.json.
+    pub paths: Option<SnapshotPaths>,
+    /// Set once a restore began, so a half-restored setup never counts as stale.
+    pub restoring: bool,
+    /// SESSION_SIDE_FILES as they were. Empty in an old restore.json.
+    pub session_backups: BTreeMap<PathBuf, FileState>,
     /// The original `external_drivers` value, written back verbatim (null included).
     pub external_drivers: Value,
     /// "section/key" -> original (None = absent). Only an old restore.json has it.
@@ -36,6 +47,15 @@ pub struct RestoreState {
 pub enum FileState {
     Absent,
     Contents(String),
+}
+
+/// Absolute paths, as Paths gave them at snapshot time.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SnapshotPaths {
+    pub vrsettings: PathBuf,
+    pub session: PathBuf,
+    pub vrcompositor: PathBuf,
+    pub driver_dir: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -113,7 +133,52 @@ fn read_json(path: &Path) -> Result<Value> {
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<()> {
-    fs::write(path, serde_json::to_string_pretty(value)?).with_context(|| path.display().to_string())
+    write_atomic(path, serde_json::to_string_pretty(value)?.as_bytes())
+}
+
+/// Temp file in the same dir, fsync, rename (as lease.rs does): a crash leaves the old file or the new one, never a torn one.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    // a symlinked file keeps its link: the target is replaced
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let name = path.file_name().with_context(|| path.display().to_string())?.to_string_lossy();
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    let mut file = fs::File::create(&tmp).with_context(|| tmp.display().to_string())?;
+    file.write_all(contents).and_then(|()| file.sync_all()).with_context(|| tmp.display().to_string())?;
+    fs::rename(&tmp, &path).with_context(|| path.display().to_string())?;
+    // so the rename itself survives a power loss
+    fs::File::open(path.parent().unwrap_or(Path::new("."))).and_then(|d| d.sync_all()).ok();
+    Ok(())
+}
+
+/// Writes `state` back to `path`: its contents, or no file.
+fn put_file(path: &Path, state: &FileState) -> Result<()> {
+    match state {
+        FileState::Contents(text) => write_atomic(path, text.as_bytes()),
+        FileState::Absent => remove_file(path),
+    }
+}
+
+fn file_state(path: &Path) -> Result<FileState> {
+    match path.exists() {
+        true => Ok(FileState::Contents(fs::read_to_string(path).with_context(|| path.display().to_string())?)),
+        false => Ok(FileState::Absent),
+    }
+}
+
+/// The paths a snapshot records, from the current Paths.
+fn current_paths(paths: &Paths) -> Result<SnapshotPaths> {
+    let abs = |p: Option<PathBuf>, missing: &'static str| -> Result<PathBuf> { Ok(std::path::absolute(p.context(missing)?)?) };
+    Ok(SnapshotPaths {
+        vrsettings: abs(paths.vrsettings_file(), NO_STEAM)?,
+        session: abs(paths.session_file(), NO_STREAMER)?,
+        vrcompositor: abs(paths.vrcompositor(), NO_STEAMVR)?,
+        driver_dir: abs(paths.driver_dir(), NO_STREAMER)?,
+    })
+}
+
+/// Where restore writes: the recorded paths, or the current ones for an old restore.json.
+fn restore_paths(paths: &Paths, state: &RestoreState) -> Result<SnapshotPaths> {
+    state.paths.clone().map_or_else(|| current_paths(paths), Ok)
 }
 
 /// Sets `section.key`, or removes it (and its section once empty) for None.
@@ -209,43 +274,97 @@ fn wrapped_vrcompositor(compositor: &Path) -> Result<Option<VrcompositorWrap>> {
 }
 
 fn read_state(paths: &Paths) -> Result<RestoreState> {
-    serde_json::from_str(&fs::read_to_string(paths.restore_file()).context("no restore.json: nothing to restore")?)
-        .context("parsing restore.json")
+    let file = paths.restore_file();
+    let text = fs::read_to_string(&file).context("no restore.json: nothing to restore")?;
+    serde_json::from_str(&text).with_context(|| {
+        format!("{} does not parse; inspect it, put back by hand what you need from it, then delete it", file.display())
+    })
 }
 
 fn write_state(paths: &Paths, state: &RestoreState) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
-    fs::write(paths.restore_file(), serde_json::to_string_pretty(state)?).context("writing restore.json")
+    write_atomic(&paths.restore_file(), serde_json::to_string_pretty(state)?.as_bytes()).context("writing restore.json")
 }
 
 fn list_dir(dir: &Path) -> BTreeSet<PathBuf> {
     fs::read_dir(dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default()
 }
 
-/// Writes restore.json from the current files, only if absent. Some(state) when written.
-pub fn snapshot(paths: &Paths) -> Result<Option<RestoreState>> {
-    if paths.restore_file().exists() {
-        return Ok(None);
-    }
-    let session_file = paths.session_file().context(NO_STREAMER)?;
-    let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
-    let compositor = paths.vrcompositor().context("SteamVR not found; set steamvr_dir in config.toml")?;
-    let state = RestoreState {
+/// The current files, as restore.json records them.
+fn take_snapshot(paths: &Paths) -> Result<RestoreState> {
+    let at = current_paths(paths)?;
+    let session_backups = SESSION_SIDE_FILES
+        .iter()
+        .map(|name| {
+            let path = at.session.with_file_name(name);
+            Ok((path.clone(), file_state(&path)?))
+        })
+        .collect::<Result<_>>()?;
+    Ok(RestoreState {
         external_drivers: alvr_server_io::load_openvr_paths_json()?
             .get("external_drivers")
             .cloned()
             .unwrap_or(Value::Null),
         vrsettings: BTreeMap::new(),
-        vrsettings_file: Some(FileState::Contents(fs::read_to_string(&vrsettings).with_context(|| vrsettings.display().to_string())?)),
-        session: Some(match session_file.exists() {
-            true => FileState::Contents(fs::read_to_string(&session_file).with_context(|| session_file.display().to_string())?),
-            false => FileState::Absent,
-        }),
+        vrsettings_file: Some(FileState::Contents(fs::read_to_string(&at.vrsettings).with_context(|| at.vrsettings.display().to_string())?)),
+        session: Some(file_state(&at.session)?),
+        session_backups,
         created_files: vec![],
-        vrcompositor: wrapped_vrcompositor(&compositor)?,
-    };
-    write_state(paths, &state)?;
-    Ok(Some(state))
+        vrcompositor: wrapped_vrcompositor(&at.vrcompositor)?,
+        paths: Some(at),
+        restoring: false,
+    })
+}
+
+/// Writes restore.json from the current files, only if absent. Some(state) when written. An existing one must
+/// parse and match the current paths, so prepare never changes files a restore would not put back.
+pub fn snapshot(paths: &Paths) -> Result<Option<RestoreState>> {
+    if !paths.restore_file().exists() {
+        let state = take_snapshot(paths)?;
+        write_state(paths, &state)?;
+        return Ok(Some(state));
+    }
+    let (state, now) = (read_state(paths)?, current_paths(paths)?);
+    let Some(then) = state.paths else { return Ok(None) };
+    let pairs = [
+        ("steamvr.vrsettings", &then.vrsettings, &now.vrsettings),
+        ("the ALVR session", &then.session, &now.session),
+        ("vrcompositor", &then.vrcompositor, &now.vrcompositor),
+        ("the ALVR driver", &then.driver_dir, &now.driver_dir),
+    ];
+    if let Some((what, then, now)) = pairs.into_iter().find(|(_, then, now)| then != now) {
+        bail!(
+            "restore.json has {what} at {}, but the config now gives {}; run vr_restore first (it restores to the recorded paths)",
+            then.display(),
+            now.display()
+        );
+    }
+    Ok(None)
+}
+
+/// Whether `a` and `b` name the same directory.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || fs::canonicalize(a).is_ok_and(|a| fs::canonicalize(b).is_ok_and(|b| a == b))
+}
+
+/// For a cold vr_start: a restore.json whose setup carries none of the MCP's changes (forcedDriver is not ALVR's and
+/// its driver is not registered: the user put SteamVR back by hand since) would revert everything done since, so a
+/// fresh snapshot replaces it. A half-done restore is never stale. True when replaced.
+pub fn refresh_stale_snapshot(paths: &Paths) -> Result<bool> {
+    if !paths.restore_file().exists() {
+        return Ok(false);
+    }
+    let state = read_state(paths)?;
+    let at = restore_paths(paths, &state)?;
+    let (section, key) = VRSETTINGS_KEYS[0];
+    // unreadable counts as changed: keep the snapshot when unsure
+    let forced = read_json(&at.vrsettings).map_or(true, |s| s[section][key] == "alvr_server");
+    let registered = alvr_server_io::get_registered_drivers().map_or(true, |d| d.iter().any(|d| same_dir(d, &at.driver_dir)));
+    if state.restoring || forced || registered {
+        return Ok(false);
+    }
+    write_state(paths, &take_snapshot(paths)?)?;
+    Ok(true)
 }
 
 /// Registers the headset as a trusted client reached at 127.0.0.1, without mDNS or the trust prompt.
@@ -262,8 +381,8 @@ pub fn client_actions() -> [ClientConnectionsAction; 3] {
 pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Result<PrepareReport> {
     let driver_dir = paths.driver_dir().context(NO_STREAMER)?;
     let session_file = paths.session_file().context(NO_STREAMER)?;
-    let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
-    let compositor = paths.vrcompositor().context("SteamVR not found; set steamvr_dir in config.toml")?;
+    let vrsettings = paths.vrsettings_file().context(NO_STEAM)?;
+    let compositor = paths.vrcompositor().context(NO_STEAMVR)?;
     let config_dir = session_file.parent().context("session file has no parent")?;
 
     // 1. snapshot
@@ -281,7 +400,7 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     // 3. vrcompositor wrapper
     let wrap = wrapped_vrcompositor(&compositor)?;
     if let Some(wrap) = &wrap {
-        fs::remove_file(&compositor).with_context(|| compositor.display().to_string())?;
+        // one rename replaces the symlink, so a crash never leaves SteamVR without a vrcompositor
         fs::rename(&wrap.real_path, &compositor).with_context(|| format!("{} -> {}", wrap.real_path.display(), compositor.display()))?;
     }
 
@@ -310,9 +429,15 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     Ok(PrepareReport { snapshot_written, unblocked_safe_mode, unwrapped_vrcompositor: wrap.is_some() })
 }
 
-/// Puts back everything restore.json recorded, then deletes it.
-pub fn restore(paths: &Paths) -> Result<()> {
-    let state = read_state(paths)?;
+/// Puts back everything restore.json recorded, at the paths it recorded, then deletes it. Every step can run
+/// again, so a retry after a failure finishes the job. Returns notes on what it left as it was.
+pub fn restore(paths: &Paths) -> Result<Vec<String>> {
+    let mut state = read_state(paths)?;
+    let at = restore_paths(paths, &state)?;
+    if !state.restoring {
+        state.restoring = true;
+        write_state(paths, &state)?;
+    }
 
     let mut json = alvr_server_io::load_openvr_paths_json()?;
     json.as_object_mut()
@@ -321,41 +446,48 @@ pub fn restore(paths: &Paths) -> Result<()> {
     alvr_server_io::save_openvr_paths_json(&json)?;
 
     if let Some(original) = &state.vrsettings_file {
-        let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
-        match original {
-            FileState::Contents(text) => fs::write(&path, text).with_context(|| path.display().to_string())?,
-            FileState::Absent => remove_file(&path)?,
-        }
+        put_file(&at.vrsettings, original)?;
     } else if !state.vrsettings.is_empty() {
-        let path = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
-        let mut settings = read_json(&path)?;
+        let mut settings = read_json(&at.vrsettings)?;
         for (name, original) in &state.vrsettings {
             let (section, key) = name.split_once('/').context("bad vrsettings key in restore.json")?;
             put(&mut settings, section, key, original.clone());
         }
-        write_json(&path, &settings)?;
+        write_json(&at.vrsettings, &settings)?;
     }
 
     if let Some(original) = &state.session {
-        let path = paths.session_file().context(NO_STREAMER)?;
-        match original {
-            FileState::Contents(text) => fs::write(&path, text).with_context(|| path.display().to_string())?,
-            FileState::Absent => remove_file(&path)?,
-        }
+        put_file(&at.session, original)?;
     }
     for file in &state.created_files {
         remove_file(file)?;
     }
+    for (file, original) in &state.session_backups {
+        put_file(file, original)?;
+    }
 
-    if let Some(wrap) = &state.vrcompositor {
-        let compositor = paths.vrcompositor().context("SteamVR not found; set steamvr_dir in config.toml")?;
-        if fs::read_link(&compositor).is_err() {
-            fs::rename(&compositor, &wrap.real_path).with_context(|| format!("{} -> {}", compositor.display(), wrap.real_path.display()))?;
-            std::os::unix::fs::symlink(&wrap.link_target, &compositor).with_context(|| compositor.display().to_string())?;
+    let mut notes = vec![];
+    if let Some(wrap) = &state.vrcompositor
+        && fs::read_link(&at.vrcompositor).is_err()
+    {
+        let compositor = &at.vrcompositor;
+        let target = compositor.parent().context("vrcompositor has no parent")?.join(&wrap.link_target);
+        if !target.exists() {
+            notes.push(format!("left Valve's vrcompositor in place: the wrapper it linked to, {}, is gone", target.display()));
+        } else {
+            // a retry after a crash finds Valve's binary already moved back
+            if !wrap.real_path.exists() {
+                fs::rename(compositor, &wrap.real_path).with_context(|| format!("{} -> {}", compositor.display(), wrap.real_path.display()))?;
+            }
+            let tmp = compositor.with_file_name("vrcompositor.tmp");
+            remove_file(&tmp)?;
+            std::os::unix::fs::symlink(&wrap.link_target, &tmp).with_context(|| tmp.display().to_string())?;
+            fs::rename(&tmp, compositor).with_context(|| compositor.display().to_string())?;
         }
     }
 
-    remove_file(&paths.restore_file())
+    remove_file(&paths.restore_file())?;
+    Ok(notes)
 }
 
 #[cfg(test)]
