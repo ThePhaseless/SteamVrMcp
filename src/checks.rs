@@ -510,9 +510,10 @@ mod tests {
         assert_eq!(tool_ready("bogus", &all_ready()), Err("unknown tool".to_owned()));
     }
 
+    // Not through startup_checks: that reads the real config.toml, opens the default audio input and a GPU render node.
     #[test]
-    fn startup_checks_report_missing_streamer() {
-        let paths = Paths {
+    fn streamer_check_reports_a_missing_or_foreign_streamer() {
+        let mut paths = Paths {
             steam_dir: None,
             flatpak_steam: false,
             steamvr_dir: None,
@@ -520,11 +521,10 @@ mod tests {
             state_dir: "/nonexistent".into(),
             runtime_dir: "/nonexistent".into(),
         };
-        let checks = startup_checks(&Config::default(), &paths);
-        let streamer = checks.iter().find(|c| c.name == "alvr_streamer").unwrap();
-        assert!(!streamer.ok && streamer.fix.contains("streamer_dir"), "{streamer:?}");
-        assert!(checks.iter().all(|c| !c.fix.is_empty()));
-        assert!(checks.iter().find(|c| c.name == "screenshot_decoder").unwrap().ok);
+        assert_eq!(streamer(&paths), Err("ALVR streamer not found".to_owned()));
+        paths.streamer_dir = Some("/nonexistent".into());
+        assert_eq!(streamer(&paths), Err("no ALVR driver.vrdrivermanifest in /nonexistent/lib64/alvr".to_owned()));
+        assert!(openh264::decoder::Decoder::new().is_ok(), "screenshot_decoder holds on every machine");
     }
 
     #[test]

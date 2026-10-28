@@ -334,9 +334,23 @@ pub fn shortcut_game_id(appid: u32) -> u64 {
 }
 
 // shortcut: line-oriented VDF scan without escape handling; switch to a parser if Valve changes the format or a value holds a quote
-/// The quoted tokens of a text VDF line.
+/// A text VDF line up to its `//` comment; a `//` inside quotes is part of a token.
+fn code(line: &str) -> &str {
+    let mut at = 0;
+    for (i, part) in line.split('"').enumerate() {
+        if i % 2 == 0
+            && let Some(c) = part.find("//")
+        {
+            return &line[..at + c];
+        }
+        at += part.len() + 1;
+    }
+    line
+}
+
+/// The quoted tokens of a text VDF line, comment excluded.
 fn tokens(line: &str) -> Vec<&str> {
-    line.split('"').skip(1).step_by(2).collect()
+    code(line).split('"').skip(1).step_by(2).collect()
 }
 
 /// The first `"key" "value"` pair's value with this key.
@@ -375,10 +389,11 @@ pub(crate) fn entry_value<'a>(vdf: &'a str, section: &str, entry: &str, key: &st
     let lines = vdf.lines().skip_while(|l| tokens(l) != [section]).skip(1);
     let (mut depth, mut in_entry) = (0, false);
     for line in lines {
-        match (line.trim(), &tokens(line)[..]) {
+        // in_entry changes only at the next depth-1 key, so a block nested in the entry keeps it
+        match (code(line).trim(), &tokens(line)[..]) {
             ("{", _) => depth += 1,
             ("}", _) if depth == 1 => return None,
-            ("}", _) => (depth, in_entry) = (depth - 1, false),
+            ("}", _) => depth -= 1,
             (_, [k]) if depth == 1 => in_entry = *k == entry,
             (_, [k, v]) if depth == 2 && in_entry && *k == key => return Some(v),
             _ => (),
@@ -544,13 +559,13 @@ pub fn url_not_taken(since: &str, tail: &str, url: &str) -> Option<String> {
 }
 
 /// None while Steam may still take `url`, or once `since` showed it took it: `taken` latches that, so
-/// later polls skip the scan. After URL_TAKEN_WAIT without it, url_not_taken's message; only then is `tail` read.
-fn url_check(taken: &mut bool, since: &str, waited: Duration, url: &str, tail: impl FnOnce() -> String) -> Option<String> {
+/// later polls skip the scan. Once the wait for it `expired` without it, url_not_taken's message; only then is `tail` read.
+fn url_check(taken: &mut bool, since: &str, expired: bool, url: &str, tail: impl FnOnce() -> String) -> Option<String> {
     if *taken {
         return None;
     }
     *taken = since.contains(&format!("ExecuteSteamURL: \"{url}\""));
-    if *taken || waited < URL_TAKEN_WAIT {
+    if *taken || !expired {
         return None;
     }
     url_not_taken(since, &tail(), url)
@@ -562,7 +577,19 @@ const DIALOG_GRACE: Duration = Duration::from_secs(10);
 /// wait_for for a launch through Steam, which fails fast once Steam waits on a desktop dialog
 /// (console log lines after `log_from`). `handed_url` is the URL launch() gave an already running Steam:
 /// it also fails fast when Steam logs no ExecuteSteamURL for it within URL_TAKEN_WAIT.
-pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option<&str>, timeout: Duration, mut done: impl FnMut() -> bool) -> Result<bool> {
+pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option<&str>, timeout: Duration, done: impl FnMut() -> bool) -> Result<bool> {
+    wait_launched_within((URL_TAKEN_WAIT, DIALOG_GRACE), steam_dir, log_from, handed_url, timeout, done)
+}
+
+/// wait_launched with its (URL_TAKEN_WAIT, DIALOG_GRACE), which tests shorten.
+fn wait_launched_within(
+    (url_wait, grace): (Duration, Duration),
+    steam_dir: Option<&Path>,
+    log_from: u64,
+    handed_url: Option<&str>,
+    timeout: Duration,
+    mut done: impl FnMut() -> bool,
+) -> Result<bool> {
     let (mut since, mut blocked) = (None, None);
     let (began, mut not_taken, mut taken) = (Instant::now(), None, false);
     let finished = wait_for(timeout, || {
@@ -573,7 +600,7 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option
         let log = steam_dir.map(|d| console_log_since(d, log_from));
         if let (Some(d), Some(log), Some(url)) = (steam_dir, &log, handed_url) {
             // shortcut: counts from the hand-off, so a Steam still starting up (login, self-update) can miss it; count from its startup line if that shows up in reports
-            not_taken = url_check(&mut taken, log, began.elapsed(), url, || log_tail(d, "console_log", 200).join("\n"));
+            not_taken = url_check(&mut taken, log, began.elapsed() >= url_wait, url, || log_tail(d, "console_log", 200).join("\n"));
             if not_taken.is_some() {
                 return true;
             }
@@ -583,7 +610,7 @@ pub fn wait_launched(steam_dir: Option<&Path>, log_from: u64, handed_url: Option
         if pending.is_none() {
             since = None;
         }
-        blocked = pending.filter(|_| started.elapsed() >= DIALOG_GRACE);
+        blocked = pending.filter(|_| started.elapsed() >= grace);
         blocked.is_some()
     });
     if let Some(msg) = not_taken {
@@ -845,12 +872,12 @@ mod tests {
     fn a_taken_url_stays_taken() {
         let url = "steam://rungameid/250820";
         let mut taken = false;
-        assert_eq!(url_check(&mut taken, "", Duration::ZERO, url, || panic!("tail read before the wait ran out")), None);
-        assert_eq!(url_check(&mut taken, &format!("ExecuteSteamURL: \"{url}\"\n"), Duration::ZERO, url, || panic!("tail read")), None);
+        assert_eq!(url_check(&mut taken, "", false, url, || panic!("tail read before the wait ran out")), None);
+        assert_eq!(url_check(&mut taken, &format!("ExecuteSteamURL: \"{url}\"\n"), false, url, || panic!("tail read")), None);
         assert!(taken);
-        assert_eq!(url_check(&mut taken, "", URL_TAKEN_WAIT, url, || panic!("tail read after the URL was taken")), None, "a rotated log does not undo it");
+        assert_eq!(url_check(&mut taken, "", true, url, || panic!("tail read after the URL was taken")), None, "a rotated log does not undo it");
         let mut taken = false;
-        assert!(url_check(&mut taken, "", URL_TAKEN_WAIT, url, String::new).unwrap().starts_with("Steam did not take"));
+        assert!(url_check(&mut taken, "", true, url, String::new).unwrap().starts_with("Steam did not take"));
     }
 
     #[test]
@@ -890,6 +917,8 @@ mod tests {
         assert_eq!(compat_tool(CONFIG_VDF, 1), None);
         assert_eq!(compat_tool(CONFIG_VDF, 7), None, "outside CompatToolMapping");
         assert_eq!(compat_tool(CONFIG_VDF, 0).as_deref(), Some("proton_9"), "Steam's default");
+        let nested = "\"CompatToolMapping\"\n{\n\t\"620980\"\n\t{\n\t\t\"sub\"\n\t\t{\n\t\t\t\"x\"\t\"y\"\n\t\t}\n\t\t\"name\"\t\"proton_x\"\n\t}\n}\n";
+        assert_eq!(compat_tool(nested, 620980).as_deref(), Some("proton_x"), "a key after a nested block");
     }
 
     fn fake_steam(name: &str) -> PathBuf {
@@ -961,6 +990,60 @@ mod tests {
         fs::remove_dir_all(&steam).ok();
     }
 
+    /// A fake Steam with a console log, its length before the launch, and a ShowInterstitials line of `action`.
+    fn launch_log(name: &str) -> (PathBuf, u64, impl Fn(u32, &str)) {
+        let steam = fake_steam(name);
+        fs::create_dir_all(steam.join("logs")).unwrap();
+        let log = steam.join("logs/console_log.txt");
+        fs::write(&log, "before the launch\n").unwrap();
+        let append = move |action: u32, what: &str| {
+            use std::io::Write;
+            let line = format!("[x] GameAction [AppID 620980, ActionID {action}] : LaunchApp {what}\n");
+            fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(line.as_bytes()).unwrap();
+        };
+        (steam.clone(), console_log_len(&steam), append)
+    }
+    const WAITING: &str = "waiting for user response to ShowInterstitials \"\"";
+    const CONTINUES: &str = "continues with user response \"ShowInterstitials\"";
+
+    #[test]
+    fn a_dialog_fails_the_launch_after_a_grace_that_restarts_when_it_clears() {
+        let (steam, from, append) = launch_log("wait-launched-grace");
+        let polls = std::cell::Cell::new(0);
+        // done() runs before each poll's log read, so the log changes at known polls whatever the load
+        let done = || {
+            polls.set(polls.get() + 1);
+            match polls.get() {
+                1 => append(1, WAITING),
+                2 => append(1, CONTINUES),
+                3 => append(2, WAITING),
+                _ => (),
+            }
+            false
+        };
+        // polls are >= 100 ms apart: poll 3 is >= 200 ms after the first wait, under the grace after the second
+        let grace = Duration::from_millis(150);
+        let e = wait_launched_within((URL_TAKEN_WAIT, grace), Some(&steam), from, None, Duration::from_secs(10), done).unwrap_err();
+        assert!(e.to_string().contains("dialog on the desktop (ShowInterstitials for AppID 620980)"), "{e:#}");
+        assert!((4..=5).contains(&polls.get()), "the grace counts from the second wait, at poll 3: failed at poll {}", polls.get());
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn launch_wait_outcomes_rank_done_then_url_then_dialog() {
+        let (steam, from, append) = launch_log("wait-launched-rank");
+        append(3, WAITING);
+        let (now, timeout) = ((Duration::ZERO, Duration::ZERO), Duration::from_secs(10));
+        assert!(wait_launched_within(now, Some(&steam), from, None, timeout, || true).unwrap(), "done wins over a dialog");
+        let e = wait_launched_within(now, Some(&steam), from, Some("steam://rungameid/1"), timeout, || false).unwrap_err();
+        assert!(e.to_string().contains("Steam did not take steam://rungameid/1"), "an untaken URL wins over the dialog: {e:#}");
+        let e = wait_launched_within(now, Some(&steam), from, None, timeout, || false).unwrap_err();
+        assert!(e.to_string().contains("waiting for a dialog"), "{e:#}");
+        append(3, CONTINUES);
+        assert!(!wait_launched_within(now, Some(&steam), from, None, Duration::from_millis(250), || false).unwrap(), "a cleared dialog only times out");
+        fs::remove_dir_all(&steam).ok();
+    }
+
     #[test]
     fn leftover_vr_processes_need_cleanup() {
         assert!(has_leftovers(&["steamtours", "vrmonitor"]), "Steam refuses the relaunch: WaitingPrevProcess");
@@ -1012,7 +1095,9 @@ mod tests {
         assert_eq!(signalable(0), None, "0 is our own process group");
         assert_eq!(signalable(i32::MAX as u32 + 1), None, "negative as i32: a process group");
         assert_eq!(signalable(u32::MAX), None, "-1: every process");
-        assert_eq!(signalable(4242), Some(4242));
+        let (me, group) = (std::process::id(), unsafe { libc::getpgrp() } as u32);
+        let other = (4242..).find(|p| ![me, group].contains(p)).unwrap();
+        assert_eq!(signalable(other), Some(other as i32));
         assert_eq!(signalable(1), None, "init");
         assert_eq!(signalable(std::process::id()), None, "this MCP");
         assert_eq!(signalable(unsafe { libc::getpgrp() } as u32), None, "our group's leader, e.g. the agent that started the MCP");

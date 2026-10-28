@@ -44,10 +44,9 @@ fn dashboard_child_role() {
 #[test]
 #[ignore]
 fn live_prepare_restore_round_trip() {
-    let vrserver_running = std::fs::read_dir("/proc").unwrap().flatten().any(|e| {
-        std::fs::read_to_string(e.path().join("comm")).is_ok_and(|c| c.trim() == "vrserver")
-    });
-    assert!(!vrserver_running, "vrserver is running; close SteamVR before this test");
+    if steamvr::is_steamvr_running() {
+        return eprintln!("skipped: vrserver is running; close SteamVR (or run live_zz_stop_and_restore) first");
+    }
 
     let cfg = Config::load().unwrap();
     let paths = Paths::detect(&cfg);
@@ -88,7 +87,9 @@ fn live_prepare_restore_round_trip() {
 #[test]
 #[ignore]
 fn live_start_streams_and_stop_cleans() {
-    assert!(!steamvr::is_steam_running(), "close Steam first");
+    if steamvr::is_steam_running() {
+        return eprintln!("skipped: Steam is running; close it first");
+    }
     start_streams_and_stop_cleans(false);
 }
 
@@ -97,7 +98,9 @@ fn live_start_streams_and_stop_cleans() {
 #[test]
 #[ignore]
 fn live_start_streams_and_stop_cleans_with_steam_running() {
-    assert!(steamvr::is_steam_running() && !steamvr::is_steamvr_running(), "start Steam and close SteamVR first");
+    if !steamvr::is_steam_running() || steamvr::is_steamvr_running() {
+        return eprintln!("skipped: needs Steam running and SteamVR closed");
+    }
     start_streams_and_stop_cleans(true);
     assert!(steamvr::is_steam_running(), "the user's Steam was closed");
 }
@@ -178,12 +181,26 @@ fn live_checks_without_config() {
 }
 
 /// The shared stack of the live window: starts it when the headset is not streaming and leaves it running.
-fn ensure_streaming() -> Arc<Stack> {
+/// None, after printing why, when SteamVR runs without ALVR: vr_start refuses that one.
+fn ensure_streaming() -> Option<Arc<Stack>> {
     let stack = shared_stack();
     if !stack.status().headset.is_some_and(|h| h.streaming) {
+        if steamvr::is_steamvr_running() && !steamvr::vrserver_has_alvr() {
+            eprintln!("skipped: SteamVR is running without ALVR; close it first");
+            return None;
+        }
         stack.start().unwrap();
     }
-    stack
+    Some(stack)
+}
+
+/// VR_TEST_GAME_ID, or None after printing that it is unset.
+fn game_id() -> Option<String> {
+    let id = std::env::var("VR_TEST_GAME_ID").ok().filter(|id| !id.is_empty());
+    if id.is_none() {
+        eprintln!("skipped: set VR_TEST_GAME_ID to a VR game's Steam app id or non-Steam shortcut game id");
+    }
+    id
 }
 
 /// The one Stack of this test process.
@@ -200,7 +217,7 @@ fn shared_stack() -> Arc<Stack> {
 #[test]
 #[ignore]
 fn live_screenshot_png() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     let [view_w, view_h] = s.status().headset.unwrap().view_resolution;
     let decode = |png: &[u8]| {
         let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
@@ -228,7 +245,7 @@ fn live_screenshot_png() {
 #[test]
 #[ignore]
 fn live_tracked_head_matches() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     let state = s.tracked_state(false).unwrap();
     println!("{state:#?}\nscene app: {:?}", s.scene_app());
     let hmds: Vec<_> = state.devices.iter().filter(|d| d.class == "hmd").collect();
@@ -248,7 +265,7 @@ fn live_tracked_head_matches() {
 #[test]
 #[ignore]
 fn live_head_move_tracked() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     // later tests in this process expect the default head pose, also after a failed assertion
     struct Reset(Arc<Stack>);
     impl Drop for Reset {
@@ -311,7 +328,7 @@ fn live_head_move_tracked() {
 #[test]
 #[ignore]
 fn live_finger_curls_per_finger() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     /// One finger at 1, the rest at 0; None opens the hand.
     fn curl(s: &Stack, hand: Hand, f: Option<usize>) -> Result<Duration, impl std::fmt::Debug> {
         let v = |k| Some(if f == Some(k) { 1.0 } else { 0.0 });
@@ -368,8 +385,8 @@ fn live_finger_curls_per_finger() {
 #[test]
 #[ignore]
 fn live_game_menu_fps() {
-    let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
-    let s = ensure_streaming();
+    let Some(id) = game_id() else { return };
+    let Some(s) = ensure_streaming() else { return };
     steamvr::launch(&Config::load().unwrap(), &format!("steam://rungameid/{id}")).unwrap();
     let running = steamvr::wait_for(Duration::from_secs(180), || s.scene_app().is_some_and(|a| a.state == "running"));
     let app = s.scene_app();
@@ -391,8 +408,8 @@ fn live_game_menu_fps() {
 #[test]
 #[ignore]
 fn live_launch_app_reaches_menu() {
-    let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
-    let s = ensure_streaming();
+    let Some(id) = game_id() else { return };
+    let Some(s) = ensure_streaming() else { return };
     let report = s.launch_app(LaunchArgs { app_id: id.clone(), ..Default::default() }).unwrap();
     println!("{report:?}");
     assert!(report.scene_pid > 0);
@@ -429,8 +446,8 @@ fn live_swing_with_trigger() {
         reader.next_frame(&mut rgb).unwrap();
         rgb
     };
-    let id = std::env::var("VR_TEST_GAME_ID").expect("set VR_TEST_GAME_ID");
-    let s = ensure_streaming();
+    let Some(id) = game_id() else { return };
+    let Some(s) = ensure_streaming() else { return };
     let app = s.launch_app(LaunchArgs { app_id: id.clone(), ..Default::default() }).unwrap();
     thread::sleep(Duration::from_secs(15)); // the menu
     let a = rgb(&s.screenshot(Source::Headset, Eye::Left).unwrap().png);
@@ -622,7 +639,7 @@ fn rows(hand: Hand) -> Vec<Row> {
 #[test]
 #[ignore]
 fn live_index_inputs_reach_openxr() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     let probe = Probe::start();
     let mut failures = vec![];
     for hand in [Hand::Left, Hand::Right] {
@@ -668,7 +685,7 @@ fn live_index_inputs_reach_openxr() {
 #[test]
 #[ignore]
 fn live_haptics_recorded() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     let probe = Probe::start();
     s.haptics(f64::NEG_INFINITY, true);
     let a = ButtonArgs { hand: Hand::Left, button: Button::A };
@@ -686,7 +703,7 @@ fn live_haptics_recorded() {
 #[test]
 #[ignore]
 fn live_bare_hand_pinch_is_trigger() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     // later tests in this process expect a right controller, also after a failed assertion
     struct Reset(Arc<Stack>);
     impl Drop for Reset {
@@ -721,7 +738,7 @@ fn preferred_fps(fps: f64) -> Vec<SettingValue> {
 #[test]
 #[ignore]
 fn live_restart_relevant_setting_restarts() {
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     // later tests expect the default 72 Hz, also after a failed assertion
     struct Reset(Arc<Stack>);
     impl Drop for Reset {
@@ -762,7 +779,7 @@ fn live_restart_relevant_setting_restarts() {
 #[ignore]
 fn live_flavour_switch() {
     let started = Instant::now();
-    let s = ensure_streaming();
+    let Some(s) = ensure_streaming() else { return };
     println!("streaming after {:?}", started.elapsed());
     // later tests expect controllers in the Index flavour, also after a failed assertion
     struct Reset(Arc<Stack>);

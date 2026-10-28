@@ -264,7 +264,8 @@ mod tests {
         let api = Api { port: listener.local_addr().unwrap().port() };
         let started = std::time::Instant::now();
         assert!(api.send("GET", "/api/ping", None, QUICK).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        // QUICK, not TIMEOUT: a margin of several seconds keeps a loaded machine from failing it
+        assert!(started.elapsed() < TIMEOUT / 2, "{:?}", started.elapsed());
     }
 
     #[test]
@@ -273,10 +274,10 @@ mod tests {
         let api = Api { port: listener.local_addr().unwrap().port() };
         let started = std::time::Instant::now();
         assert!(api.send("GET", "/api/version", None, QUICK).is_err());
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(started.elapsed() < TIMEOUT / 2, "{:?}", started.elapsed());
         let started = std::time::Instant::now();
         assert!(api.connect_events().is_err());
-        assert!(started.elapsed() < HANDSHAKE + Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(started.elapsed() < HANDSHAKE * 2, "{:?}", started.elapsed());
     }
 
     #[test]

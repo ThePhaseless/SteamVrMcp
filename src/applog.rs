@@ -4,7 +4,7 @@ use alvr_common::warn;
 use regex::Regex;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
@@ -127,7 +127,9 @@ impl App {
             .filter(|p| p.is_file())
             .collect();
         files.sort();
-        files.dedup();
+        // one file reached by two paths (a symlinked dir in a prefix) is tailed once, under its first path
+        let mut seen = BTreeSet::new();
+        files.retain(|p| p.metadata().is_ok_and(|m| seen.insert((m.dev(), m.ino()))));
         files
     }
 
@@ -335,6 +337,21 @@ mod tests {
         fs::write(install.join("Player.log"), "3\n").unwrap();
         logs.poll(Some(&steam));
         assert_eq!(texts(&logs, 0), ["2", "3"]);
+        fs::remove_dir_all(&steam).ok();
+    }
+
+    #[test]
+    fn a_file_reached_by_two_paths_is_tailed_once() {
+        let (steam, install, mut logs) = game("symlink", &["${install}/*/*.log"]);
+        fs::create_dir_all(install.join("logs")).unwrap();
+        std::os::unix::fs::symlink(install.join("logs"), install.join("z-link")).unwrap(); // as in a Proton prefix
+        fs::write(install.join("logs/a.log"), "").unwrap();
+        logs.poll(Some(&steam));
+        append(&install.join("logs/a.log"), "1\n");
+        logs.poll(Some(&steam));
+        let page = logs.page(42, 0).unwrap();
+        assert_eq!(page.lines.iter().map(|l| (l.text.as_str(), l.file.clone())).collect::<Vec<_>>(), [("1", install.join("logs/a.log").display().to_string())]);
+        assert_eq!(page.files, [install.join("logs/a.log").display().to_string()], "the first path in path order");
         fs::remove_dir_all(&steam).ok();
     }
 

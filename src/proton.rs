@@ -347,6 +347,8 @@ mod tests {
         write(&ge.join("toolmanifest.vdf"), MANIFEST);
         assert_eq!(custom_tool_path(vdf, "GE-Proton10").as_deref(), Some("."));
         assert_eq!(custom_tool_path(vdf, "x"), None, "the display name is not the internal name");
+        let commented = "\"compat_tools\"\n{\n  \"T\" // \"internal\" name\n  {\n    // \"install_path\" \"wrong\"\n    \"install_path\" \"a//b\" // \".\" for a subdir\n  }\n}\n";
+        assert_eq!(custom_tool_path(commented, "T").as_deref(), Some("a//b"), "// starts a comment only outside quotes");
         assert_eq!(tool_dir(&steam, "GE-Proton10").unwrap().as_os_str(), ge.as_os_str());
         assert!(tool_dir(&steam, "Nope-1").unwrap_err().to_string().contains("\"Nope-1\""));
         fs::remove_dir_all(&steam).ok();
