@@ -416,7 +416,7 @@ impl VrServer {
 
     #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs.")]
     async fn vr_restore(&self) -> Result<CallToolResult, String> {
-        self.run(|s| json(s.restore().map(|()| serde_json::json!({ "restored": true }))?)).await.map_err(message)
+        self.run(|s| json(s.restore().map(|notes| serde_json::json!({ "restored": true, "notes": notes }))?)).await.map_err(message)
     }
 }
 

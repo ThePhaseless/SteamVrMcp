@@ -628,9 +628,10 @@ pub fn launch_guard(steamvr_running: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn restore_guard(steamvr_running: bool) -> Result<()> {
-    if steamvr_running {
-        bail!("SteamVR is running; run vr_stop first");
+/// Any live VR_PROCESS_NAMES process (vrmonitor, vrcompositor, ...) can rewrite steamvr.vrsettings after the restore.
+pub fn restore_guard(alive: &[&str]) -> Result<()> {
+    if !alive.is_empty() {
+        bail!("SteamVR processes still run ({}) and may rewrite steamvr.vrsettings; run vr_stop first", alive.join(", "));
     }
     Ok(())
 }
@@ -857,11 +858,17 @@ impl Stack {
         }
     }
 
-    pub fn restore(&self) -> Result<()> {
-        restore_guard(steamvr::is_steamvr_running())?;
-        setup::restore(&self.paths())?;
+    /// Holds `starting` and `restarting` throughout, so no vr_start snapshots or prepares while restore.json goes away.
+    pub fn restore(&self) -> Result<Vec<String>> {
+        let Some(_starting) = self.starting.try_lock() else { bail!("vr_start is running; run vr_stop first") };
+        let Some(_restarting) = self.restarting.try_lock() else { bail!("SteamVR is stopping or restarting") };
+        if self.state.lock().managing {
+            bail!("a vr_start session runs; run vr_stop first");
+        }
+        restore_guard(&self.vr.alive())?; // the Stack's VrProcs: a unit test never sees the user's SteamVR
+        let notes = setup::restore(&self.paths())?;
         self.release_after_success();
-        Ok(())
+        Ok(notes)
     }
 
     /// A screenshot of the headset's stream, or of the compositor's scene textures. The waits run outside the state lock.
@@ -1280,6 +1287,9 @@ impl Stack {
                 bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", self.vr.alive(), self.vr.kill_wait.as_secs());
             }
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
+            if setup::refresh_stale_snapshot(&self.paths())? {
+                report.notes.push("restore.json predated a SteamVR setup without the MCP's changes; took a fresh snapshot".into());
+            }
             setup::snapshot(&self.paths())?;
             let unblocked = setup::undo_safe_mode_blocks(&self.paths())?;
             if !unblocked.is_empty() {
@@ -2448,9 +2458,25 @@ mod tests {
     }
 
     #[test]
-    fn vr_restore_refuses_while_steamvr_runs() {
-        assert_eq!(restore_guard(true).unwrap_err().to_string(), "SteamVR is running; run vr_stop first");
-        assert!(restore_guard(false).is_ok());
+    fn vr_restore_refuses_while_any_steamvr_process_runs() {
+        assert_eq!(
+            restore_guard(&["vrcompositor", "vrmonitor"]).unwrap_err().to_string(),
+            "SteamVR processes still run (vrcompositor, vrmonitor) and may rewrite steamvr.vrsettings; run vr_stop first"
+        );
+        assert!(restore_guard(&[]).is_ok());
+    }
+
+    #[test]
+    fn vr_restore_refuses_while_a_start_restart_or_session_runs() {
+        let stack = test_stack();
+        let starting = stack.starting.lock();
+        assert_eq!(stack.restore().unwrap_err().to_string(), "vr_start is running; run vr_stop first");
+        drop(starting);
+        let restarting = stack.restarting.lock();
+        assert_eq!(stack.restore().unwrap_err().to_string(), "SteamVR is stopping or restarting");
+        drop(restarting);
+        stack.state.lock().managing = true;
+        assert_eq!(stack.restore().unwrap_err().to_string(), "a vr_start session runs; run vr_stop first");
     }
 
     #[test]
