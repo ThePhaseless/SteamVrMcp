@@ -176,6 +176,17 @@ macro_rules! call {
     };
 }
 
+/// Writes an action manifest file that vrserver may be parsing for another MCP: skipped when unchanged,
+/// else a temp file renamed over it, so a reader never sees it truncated.
+fn write_asset(path: &Path, text: &str) -> Result<()> {
+    if fs::read(path).is_ok_and(|now| now == text.as_bytes()) {
+        return Ok(());
+    }
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id())); // per MCP: two may write at once
+    fs::write(&tmp, text).with_context(|| tmp.display().to_string())?;
+    fs::rename(&tmp, path).with_context(|| path.display().to_string())
+}
+
 fn input_ok(e: EVRInputError, what: &str) -> Result<()> {
     if e != 0 {
         bail!("{what}: EVRInputError {e}");
@@ -263,7 +274,7 @@ impl OpenVr {
         let dir = state_dir.join("openvr");
         fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
         for (name, text) in ASSETS {
-            fs::write(dir.join(name), text).with_context(|| dir.join(name).display().to_string())?;
+            write_asset(&dir.join(name), text)?;
         }
         let manifest = CString::new(dir.join(ASSETS[0].0).as_os_str().as_bytes())?;
         input_ok(call!(self.input, SetActionManifestPath, manifest.as_ptr() as *mut _), "SetActionManifestPath")?;
@@ -487,6 +498,25 @@ mod tests {
     use super::*;
     use alvr_common::glam::Quat;
     use std::f32::consts::FRAC_PI_2;
+
+    #[test]
+    fn assets_are_replaced_whole_and_left_alone_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-openvr-assets-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("actions.json");
+        write_asset(&path, "old").unwrap();
+        let ino = fs::metadata(&path).unwrap().ino();
+        write_asset(&path, "old").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().ino(), ino, "same contents: not rewritten");
+        let reader = fs::File::open(&path).unwrap(); // a vrserver mid-parse keeps the old file
+        write_asset(&path, "new").unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), ino, "renamed over, never truncated in place");
+        assert_eq!(std::io::read_to_string(reader).unwrap(), "old");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temp file left");
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn spread_uses_nearest_rank() {
