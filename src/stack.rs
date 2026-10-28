@@ -494,6 +494,8 @@ pub struct Stack {
     lease: Mutex<(String, Duration)>,
     /// The game log rings from `[app_logs]`; rebuilt when the config reloads. Locked briefly, never while sleeping.
     app_logs: Mutex<AppLogs>,
+    /// The processes vr_stop, a restart and a cold vr_start signal.
+    vr: steamvr::VrProcs,
 }
 
 const RECENTER_NOT_STAGE: &str =
@@ -544,6 +546,11 @@ pub fn restore_guard(steamvr_running: bool) -> Result<()> {
 
 impl Stack {
     pub fn new(cfg: Config, paths: Paths) -> Arc<Stack> {
+        // a unit test that reaches stop() must never signal the user's SteamVR
+        Self::with_procs(cfg, paths, if cfg!(test) { steamvr::VrProcs::NONE } else { steamvr::VrProcs::STEAMVR })
+    }
+
+    fn with_procs(cfg: Config, paths: Paths, vr: steamvr::VrProcs) -> Arc<Stack> {
         let app_log_patterns = cfg.app_logs.clone();
         let stack = Arc::new(Stack {
             api: Mutex::new(api_for(&paths)),
@@ -560,6 +567,7 @@ impl Stack {
             alvr_logs: Mutex::default(),
             lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
             app_logs: Mutex::new(AppLogs::new(&app_log_patterns)),
+            vr,
         });
         stack.run_checks();
         let weak = Arc::downgrade(&stack);
@@ -1068,10 +1076,8 @@ impl Stack {
         let mut restart_adopted = false;
         if !steamvr_running {
             foreign_alvr_guard(false, || self.api().ping(), self.api().port)?;
-            if steamvr::has_leftovers(&steamvr::alive_vr_processes()) {
-                if !steamvr::kill_vr_processes() {
-                    bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", steamvr::alive_vr_processes(), steamvr::KILL_WAIT.as_secs());
-                }
+            if steamvr::has_leftovers(&self.vr.alive()) && !self.vr.kill() {
+                bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", self.vr.alive(), self.vr.kill_wait.as_secs());
             }
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
             setup::snapshot(&self.paths())?;
@@ -1191,23 +1197,15 @@ impl Stack {
         if let Some(h) = headset {
             self.dispose(h);
         }
-        // by pid: the name checks below missed a vrserver that lived on 30 s and needed SIGKILL
-        let snapshot = steamvr::vr_snapshot();
+        // by pid: the name checks missed a vrserver that lived on 30 s and needed SIGKILL
+        let snapshot = self.vr.snapshot();
         if self.api().ping() {
             // on failure the signals below still stop SteamVR
             self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
-        let mut gone = steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) || {
-            report.used_signals = true;
-            steamvr::kill_vr_processes()
-        };
-        let survivors = || steamvr::survivors(&snapshot, steamvr::stat);
-        if !survivors().is_empty() {
-            report.used_signals = true;
-            survivors().into_iter().for_each(|pid| steamvr::terminate(pid, libc::SIGKILL));
-            gone = steamvr::wait_for(steamvr::KILL_WAIT, || survivors().is_empty()) && gone;
-        }
-        if gone {
+        let ended = self.vr.end(&snapshot);
+        report.used_signals = ended.used_signals;
+        if ended.gone {
             // SteamVR has exited, so it no longer rewrites the file
             setup::undo_safe_mode_blocks(&self.paths()).map_err(|e| error!("{e:#}")).ok();
         }
@@ -1226,12 +1224,7 @@ impl Stack {
             }
             report.closed_steam = steamvr::wait_gone(&["steam"], Duration::from_secs(60));
         }
-        report.remaining_processes = VR_PROCESS_NAMES
-            .iter()
-            .filter(|n| !steamvr::pids_named(n).is_empty())
-            .map(|n| n.to_string())
-            .chain(survivors().into_iter().map(|pid| format!("pid {pid} ({})", steamvr::process_name(pid).unwrap_or_default())))
-            .collect();
+        report.remaining_processes = self.vr.remaining(&snapshot);
         self.release_if_clean(&report);
         Ok(report)
     }
@@ -1614,7 +1607,7 @@ impl Stack {
         self.drop_reader();
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
-        let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), stopped, &mut started_steam);
+        let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), &self.vr, stopped, &mut started_steam);
         let headset = headset.inspect(Headset::resume).unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
         let spare = {
             let mut state = self.state.lock();
@@ -1912,15 +1905,88 @@ mod tests {
 
     #[test]
     fn vr_stop_clears_safe_mode_blocks_when_steamvr_is_gone() {
-        if !steamvr::alive_vr_processes().is_empty() {
-            return eprintln!("skipped: SteamVR is running");
-        }
         let (stack, root) = blocked_stack("stop", true);
+        assert_eq!(stack.vr.names, steamvr::VrProcs::NONE.names, "unit tests never see the user's SteamVR");
         let file = stack.paths().vrsettings_file().unwrap();
         stack.claim().unwrap();
-        stack.stop().unwrap();
+        stack.state.lock().managing = true; // passes stop_guard whatever SteamVR runs on this machine
+        let report = stack.stop().unwrap();
+        assert!(!report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
         assert!(setup::blocked_drivers(&file).is_empty());
         assert!(stack.status().owner.is_none(), "a finished stop gives up the lease");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A name only this test's fake processes carry.
+    fn fake_name(tag: &str) -> &'static str {
+        Box::leak(format!("vrfake{}{tag}", std::process::id()).into_boxed_str())
+    }
+
+    /// A stack whose stop() ends only processes named `name`, holding its lease in a temp dir.
+    fn fake_vr_stack(name: &'static str, grace_ms: u64) -> (Arc<Stack>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-stack-{name}"));
+        std::fs::remove_dir_all(&root).ok();
+        let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
+        let names = Box::leak(Box::new([name]));
+        let procs = steamvr::VrProcs { names, grace: Duration::from_millis(grace_ms), kill_wait: Duration::from_millis(300) };
+        let stack = Stack::with_procs(Config::default(), paths, procs);
+        *stack.api.lock() = Api { port: 1 };
+        stack.claim().unwrap();
+        stack.state.lock().managing = true;
+        (stack, root)
+    }
+
+    /// Runs `script` in sh with argv0 `name`, reaped by a thread so a killed one leaves no zombie; waits until /proc shows it.
+    fn fake_vr(name: &str, script: &str) -> u32 {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh").arg0(name).args(["-c", script]).spawn().unwrap();
+        let pid = child.id();
+        thread::spawn(move || child.wait());
+        assert!(steamvr::wait_for(Duration::from_secs(5), || steamvr::pids_named(name) == [pid]));
+        pid
+    }
+
+    #[test]
+    fn vr_stop_kills_a_process_that_ignores_sigterm() {
+        let name = fake_name("t");
+        let (stack, root) = fake_vr_stack(name, 200);
+        let pid = fake_vr(name, "trap '' TERM; while :; do sleep 1; done");
+        let report = stack.stop().unwrap();
+        assert!(report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
+        assert!(steamvr::wait_for(Duration::from_secs(2), || steamvr::stat(pid).is_none()), "SIGKILL ended it");
+        assert!(stack.status().owner.is_none(), "clean, so the lease is given up");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_kills_a_snapshot_pid_that_changed_its_name() {
+        let name = fake_name("r");
+        let (stack, root) = fake_vr_stack(name, 5000);
+        // gone by name after 1 s, as a vrserver that renames itself
+        let pid = fake_vr(name, "sleep 1; exec sleep 30");
+        let began = Instant::now();
+        let report = stack.stop().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(4), "the name wait ended when the name went");
+        assert!(report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
+        assert!(steamvr::wait_for(Duration::from_secs(2), || steamvr::stat(pid).is_none()));
+        assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_keeps_the_lease_while_a_process_remains() {
+        let name = fake_name("z");
+        let (stack, root) = fake_vr_stack(name, 200);
+        // an unreaped zombie keeps its comm in /proc and outlives every signal
+        let link = root.join(name);
+        std::os::unix::fs::symlink("/usr/bin/true", &link).unwrap();
+        let mut zombie = std::process::Command::new(&link).spawn().unwrap();
+        assert!(steamvr::wait_for(Duration::from_secs(5), || steamvr::stat(zombie.id()).is_some_and(|(s, _)| s == 'Z')));
+        let report = stack.stop().unwrap();
+        assert!(report.used_signals && report.remaining_processes == [name], "{report:?}");
+        assert!(stack.status().owner.is_some_and(|o| o.mine), "processes remain, so the lease stays");
+        zombie.wait().unwrap();
+        stack.release_lease().unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
