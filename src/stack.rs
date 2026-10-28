@@ -49,6 +49,8 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
+const SESSION_LOST: &str = "SteamVR exited without vr_stop (it crashed or was quit), so the session ended; run vr_start";
+
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a cold vr_start waits for vrserver to log ALVR's HMD activation before it resumes the headset.
@@ -140,7 +142,8 @@ pub struct StatusReport {
     pub on_head: bool,
     /// Only while the OpenVR reader is connected, so vr_status never connects one.
     pub scene_app: Option<openvr::SceneApp>,
-    pub warning: Option<&'static str>,
+    /// What needs the agent's action, "; "-joined: a leaked headset, a session SteamVR's exit ended, a failed restart.
+    pub warning: Option<String>,
     /// The last SteamVR restart that failed, also one the supervisor ran: "<age> s ago: <reason>".
     pub last_restart_error: Option<String>,
     /// Session clock: seconds since MCP start, and the same instant and T0 as RFC 3339 UTC.
@@ -463,6 +466,8 @@ struct State {
     managing: bool,
     /// Bumped by every vr_stop; a vr_start that saw another value bails at its next check.
     stops: u64,
+    /// Why the session ended without vr_stop, for vr_status; cleared by vr_start and vr_stop.
+    ended: Option<&'static str>,
     /// When and why the last SteamVR restart failed.
     last_restart_error: Option<(Instant, String)>,
     /// The last `launch_app via proton` run, until stop_app ends it.
@@ -705,9 +710,34 @@ impl Stack {
         let (owner, ttl) = self.lease.lock().clone();
         let dir = self.paths().runtime_dir;
         // the unlocked read only spares the lock on most ticks; renew checks again under it
-        if watch_renews(managing, lease::read(&dir).as_ref(), std::process::id(), ttl, SystemTime::now()) {
+        let held = lease::read(&dir);
+        if watch_renews(managing, managing && steamvr::is_steamvr_running(), held.as_ref(), std::process::id(), ttl, SystemTime::now()) {
             lease::renew(&dir, &owner, ttl).map_err(|e| warn!("{e:#}")).ok();
         }
+    }
+
+    /// From the watcher: ends a session whose SteamVR has been gone for `gone_for` (it crashed, or the user
+    /// quit it), so its lease is no longer renewed and no supervisor restart starts SteamVR again. Not while
+    /// a vr_start, vr_stop or restart runs, which bring SteamVR down on purpose. Whether it ended one.
+    fn end_lost_session(&self, gone_for: Duration) -> bool {
+        if gone_for < steamvr::VR_EXIT_GRACE {
+            return false;
+        }
+        let (Some(_start), Some(_restart)) = (self.starting.try_lock(), self.restarting.try_lock()) else { return false };
+        let headset = {
+            let mut state = self.state.lock();
+            if !state.managing {
+                return false;
+            }
+            state.managing = false;
+            state.ended = Some(SESSION_LOST);
+            state.headset.take()
+        };
+        warn!("{SESSION_LOST}");
+        if let Some(h) = headset {
+            self.dispose(h);
+        }
+        true
     }
 
     /// A finished stop or restore leaves nothing running, so hold nothing.
@@ -1029,6 +1059,7 @@ impl Stack {
         let epoch = {
             let mut state = self.state.lock();
             state.watchdog_fired = false;
+            state.ended = None;
             state.stops
         };
         let started = self.start_inner(epoch, no_restart);
@@ -1227,6 +1258,7 @@ impl Stack {
             let mut state = self.state.lock();
             state.managing = false;
             state.stops += 1;
+            state.ended = None;
         }
         // an in-flight vr_start bails at its next check; what it left (headset, dashboard, the SteamVR it launched) goes below
         let _no_start = self.starting.lock();
@@ -1279,9 +1311,10 @@ impl Stack {
 
     pub fn status(&self) -> StatusReport {
         let reader_connected = self.reader_connected();
-        let (leaked, last_restart_error) = {
+        let (warnings, last_restart_error) = {
             let state = self.state.lock();
-            (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
+            let warnings: Vec<&str> = [state.leaked.then_some(LEAKED), state.ended].into_iter().flatten().collect();
+            (warnings, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
         };
         let now = clock::now_s();
         let held = lease::read(&self.paths().runtime_dir);
@@ -1295,7 +1328,7 @@ impl Stack {
             headset: self.headset_status(),
             on_head: self.rig.lock().on_head,
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
-            warning: leaked.then_some(LEAKED),
+            warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
             last_restart_error,
             now_t_s: now,
             now_at: clock::at(now),
@@ -1314,7 +1347,7 @@ impl Stack {
             let exited = self.vr_exited(&mut seen); // own statement: it reads `restarting`, not `state`
             let state = self.state.lock();
             aborted = match &state.last_restart_error {
-                _ if !state.managing => Some("vr_stop ended the session".to_owned()),
+                _ if !state.managing => Some(state.ended.unwrap_or("vr_stop ended the session").to_owned()),
                 Some((t, e)) if *t >= since => Some(e.clone()),
                 _ => exited.map(|name| format!("{name} exited before the headset streamed")),
             };
@@ -1714,9 +1747,9 @@ fn dispose_reader(reader: OpenVr) {
 }
 
 /// Whether the watcher renews the lease: only our own (vr_release gave it up for good), only
-/// while we manage a session, and once half the ttl is gone.
-fn watch_renews(managing: bool, held: Option<&Lease>, me: u32, ttl: Duration, now: SystemTime) -> bool {
-    managing && held.is_some_and(|l| l.pid == me && lease::renew_due(l, ttl, now))
+/// while we manage a session whose SteamVR runs, and once half the ttl is gone.
+fn watch_renews(managing: bool, steamvr_running: bool, held: Option<&Lease>, me: u32, ttl: Duration, now: SystemTime) -> bool {
+    managing && steamvr_running && held.is_some_and(|l| l.pid == me && lease::renew_due(l, ttl, now))
 }
 
 /// Why a log wait ends early: the Proton launcher exited, or the scene pid seen at the wait's start is gone.
@@ -1730,9 +1763,15 @@ fn app_exited(launcher: Option<std::process::ExitStatus>, scene_pid: Option<u32>
 /// Recomputes readiness every 1 s and reports changes. Not in `supervise`, which blocks for a whole restart.
 fn watch(stack: Weak<Stack>) {
     let mut last = Readiness::default();
+    // since when a managed session has had no vrserver
+    let mut vr_gone: Option<Instant> = None;
     loop {
         let Some(s) = stack.upgrade() else { return };
         s.pump_reader();
+        vr_gone = (s.state.lock().managing && !steamvr::is_steamvr_running()).then(|| vr_gone.unwrap_or_else(Instant::now));
+        if let Some(t) = vr_gone {
+            s.end_lost_session(t.elapsed());
+        }
         s.keep_lease();
         let steam = s.paths().steam_dir;
         s.app_logs.lock().poll(steam.as_deref());
@@ -2444,12 +2483,35 @@ mod tests {
     fn watch_renews_only_our_lease_while_managing() {
         let (me, ttl, now) = (10, Duration::from_secs(1800), SystemTime::now());
         let ours = |left_s| Lease { owner: "a".into(), pid: me, expires_at: clock::rfc3339(now + Duration::from_secs(left_s)) };
-        assert!(watch_renews(true, Some(&ours(100)), me, ttl, now), "half the ttl is gone");
-        assert!(!watch_renews(true, Some(&ours(1700)), me, ttl, now), "fresh");
-        assert!(watch_renews(true, Some(&Lease { expires_at: "garbage".into(), ..ours(0) }), me, ttl, now), "expired or unreadable");
-        assert!(!watch_renews(false, Some(&ours(100)), me, ttl, now), "no session to keep");
-        assert!(!watch_renews(true, None, me, ttl, now), "vr_release gave it up: do not take it back");
-        assert!(!watch_renews(true, Some(&Lease { pid: 11, ..ours(100) }), me, ttl, now), "another MCP's lease");
+        assert!(watch_renews(true, true, Some(&ours(100)), me, ttl, now), "half the ttl is gone");
+        assert!(!watch_renews(true, true, Some(&ours(1700)), me, ttl, now), "fresh");
+        assert!(watch_renews(true, true, Some(&Lease { expires_at: "garbage".into(), ..ours(0) }), me, ttl, now), "expired or unreadable");
+        assert!(!watch_renews(false, true, Some(&ours(100)), me, ttl, now), "no session to keep");
+        assert!(!watch_renews(true, false, Some(&ours(100)), me, ttl, now), "SteamVR is gone");
+        assert!(!watch_renews(true, true, None, me, ttl, now), "vr_release gave it up: do not take it back");
+        assert!(!watch_renews(true, true, Some(&Lease { pid: 11, ..ours(100) }), me, ttl, now), "another MCP's lease");
+    }
+
+    #[test]
+    fn a_session_whose_steamvr_died_ends() {
+        let (stack, root) = blocked_stack("lost", false);
+        stack.state.lock().managing = true;
+        let long = Duration::from_secs(10);
+        assert!(!stack.end_lost_session(Duration::from_secs(1)), "a relaunching vrserver leaves a short gap");
+        let starting = stack.starting.lock();
+        assert!(!stack.end_lost_session(long), "vr_start brings SteamVR up");
+        drop(starting);
+        let restarting = stack.restarting.lock();
+        assert!(!stack.end_lost_session(long), "a restart takes SteamVR down on purpose");
+        drop(restarting);
+        assert!(stack.state.lock().managing && stack.status().warning.is_none());
+        assert!(stack.end_lost_session(long));
+        assert!(!stack.state.lock().managing, "no more lease renewal, supervisor restarts or stop_guard bypass");
+        assert!(stack.status().warning.is_some_and(|w| w.contains("run vr_start")), "{:?}", stack.status().warning);
+        assert!(!stack.end_lost_session(long), "already ended");
+        stack.stop().unwrap();
+        assert_eq!(stack.status().warning, None, "vr_stop clears it");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
