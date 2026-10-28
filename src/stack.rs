@@ -1731,7 +1731,7 @@ impl Stack {
     fn spawn_launched(&self, l: &proton::ProtonLaunch, log: &Path) -> Result<proton::Launched> {
         let mut state = self.state.lock();
         if !state.managing {
-            bail!("no session is running (vr_stop ended it); run vr_start first");
+            bail!("no vr_start session is being managed; run vr_start");
         }
         let launched = proton::spawn(l, log)?;
         state.launched = Some(launched.clone());
@@ -3105,9 +3105,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let env = vec![("PATH".into(), std::env::var_os("PATH").unwrap())];
         let l = proton::ProtonLaunch { argv: vec!["sleep".into(), "30".into()], env, cwd: dir.clone(), compatdata: dir.clone(), app_id: 9 };
-        // vr_stop already cleared managing and found nothing to stop
+        // no session, or vr_stop already cleared managing and found nothing to stop
         let e = stack.spawn_launched(&l, &dir.join("run.log")).map(|l| l.signal(libc::SIGKILL)).unwrap_err().to_string();
-        assert!(e.contains("vr_start"), "{e}");
+        assert_eq!(e, "no vr_start session is being managed; run vr_start", "no stop ran here: the error must not blame one");
         assert!(stack.state.lock().launched.is_none(), "nothing spawned that vr_stop would miss");
         stack.state.lock().managing = true;
         let launched = stack.spawn_launched(&l, &dir.join("run.log")).unwrap();
