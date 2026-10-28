@@ -31,6 +31,8 @@ pub struct Readiness {
     pub leased_to: Option<String>,
     /// config.toml has at least one `[app_logs]` entry.
     pub app_logs: bool,
+    /// A `launch_app via proton` run that stop_app has not ended.
+    pub launched: bool,
 }
 
 /// Tools that change nothing, so an observer without the lease keeps them.
@@ -107,7 +109,13 @@ pub fn tool_ready(tool: &str, r: &Readiness) -> Result<(), String> {
             holds(r.steamvr_running, "SteamVR is not running")?;
             checks(&["openvr_client"])
         }
-        "launch_app" | "stop_app" | "get_frame_timing" => {
+        // a game outlives a dead stream, and a proton run outlives SteamVR
+        "stop_app" if r.launched => Ok(()),
+        "stop_app" => {
+            holds(r.steamvr_running, "no app to stop: SteamVR is not running and no launch_app via proton runs")?;
+            checks(&["openvr_client"])
+        }
+        "launch_app" | "get_frame_timing" => {
             streaming()?;
             checks(&["openvr_client"])
         }
@@ -455,6 +463,29 @@ mod tests {
             assert!(tool_ready(tool, &none).unwrap_err().contains("[app_logs]"), "{tool}");
             assert_eq!(tool_ready(tool, &all_ready()), Ok(()), "{tool}");
         }
+    }
+
+    #[test]
+    fn stop_app_needs_a_launched_run_or_steamvr_not_the_stream() {
+        let r = Readiness { streaming: false, ..all_ready() };
+        assert_eq!(tool_ready("stop_app", &r), Ok(()), "a dead stream must not strand a wedged game");
+        let r = Readiness { streaming: false, steamvr_running: false, launched: true, ..all_ready() };
+        assert_eq!(tool_ready("stop_app", &r), Ok(()), "a proton run outlives SteamVR");
+        let r = Readiness { steamvr_running: false, launched: false, ..all_ready() };
+        assert!(tool_ready("stop_app", &r).is_err());
+        let r = Readiness { failed: [("openvr_client", "gone".to_owned())].into(), launched: false, ..all_ready() };
+        assert!(tool_ready("stop_app", &r).unwrap_err().contains("openvr_client"));
+    }
+
+    #[test]
+    fn read_only_is_exactly_the_tools_that_change_nothing() {
+        let mut got = READ_ONLY.to_vec();
+        got.sort();
+        let want = [
+            "audio_level", "get_frame_timing", "get_haptics", "get_logs", "get_tracked_state", "read_app_log", "record_audio",
+            "screenshot", "vr_acquire", "vr_release", "vr_status", "wait_for_log",
+        ];
+        assert_eq!(got, want, "a tool added here skips the lease: check it changes nothing another MCP sees");
     }
 
     #[test]

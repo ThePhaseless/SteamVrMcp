@@ -180,9 +180,9 @@ impl VrServer {
         self.run(move |s| json(Owner { lease: s.acquire_lease(args.owner, args.ttl_s)?, mine: true })).await.map_err(message)
     }
 
-    #[tool(description = "Give up this MCP's lease on SteamVR so another agent can take it at once. Returns released: false when this MCP did not hold it. Leaves SteamVR running.")]
+    #[tool(description = "Give up this MCP's lease on SteamVR so another agent can take it at once. Returns released: false when this MCP did not hold it. Leaves SteamVR running. Refuses while this MCP still runs a session (its headset or ALVR dashboard): run vr_stop first.")]
     async fn vr_release(&self) -> Result<CallToolResult, String> {
-        self.run(|s| json(serde_json::json!({ "released": s.release_lease()? }))).await.map_err(message)
+        self.run(|s| json(serde_json::json!({ "released": s.release()? }))).await.map_err(message)
     }
 
     #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s). The result's dashboard_visible says whether SteamVR's dashboard is open at that moment (null when unknown); SteamVR opens it about 10 s after no scene app runs, so call close_dashboard once your game reaches its scene.")]
@@ -340,8 +340,12 @@ impl VrServer {
 
     #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows SteamVR's last worn or removed event as the hmd's head_proximity (null before any). The headset is worn until set_proximity says otherwise; the last value is resent at every stream start.")]
     async fn set_proximity(&self, Parameters(args): Parameters<ProximityArgs>) -> Result<CallToolResult, String> {
-        self.stack.set_proximity(args.on_head).map_err(message)?;
-        json(serde_json::json!({ "ok": true, "on_head": args.on_head })).map_err(message)
+        self.run(move |s| {
+            s.set_proximity(args.on_head)?; // connects the OpenVR reader: up to OPENVR_TIMEOUT
+            json(serde_json::json!({ "ok": true, "on_head": args.on_head }))
+        })
+        .await
+        .map_err(message)
     }
 
     #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: started_t_s and started_at (the session clock when it began), per step at_s, action, applied_s, ok and error, plus total_s. Can take minutes: it lasts as long as its steps.")]
@@ -430,6 +434,26 @@ impl VrServer {
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
+    /// `not ready: <reason>` when `tool` may not run now; otherwise takes the lease for a mutating tool.
+    async fn refusal(&self, tool: &str) -> Result<Option<String>, ErrorData> {
+        // at each vr_start config.toml is re-read (applied while nothing runs) and the static checks run
+        // again, so a fixed problem does not need an MCP restart
+        let r = self.readiness(tool == "vr_start").await?;
+        if let Err(reason) = checks::tool_ready(tool, &r) {
+            return Ok(Some(format!("not ready: {reason}")));
+        }
+        if !checks::READ_ONLY.contains(&tool) {
+            let stack = Arc::clone(&self.stack);
+            let claimed = tokio::task::spawn_blocking(move || stack.claim())
+                .await
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            if let Err(e) = claimed {
+                return Ok(Some(format!("not ready: {e:#}")));
+            }
+        }
+        Ok(None)
+    }
+
     /// Makes the watcher thread send `notifications/tools/list_changed` through `notify`.
     fn forward_changes<F: Future<Output = ()> + Send + 'static>(&self, notify: impl Fn() -> F + Send + Sync + 'static) {
         let runtime = tokio::runtime::Handle::current();
@@ -488,20 +512,8 @@ impl ServerHandler for VrServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        // at each vr_start config.toml is re-read (applied while nothing runs) and the static checks run
-        // again, so a fixed problem does not need an MCP restart
-        let r = self.readiness(request.name == "vr_start").await?;
-        if let Err(reason) = checks::tool_ready(&request.name, &r) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {reason}"))]).into());
-        }
-        if !checks::READ_ONLY.contains(&&*request.name) {
-            let stack = Arc::clone(&self.stack);
-            let claimed = tokio::task::spawn_blocking(move || stack.claim())
-                .await
-                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-            if let Err(e) = claimed {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!("not ready: {e:#}"))]).into());
-            }
+        if let Some(refused) = self.refusal(&request.name).await? {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(refused)]).into());
         }
         self.router.call(ToolCallContext::new(self, request, context)).await
     }
@@ -531,6 +543,24 @@ mod tests {
             .collect();
         want.sort();
         assert_eq!((names.len(), names), (42, want));
+    }
+
+    #[tokio::test]
+    async fn a_foreign_live_lease_refuses_mutating_calls_only() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-server-lease-{}", std::process::id()));
+        crate::steamvr::private_dir(&dir).unwrap();
+        let other = crate::lease::Lease {
+            owner: "other agent".into(),
+            pid: std::os::unix::process::parent_id(), // alive, and not us
+            expires_at: crate::clock::rfc3339(std::time::SystemTime::now() + std::time::Duration::from_secs(600)),
+        };
+        std::fs::write(dir.join("owner.json"), serde_json::to_vec(&other).unwrap()).unwrap();
+        let server = VrServer::new(Stack::for_tests(dir.clone()));
+        let refused = server.refusal("vr_stop").await.unwrap().unwrap_or_default();
+        assert!(refused.starts_with("not ready: ") && refused.contains("leased to other agent"), "{refused}");
+        assert_eq!(server.refusal("vr_status").await.unwrap(), None, "read-only tools stay open");
+        assert_eq!(crate::lease::read(&dir), Some(other), "the holder's lease is untouched");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
