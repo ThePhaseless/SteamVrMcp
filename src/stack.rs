@@ -145,21 +145,35 @@ fn desktop_screenshot(eye: Eye) -> Result<Screenshot> {
 }
 
 /// The file's bytes once its size is non-zero and the same on two polls 100 ms apart: vrserver writes it on its own schedule.
-/// Fails at once when `exited` names a SteamVR process gone.
-fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> Option<&'static str>) -> Result<Vec<u8>> {
-    let (mut last, mut gone) = (0, None);
+/// Fails at once when `exited` names a SteamVR process gone, or when vrcompositor's log since the request (`compositor_log`) shows it failed.
+fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> Option<&'static str>, mut compositor_log: impl FnMut() -> String) -> Result<Vec<u8>> {
+    let (mut last, mut gone, mut failed) = (0, None, None);
     let stable = steamvr::wait_for(timeout, || {
         gone = exited();
+        failed = compositor_shot(&compositor_log()).1.map(str::to_owned);
         let size = std::fs::metadata(path).map_or(0, |m| m.len());
-        gone.is_some() || (size > 0 && size == std::mem::replace(&mut last, size))
+        gone.is_some() || failed.is_some() || (size > 0 && size == std::mem::replace(&mut last, size))
     });
     if let Some(name) = gone {
         bail!("failed: {name} exited before SteamVR wrote the screenshot to {}", path.display());
     }
+    if let Some(line) = failed {
+        bail!("failed: vrcompositor could not capture the scene app's textures ({line}); OpenXR or Proton scene apps may not support compositor screenshots; use source headset");
+    }
     if !stable {
-        bail!("SteamVR wrote no screenshot to {} (deadline {} s); vrserver may not see this directory", path.display(), timeout.as_secs_f64());
+        let why = match compositor_shot(&compositor_log()).0 {
+            true => "vrcompositor logged the request but wrote no file",
+            false => "vrcompositor logged no screenshot request; vrserver may not see this directory",
+        };
+        bail!("SteamVR wrote no screenshot to {} (deadline {} s); {why}", path.display(), timeout.as_secs_f64());
     }
     std::fs::read(path).with_context(|| path.display().to_string())
+}
+
+/// Whether vrcompositor's log shows a stereo screenshot request, and its `Screenshot: Failed` line if it logged one.
+fn compositor_shot(log: &str) -> (bool, Option<&str>) {
+    let failed = log.lines().find_map(|l| l.find("Screenshot: Failed").map(|i| l[i..].trim_end()));
+    (log.contains("Take stereo screenshot request"), failed)
 }
 
 /// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
@@ -262,12 +276,12 @@ pub struct LaunchArgs {
     /// "steam" (default) or "proton".
     #[serde(default)]
     pub via: Via,
-    /// Proton only, required: the exe relative to the app's install dir, e.g. "Game.exe" or "bin\\Game.exe".
+    /// Proton only, required: the exe relative to the app's install dir, e.g. "Game.exe" or "bin\\Game.exe". Must be a Windows .exe (MZ header) and not a shell, interpreter or loader (cmd, powershell, python*, java*, wine*, rundll32 and the like).
     pub exe: Option<String>,
-    /// Proton only: the exe's arguments, passed as given (no shell).
+    /// Proton only: the exe's arguments, passed as given (no shell). Chromium/CEF switches that run a program (--renderer-cmd-prefix, --gpu-launcher, --utility-cmd-prefix, --browser-subprocess-path) are refused.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; values must hold no "..".
+    /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes upper-case [A-Z0-9_] names starting MESA_, RADV_, VK_, DXVK_, VKD3D_, PROTON_, SDL_ or __GL_, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; also WINEDEBUG, WINEDLLOVERRIDES, DRI_PRIME, __NV_PRIME_RENDER_OFFLOAD, __VK_LAYER_NV_optimus, MANGOHUD, WINE_FULLSCREEN_FSR, WINEFSYNC, WINEESYNC, PULSE_LATENCY_MSEC, AMD_VULKAN_ICD, and __GLX_VENDOR_LIBRARY_NAME with a [a-z0-9_] value. Values must hold no "..".
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -280,10 +294,13 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
         Via::Proton if a.app_id.trim().parse() == Ok(steamvr::STEAMVR_APP_ID) => return Err("via \"proton\" cannot launch SteamVR (app 250820)".into()),
         _ => (),
     }
+    if let Some((arg, switch)) = a.args.iter().find_map(|arg| COMMAND_SWITCHES.iter().find(|s| arg.to_ascii_lowercase().contains(*s)).map(|s| (arg, s))) {
+        return Err(format!("arg {arg:?} refused: {switch} is a Chromium/CEF switch that runs a program of the caller's choice"));
+    }
     if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL"));
     }
-    if let Some(k) = a.env.keys().find(|k| !env_allowed(k)) {
+    if let Some(k) = a.env.iter().find_map(|(k, v)| (!env_allowed(k, v)).then_some(k)) {
         return Err(format!("env {k} refused: {ENV_ALLOWED}"));
     }
     match a.env.iter().find(|(_, v)| v.contains("..")) {
@@ -292,17 +309,30 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
     }
 }
 
-/// What launch_app's env takes, for its errors.
-pub const ENV_ALLOWED: &str = "env takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES \
-    and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API, GL_DRIVER or ending in _CMD, \
-    which run or load code (Proton runs PROTON_REMOTE_DEBUG_CMD; VK_ICD_FILENAMES and VK_LAYER_PATH load drivers and layers)";
+/// Chromium/CEF switches (any of `--`, `-` or `/` on Windows, any case) naming a program to run.
+const COMMAND_SWITCHES: [&str; 4] = ["renderer-cmd-prefix", "gpu-launcher", "utility-cmd-prefix", "browser-subprocess-path"];
 
-/// Whether launch_app may pass env var `name` to the Proton launcher: tuning a game, never a
+/// What launch_app's env takes, for its errors.
+pub const ENV_ALLOWED: &str = "env takes names of [A-Z0-9_] only (Wine matches names ignoring case) starting MESA_*, RADV_*, VK_*, DXVK_*, \
+    VKD3D_*, PROTON_*, SDL_* or __GL_*, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API, GL_DRIVER or ending in _CMD, \
+    which run or load code (Proton runs PROTON_REMOTE_DEBUG_CMD; VK_ICD_FILENAMES and VK_LAYER_PATH load drivers and layers); \
+    also WINEDEBUG, WINEDLLOVERRIDES, DRI_PRIME, __NV_PRIME_RENDER_OFFLOAD, __VK_LAYER_NV_optimus, MANGOHUD, WINE_FULLSCREEN_FSR, \
+    WINEFSYNC, WINEESYNC, PULSE_LATENCY_MSEC, AMD_VULKAN_ICD, and __GLX_VENDOR_LIBRARY_NAME with a [a-z0-9_] value";
+
+/// Whether launch_app may pass env var `name=value` to the Proton launcher: tuning a game, never a
 /// command, library or search path it would run or load.
-fn env_allowed(name: &str) -> bool {
+fn env_allowed(name: &str, value: &str) -> bool {
+    let only = |s: &str, ok: fn(&u8) -> bool| !s.is_empty() && s.bytes().all(|b| ok(&b) || b.is_ascii_digit() || b == b'_');
+    if name == "__GLX_VENDOR_LIBRARY_NAME" {
+        return only(value, u8::is_ascii_lowercase); // loads libGLX_<value>.so: a name, never a path
+    }
+    let names = [
+        "WINEDEBUG", "WINEDLLOVERRIDES", "DRI_PRIME", "__NV_PRIME_RENDER_OFFLOAD", "__VK_LAYER_NV_optimus", "MANGOHUD",
+        "WINE_FULLSCREEN_FSR", "WINEFSYNC", "WINEESYNC", "PULSE_LATENCY_MSEC", "AMD_VULKAN_ICD",
+    ];
     let prefixes = ["MESA_", "RADV_", "VK_", "DXVK_", "VKD3D_", "PROTON_", "SDL_", "__GL_"];
     let loads_code = ["PATH", "FILENAMES", "_FILES", "LIBRARY", "DYNAMIC_API", "GL_DRIVER"].iter().any(|p| name.contains(p)) || name.ends_with("_CMD");
-    (prefixes.iter().any(|p| name.starts_with(p)) || ["WINEDEBUG", "WINEDLLOVERRIDES", "DRI_PRIME"].contains(&name)) && !loads_code
+    names.contains(&name) || (only(name, u8::is_ascii_uppercase) && prefixes.iter().any(|p| name.starts_with(p)) && !loads_code)
 }
 
 #[derive(Debug, Serialize)]
@@ -975,9 +1005,13 @@ impl Stack {
         let stem = unique_stem(SystemTime::now(), std::process::id());
         let (preview, vr) = (dir.join(format!("{stem}-preview")), dir.join(&stem));
         let (p, v) = (preview.clone(), vr.clone());
+        // TakeStereoScreenshot only queues the request; vrcompositor logs whether it took it
+        let steam = self.paths().steam_dir;
+        let log_from = steam.as_deref().map(|d| steamvr::log_mark(d, "vrcompositor"));
+        let compositor_log = || steam.as_deref().zip(log_from).map(|(d, m)| steamvr::log_since(d, "vrcompositor", m)).unwrap_or_default();
         let taken = self.read(move |openvr| openvr.take_stereo_screenshot(&p, &v));
         let mut seen = Vec::new();
-        let png = taken.and_then(|()| read_when_stable(&dir.join(format!("{stem}.png")), Duration::from_secs(10), || self.vr_exited(&mut seen)));
+        let png = taken.and_then(|()| read_when_stable(&dir.join(format!("{stem}.png")), Duration::from_secs(10), || self.vr_exited(&mut seen), compositor_log));
         for f in [format!("{stem}-preview.png"), format!("{stem}.png")] {
             let _ = std::fs::remove_file(dir.join(f));
         }
@@ -2240,17 +2274,29 @@ mod tests {
             "STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId", "PROTON_REMOTE_DEBUG_CMD", "LD_PRELOAD",
             "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "PRESSURE_VESSEL_FILESYSTEMS_RW", "VK_ICD_FILENAMES", "VK_DRIVER_FILES",
             "VK_LAYER_PATH", "VK_ADD_LAYER_PATH", "SDL_DYNAMIC_API", "SDL_VIDEO_GL_DRIVER", "WINEDLLPATH", "HOME",
+            // Wine looks env names up ignoring case on the Windows side, so these would dodge the substring rules
+            "SDL_Dynamic_Api", "DXVK_Log_Path", "Mesa_Loader_Driver_Override", "mangohud",
         ];
         for key in refused {
             let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err();
-            assert!(e.contains(key) && e.contains("MESA_*"), "{key}: {e}");
+            assert!(e.contains(key) && e.contains("MESA_*") && e.contains("[A-Z0-9_]"), "{key}: {e}");
+        }
+        for glx in ["/tmp/x", "Mesa", ""] {
+            let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[("__GLX_VENDOR_LIBRARY_NAME", glx)])).unwrap_err();
+            assert!(e.contains("__GLX_VENDOR_LIBRARY_NAME"), "{glx:?}: {e}");
+        }
+        for arg in ["--renderer-cmd-prefix=Z:\\usr\\bin\\sh -c x", "--gpu-launcher", "/Utility-Cmd-Prefix=x", "-browser-subprocess-path=Z:\\x"] {
+            let e = check_launch(&a(Via::Proton, Some("Game.exe"), &["-vr", arg], &[])).unwrap_err();
+            assert!(e.contains(&format!("{arg:?}")) && e.contains("Chromium"), "{arg}: {e}");
         }
         let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[("MESA_LOADER_DRIVER_OVERRIDE", "../../tmp/x")])).unwrap_err();
         assert!(e.contains(".."), "{e}");
         let allowed = [
             ("DRI_PRIME", "1"), ("MESA_VK_DEVICE_SELECT", "1002:73bf"), ("RADV_PERFTEST", "gpl"), ("VK_INSTANCE_LAYERS", "x"),
             ("DXVK_HUD", "fps"), ("VKD3D_CONFIG", "dxr"), ("WINEDEBUG", "-all"), ("WINEDLLOVERRIDES", "dxgi=n,b"),
-            ("PROTON_LOG", "1"), ("SDL_VIDEODRIVER", "x11"), ("__GL_SYNC_TO_VBLANK", "0"),
+            ("PROTON_LOG", "1"), ("SDL_VIDEODRIVER", "x11"), ("__GL_SYNC_TO_VBLANK", "0"), ("__NV_PRIME_RENDER_OFFLOAD", "1"),
+            ("__VK_LAYER_NV_optimus", "NVIDIA_only"), ("__GLX_VENDOR_LIBRARY_NAME", "mesa"), ("MANGOHUD", "1"), ("WINE_FULLSCREEN_FSR", "1"),
+            ("WINEFSYNC", "1"), ("WINEESYNC", "0"), ("PULSE_LATENCY_MSEC", "60"), ("AMD_VULKAN_ICD", "RADV"),
         ];
         assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &allowed)), Ok(()));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1"})).unwrap();
@@ -2846,14 +2892,39 @@ mod tests {
             }
             None
         };
-        assert_eq!(read_when_stable(&path, Duration::from_secs(5), writer).unwrap(), b"abcd");
+        assert_eq!(read_when_stable(&path, Duration::from_secs(5), writer, String::new).unwrap(), b"abcd");
         assert_eq!(polls, 4, "stable once two polls see the same size");
-        let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None).unwrap_err();
-        assert!(err.to_string().contains("never.png") && err.to_string().contains("deadline 0.3 s"), "{err}");
+        let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None, String::new).unwrap_err().to_string();
+        assert!(err.contains("never.png") && err.contains("deadline 0.3 s") && err.contains("vrserver may not see this directory"), "{err}");
+        let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None, || COMPOSITOR_REQUESTED.into()).unwrap_err().to_string();
+        assert!(err.contains("vrcompositor logged the request") && !err.contains("may not see"), "{err}");
         let began = Instant::now();
-        let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || Some("vrserver")).unwrap_err();
+        let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || Some("vrserver"), String::new).unwrap_err();
         assert!(err.to_string().contains("failed: vrserver exited") && began.elapsed() < Duration::from_secs(2), "{err}");
+        let began = Instant::now();
+        let failed = || format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}");
+        let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || None, failed).unwrap_err().to_string();
+        assert!(began.elapsed() < Duration::from_secs(2), "bails at the failure line, not the deadline: {err}");
+        assert_eq!(
+            err,
+            "failed: vrcompositor could not capture the scene app's textures (Screenshot: Failed to get the correct textures.); \
+             OpenXR or Proton scene apps may not support compositor screenshots; use source headset"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// vrcompositor.txt after a TakeStereoScreenshot with an OpenXR scene app under Proton.
+    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 - Take stereo screenshot request dest filename=/h/.local/state/vr-test-mcp/screenshots/vr-1-2\n\
+        Tue Oct 27 2026 21:14:02.104 - Marked submission of screenshot textures for screenshot type 2, flags 3\n\
+        Tue Oct 27 2026 21:14:02.110 - Capturing Stereo2D texture\n";
+    const COMPOSITOR_FAILED: &str = "Tue Oct 27 2026 21:14:02.116 - Screenshot: Failed to get the correct textures.\n";
+
+    #[test]
+    fn compositor_log_shows_the_request_and_its_failure() {
+        assert_eq!(compositor_shot(""), (false, None));
+        assert_eq!(compositor_shot(COMPOSITOR_REQUESTED), (true, None));
+        let failed = format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}");
+        assert_eq!(compositor_shot(&failed), (true, Some("Screenshot: Failed to get the correct textures.")));
     }
 
     fn pairs(path: &str, value: serde_json::Value) -> Vec<PathValuePair> {

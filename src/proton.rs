@@ -87,8 +87,22 @@ pub fn resolve_exe(install_dir: &Path, exe: &str) -> Result<PathBuf> {
     if !path.is_file() {
         bail!("exe {exe:?} is not a file");
     }
+    // Wine runs any file it is handed: a .cmd through cmd.exe /c, a Linux ELF or script by fork/exec
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let Some(stem) = name.strip_suffix(".exe") else { bail!("exe {exe:?} must end in .exe: Wine runs other files as scripts or Linux programs") };
+    let mut magic = [0; 2];
+    if fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic)).is_err() || &magic != b"MZ" {
+        bail!("exe {exe:?} does not start with MZ, so it is not a Windows executable");
+    }
+    if INTERPRETERS.contains(&stem) || ["python", "java", "wine"].iter().any(|p| stem.starts_with(p)) {
+        bail!("exe {exe:?} is a shell, script interpreter or loader ({stem}.exe), which runs whatever its args name");
+    }
     Ok(path)
 }
+
+/// Exe stems that run a command, script or other program named in their args.
+// shortcut: a game exe that itself interprets its args (a console, a mod loader) still runs what they name; add a per-app exe allowlist in config.toml if one shows up
+const INTERPRETERS: [&str; 11] = ["cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "node", "start", "explorer"];
 
 #[derive(Debug)]
 pub struct ProtonLaunch {
@@ -371,7 +385,7 @@ mod tests {
         let root = root("exe");
         let install = root.join("Game");
         for f in ["Game/Game.exe", "Game/bin/Game.exe", "outside.exe"] {
-            write(&root.join(f), "");
+            write(&root.join(f), "MZ");
         }
         std::os::unix::fs::symlink(root.join("outside.exe"), install.join("link.exe")).unwrap();
         let canon = install.canonicalize().unwrap();
@@ -389,13 +403,48 @@ mod tests {
     }
 
     #[test]
+    fn exe_must_be_a_windows_exe_and_no_interpreter() {
+        let install = root("pe");
+        let files = [
+            ("Game.EXE", "MZP"),
+            ("_CommonRedist/vcredist/2022/Microsoft Visual C++ 2022 x64.cmd", "MZ"),
+            ("run.sh", "#!/bin/sh"),
+            ("elf.exe", "\x7fELF"),
+            ("empty.exe", ""),
+            ("bin/CMD.exe", "MZ"),
+            ("python/python311.exe", "MZ"),
+            ("pythonw.exe", "MZ"),
+            ("jre/bin/javaw.exe", "MZ"),
+            ("wine64.exe", "MZ"),
+            ("rundll32.exe", "MZ"),
+            ("PowerShell.exe", "MZ"),
+        ];
+        for (f, text) in files {
+            write(&install.join(f), text);
+        }
+        std::os::unix::fs::symlink(install.join("bin/CMD.exe"), install.join("Launcher.exe")).unwrap();
+        assert!(resolve_exe(&install, "Game.EXE").is_ok(), "the .exe suffix ignores case");
+        for not_exe in ["_CommonRedist\\vcredist\\2022\\Microsoft Visual C++ 2022 x64.cmd", "run.sh"] {
+            assert!(resolve_exe(&install, not_exe).unwrap_err().to_string().contains("must end in .exe"), "{not_exe}");
+        }
+        for not_pe in ["elf.exe", "empty.exe"] {
+            assert!(resolve_exe(&install, not_pe).unwrap_err().to_string().contains("MZ"), "{not_pe}");
+        }
+        for interpreter in ["bin/CMD.exe", "Launcher.exe", "python/python311.exe", "pythonw.exe", "jre/bin/javaw.exe", "wine64.exe", "rundll32.exe", "PowerShell.exe"] {
+            let e = resolve_exe(&install, interpreter).unwrap_err().to_string();
+            assert!(e.contains("interpreter"), "{interpreter}: {e}");
+        }
+        fs::remove_dir_all(&install).ok();
+    }
+
+    #[test]
     fn plan_env_has_compat_vars_home_and_caller_last() {
         let (steam, tool) = fake_steam("plan");
         let runtime = add_runtime(&steam);
         let config = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"CompatToolMapping\"\n\t\t{\n\t\t\t\"0\"\n\t\t\t{\n\t\t\t\t\"name\"\t\t\"proton_experimental\"\n\t\t\t}\n\t\t}\n\t}\n}\n";
         write(&steam.join("config/config.vdf"), config);
         let install = steam.join("steamapps/common/Game");
-        write(&install.join("Game.exe"), "");
+        write(&install.join("Game.exe"), "MZ");
         let mut app = steamvr::AppInfo {
             app_id: 620980,
             game_id: 620980,
