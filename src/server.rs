@@ -340,8 +340,12 @@ impl VrServer {
 
     #[tool(description = "Tell SteamVR the headset is worn (on_head true) or taken off (false), as the proximity sensor does. get_tracked_state shows SteamVR's last worn or removed event as the hmd's head_proximity (null before any). The headset is worn until set_proximity says otherwise; the last value is resent at every stream start.")]
     async fn set_proximity(&self, Parameters(args): Parameters<ProximityArgs>) -> Result<CallToolResult, String> {
-        self.stack.set_proximity(args.on_head).map_err(message)?;
-        json(serde_json::json!({ "ok": true, "on_head": args.on_head })).map_err(message)
+        self.run(move |s| {
+            s.set_proximity(args.on_head)?; // connects the OpenVR reader: up to OPENVR_TIMEOUT
+            json(serde_json::json!({ "ok": true, "on_head": args.on_head }))
+        })
+        .await
+        .map_err(message)
     }
 
     #[tool(description = "Run timed steps: each has at_s (seconds from the start, 0 to 600), action (a rig tool's name such as set_head_pose, animate_controller, set_trigger, press_button, set_finger_curl or set_hand_gesture) and args (that tool's arguments). Animations start and do not block later steps. Every step is checked first, including against the rig's state (a trigger of 7, an untracked controller, inputs to a bare hand): a refused one fails the call, naming the step, before any runs and with no state changed. Returns once the last step and the latest animation are done: started_t_s and started_at (the session clock when it began), per step at_s, action, applied_s, ok and error, plus total_s. Can take minutes: it lasts as long as its steps.")]
