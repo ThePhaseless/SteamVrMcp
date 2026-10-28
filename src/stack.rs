@@ -188,7 +188,7 @@ pub struct LaunchArgs {
     /// Proton only: the exe's arguments, passed as given (no shell).
     #[serde(default)]
     pub args: Vec<String>,
-    /// Proton only: env vars over the desktop session's, e.g. GPU selection. STEAM_COMPAT_*, SteamAppId and SteamGameId are refused: the MCP sets them.
+    /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; values must hold no "..".
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -204,10 +204,26 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
     if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL"));
     }
-    match a.env.keys().find(|k| k.starts_with("STEAM_COMPAT_") || ["SteamAppId", "SteamGameId"].contains(&k.as_str())) {
-        Some(k) => Err(format!("env must not set {k}: the MCP sets STEAM_COMPAT_*, SteamAppId and SteamGameId itself")),
+    if let Some(k) = a.env.keys().find(|k| !env_allowed(k)) {
+        return Err(format!("env {k} refused: {ENV_ALLOWED}"));
+    }
+    match a.env.iter().find(|(_, v)| v.contains("..")) {
+        Some((k, _)) => Err(format!("env {k} refused: a value must hold no \"..\", which name-based loaders follow out of their dir")),
         None => Ok(()),
     }
+}
+
+/// What launch_app's env takes, for its errors.
+pub const ENV_ALLOWED: &str = "env takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES \
+    and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API, GL_DRIVER or ending in _CMD, \
+    which run or load code (Proton runs PROTON_REMOTE_DEBUG_CMD; VK_ICD_FILENAMES and VK_LAYER_PATH load drivers and layers)";
+
+/// Whether launch_app may pass env var `name` to the Proton launcher: tuning a game, never a
+/// command, library or search path it would run or load.
+fn env_allowed(name: &str) -> bool {
+    let prefixes = ["MESA_", "RADV_", "VK_", "DXVK_", "VKD3D_", "PROTON_", "SDL_", "__GL_"];
+    let loads_code = ["PATH", "FILENAMES", "_FILES", "LIBRARY", "DYNAMIC_API", "GL_DRIVER"].iter().any(|p| name.contains(p)) || name.ends_with("_CMD");
+    (prefixes.iter().any(|p| name.starts_with(p)) || ["WINEDEBUG", "WINEDLLOVERRIDES", "DRI_PRIME"].contains(&name)) && !loads_code
 }
 
 #[derive(Debug, Serialize)]
@@ -1859,10 +1875,23 @@ mod tests {
             let vr = LaunchArgs { app_id: id.into(), ..a(Via::Proton, Some("vrstartup.exe"), &[], &[]) };
             assert!(check_launch(&vr).unwrap_err().contains("SteamVR"), "{id:?}");
         }
-        for key in ["STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId"] {
-            assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err().contains(key), "the MCP sets {key}");
+        let refused = [
+            "STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId", "PROTON_REMOTE_DEBUG_CMD", "LD_PRELOAD",
+            "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "PRESSURE_VESSEL_FILESYSTEMS_RW", "VK_ICD_FILENAMES", "VK_DRIVER_FILES",
+            "VK_LAYER_PATH", "VK_ADD_LAYER_PATH", "SDL_DYNAMIC_API", "SDL_VIDEO_GL_DRIVER", "WINEDLLPATH", "HOME",
+        ];
+        for key in refused {
+            let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err();
+            assert!(e.contains(key) && e.contains("MESA_*"), "{key}: {e}");
         }
-        assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &[("DRI_PRIME", "1")])), Ok(()));
+        let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[("MESA_LOADER_DRIVER_OVERRIDE", "../../tmp/x")])).unwrap_err();
+        assert!(e.contains(".."), "{e}");
+        let allowed = [
+            ("DRI_PRIME", "1"), ("MESA_VK_DEVICE_SELECT", "1002:73bf"), ("RADV_PERFTEST", "gpl"), ("VK_INSTANCE_LAYERS", "x"),
+            ("DXVK_HUD", "fps"), ("VKD3D_CONFIG", "dxr"), ("WINEDEBUG", "-all"), ("WINEDLLOVERRIDES", "dxgi=n,b"),
+            ("PROTON_LOG", "1"), ("SDL_VIDEODRIVER", "x11"), ("__GL_SYNC_TO_VBLANK", "0"),
+        ];
+        assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &allowed)), Ok(()));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1"})).unwrap();
         assert_eq!((parsed.via, parsed.exe, parsed.args.len(), parsed.env.len()), (Via::Steam, None, 0, 0));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1", "via": "proton", "exe": "a.exe"})).unwrap();

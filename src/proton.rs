@@ -104,6 +104,9 @@ pub struct ProtonLaunch {
 /// paths, which the caller cannot change since stop_app finds the run by them.
 pub fn plan(steam_dir: &Path, app: &AppInfo, exe: &str, args: &[String], base_env: Vec<(OsString, OsString)>, caller_env: &BTreeMap<String, String>) -> Result<ProtonLaunch> {
     let install = app.install_dir.as_deref().with_context(|| format!("{} has no installdir in its appmanifest", app.name))?;
+    if install.join("toolmanifest.vdf").exists() {
+        bail!("{} is a compatibility tool or runtime (its dir has a toolmanifest.vdf), not a game", app.name);
+    }
     let exe = resolve_exe(install, exe)?;
     let config = fs::read_to_string(steam_dir.join("config/config.vdf")).unwrap_or_default();
     let tool = app.compat_tool.clone().or_else(|| compat_tool(&config, 0));
@@ -423,6 +426,12 @@ mod tests {
         app.compat_tool = Some("proton_hotfix".into());
         let e = plan(&steam, &app, "Game.exe", &[], base, &BTreeMap::new()).unwrap_err();
         assert!(e.to_string().contains("proton_hotfix"), "the app's own mapping comes before \"0\": {e}");
+        for dir in [tool, runtime] {
+            let tool_app = steamvr::AppInfo { install_dir: Some(dir.clone()), compat_tool: None, ..app.clone() };
+            write(&dir.join("toolmanifest.vdf"), MANIFEST);
+            let e = plan(&steam, &tool_app, "proton", &[], vec![], &BTreeMap::new()).unwrap_err().to_string();
+            assert!(e.contains("is a compatibility tool or runtime"), "{}: {e}", dir.display());
+        }
         fs::remove_dir_all(&steam).ok();
     }
 
