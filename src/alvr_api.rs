@@ -8,7 +8,7 @@ use alvr_events::Event;
 use alvr_session::SessionConfig;
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs,
     io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
@@ -136,27 +136,26 @@ impl EventStream {
 
 /// Refuses a call unless every socket listening on `port` is held by one of `vrservers` (this
 /// user's): another user or program can hold the port, and would take our POSTs and feed us forged
-/// sessions, restart requests and log lines. A verified set of sockets is kept until it changes.
+/// sessions, restart requests and log lines. Verified sockets are remembered: an inode names one socket while it lives.
 // shortcut: checked before connecting, so a listener swapped in between is missed; compare the accepted socket's inode if that matters
 fn refuse_foreign(port: u16, vrservers: impl FnOnce() -> Vec<u32>) -> Result<()> {
-    static VERIFIED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-    let mut listening: Vec<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
+    static VERIFIED: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+    let listening: Vec<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
         .iter()
         .flat_map(|t| listening_inodes(&fs::read_to_string(t).unwrap_or_default(), port))
         .collect();
-    listening.sort();
     if listening.is_empty() {
         bail!("ALVR API not reachable on port {port}");
     }
     let mut verified = VERIFIED.lock();
-    if *verified == listening {
+    if listening.iter().all(|i| verified.contains(i)) {
         return Ok(());
     }
     let held: HashSet<u64> = vrservers().into_iter().flat_map(socket_inodes).collect();
     if !listening.iter().all(|i| held.contains(i)) {
         bail!("not ours: the ALVR on port {port} does not belong to this user's SteamVR");
     }
-    *verified = listening;
+    verified.extend(listening);
     Ok(())
 }
 
