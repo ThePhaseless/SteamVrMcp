@@ -335,9 +335,30 @@ fn severity(level: &str) -> Option<LogSeverity> {
     [LogSeverity::Error, LogSeverity::Warning, LogSeverity::Info, LogSeverity::Debug].into_iter().find(|s| level_name(*s) == level)
 }
 
-/// The values in ALVR's own types; a bad path fails here, before any request.
+/// Session paths set_alvr_settings refuses, with everything above and below them: they open ALVR
+/// to the network (a trusted client it dials and streams to, the API on every interface, discovery,
+/// ports, connect scripts) or send tracking to any host (VMC).
+pub const REFUSED_PATHS: [&str; 3] = ["client_connections", "session_settings.connection", "session_settings.headset.vmc"];
+
+/// The values in ALVR's own types; a bad or refused path fails here, before any request.
 pub fn parse_values(values: Vec<SettingValue>) -> Result<Vec<PathValuePair>> {
-    values.into_iter().map(|v| Ok(PathValuePair { path: parse_path(&v.path)?, value: v.value })).collect()
+    values
+        .into_iter()
+        .map(|v| {
+            let path = parse_path(&v.path)?;
+            // one is a prefix of the other when they agree up to the shorter one's length
+            let same = |s: (&PathSegment, &PathSegment)| match s {
+                (PathSegment::Name(a), PathSegment::Name(b)) => a == b,
+                (PathSegment::Index(a), PathSegment::Index(b)) => a == b,
+                _ => false,
+            };
+            let overlaps = |r: &&str| parse_path(r).is_ok_and(|r| path.iter().zip(&r).all(same));
+            if REFUSED_PATHS.iter().any(overlaps) {
+                bail!("{} refused: set_alvr_settings cannot change {REFUSED_PATHS:?} or a path holding them", v.path);
+            }
+            Ok(PathValuePair { path, value: v.value })
+        })
+        .collect()
 }
 
 /// Ok when `session` (ALVR's session as JSON) holds every value.
@@ -355,6 +376,28 @@ pub fn verify_applied(session: &Value, values: &[PathValuePair]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Reads events from `next` until ALVR's session holds `values`, by `deadline`.
+// ALVR answers 200 even when it rejects the values: it logs why and sends no new session
+// (server_core web_server.rs:181-185, server_io lib.rs:156-187)
+pub fn wait_applied(mut next: impl FnMut(Duration) -> Result<Option<Event>>, values: &[PathValuePair], deadline: Instant) -> Result<()> {
+    let mut mismatch = "ALVR sent no session".to_owned();
+    while Instant::now() < deadline {
+        match next(Duration::from_millis(200))? {
+            Some(Event { event_type: EventType::Session(session), .. }) => match verify_applied(&serde_json::to_value(&*session)?, values) {
+                Ok(()) => return Ok(()),
+                Err(e) => mismatch = e,
+            },
+            Some(Event { event_type: EventType::Log(LogEntry { severity: LogSeverity::Error, content }), .. })
+                if content.starts_with("Failed to set session values") =>
+            {
+                bail!("failed: {content}")
+            }
+            _ => (),
+        }
+    }
+    bail!("ALVR did not apply the values: {mismatch} (deadline 3 s)")
 }
 
 /// Equality with numbers compared at f32 precision: ALVR stores most numbers as f32.
@@ -1309,32 +1352,13 @@ impl Stack {
         }
         let values = parse_values(values)?;
         let restart = !values.iter().all(|v| is_real_time(&v.path));
-        if restart && !self.state.lock().managing {
-            bail!("these settings need a SteamVR restart, which only a vr_start session does; run vr_start first");
+        // without vr_start the session.json is the user's own, with no snapshot for vr_restore
+        if !self.state.lock().managing {
+            bail!("set_alvr_settings changes only the session vr_start set up; run vr_start first");
         }
         let mut events = self.api().events()?;
         self.api().post_json("/api/session/values", &values)?;
-        // ALVR answers 200 even when it rejects the values: it logs why and sends no new session
-        // (server_core web_server.rs:181-185, server_io lib.rs:156-187)
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut mismatch = "ALVR sent no session".to_owned();
-        while Instant::now() < deadline {
-            match events.next(Duration::from_millis(200))? {
-                Some(Event { event_type: EventType::Session(session), .. }) => match verify_applied(&serde_json::to_value(&*session)?, &values) {
-                    Ok(()) => break,
-                    Err(e) => mismatch = e,
-                },
-                Some(Event { event_type: EventType::Log(LogEntry { severity: LogSeverity::Error, content }), .. })
-                    if content.starts_with("Failed to set session values") =>
-                {
-                    bail!("failed: {content}")
-                }
-                _ => (),
-            }
-        }
-        if Instant::now() >= deadline {
-            bail!("ALVR did not apply the values: {mismatch} (deadline 3 s)");
-        }
+        wait_applied(|t| events.next(t), &values, Instant::now() + Duration::from_secs(3))?;
         drop(events);
 
         let status = || self.headset_status().unwrap_or_default();
@@ -2212,6 +2236,55 @@ mod tests {
         assert_eq!(verify_applied(&session, &pairs(index, json!(true))), Ok(()));
         let e = verify_applied(&session, &pairs("session_settings.video.nope", json!(1))).unwrap_err();
         assert!(e.contains("session_settings.video.nope"), "{e}");
+    }
+
+    #[test]
+    fn settings_refuse_network_exposure() {
+        let parse = |p: &str| parse_values(vec![SettingValue { path: p.into(), value: json!(true) }]);
+        for p in [
+            "client_connections",
+            "client_connections.x.manual_ips",
+            "session_settings",
+            "session_settings.connection",
+            "session_settings.connection.allow_remote_dashboard",
+            "session_settings.connection.client_discovery.enabled",
+            "session_settings.connection.stream_port",
+            "session_settings.connection.enable_on_connect_script",
+            "session_settings.headset",
+            "session_settings.headset.vmc.content.host",
+        ] {
+            let e = format!("{:#}", parse(p).unwrap_err());
+            assert!(e.contains("refused") && e.contains("session_settings.connection"), "{p}: {e}");
+        }
+        assert!(parse("session_settings.video.preferred_fps").is_ok());
+        assert!(parse("session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0").is_ok());
+    }
+
+    fn session_event(session: &SessionConfig) -> Event {
+        Event { timestamp: String::new(), event_type: EventType::Session(Box::new(session.clone())) }
+    }
+
+    #[test]
+    fn wait_applied_takes_a_match_that_lands_at_the_deadline() {
+        let mut session = SessionConfig::default();
+        session.session_settings.video.preferred_fps = 90.0;
+        let values = pairs("session_settings.video.preferred_fps", json!(90.0));
+        let deadline = Instant::now() + Duration::from_millis(50);
+        // the read blocks past the deadline, then hands over the matching session
+        let late = |_| {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20));
+            Ok(Some(session_event(&session)))
+        };
+        assert!(wait_applied(late, &values, deadline).is_ok());
+        let none = |t| {
+            std::thread::sleep(t);
+            Ok(None)
+        };
+        let e = wait_applied(none, &values, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(e.to_string().contains("ALVR did not apply the values: ALVR sent no session"), "{e}");
+        let mismatch = |_| Ok(Some(session_event(&SessionConfig::default())));
+        let e = wait_applied(mismatch, &values, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(e.to_string().contains("preferred_fps is"), "{e}");
     }
 
     #[test]

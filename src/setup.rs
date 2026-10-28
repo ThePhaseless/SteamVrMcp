@@ -74,6 +74,7 @@ pub fn session_values(cfg: &Config) -> Result<Vec<PathValuePair>> {
         ("session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0", json!(false)),
         ("session_settings.headset.controllers.content.hand_tracking_interaction.enabled", json!(true)),
         ("session_settings.connection.client_discovery.enabled", json!(false)),
+        ("session_settings.connection.allow_remote_dashboard", json!(false)),
         ("session_settings.headset.controllers.content.button_mappings", index_button_mappings(&template)),
     ];
     defaults
@@ -420,6 +421,17 @@ mod tests {
         }
         let keys: Vec<_> = mappings.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"/user/hand/left/input/a/click") && keys.contains(&"/user/hand/right/input/trackpad/force"));
+    }
+
+    #[test]
+    fn session_values_close_the_dashboard_to_the_lan() {
+        let mut m = ServerSessionManager::new(None);
+        let open = [("session_settings.connection.allow_remote_dashboard", json!(true)), ("session_settings.connection.client_discovery.enabled", json!(true))];
+        m.set_session_values(open.map(|(p, value)| PathValuePair { path: parse_path(p).unwrap(), value }).to_vec()).unwrap();
+        m.set_session_values(session_values(&Config::default()).unwrap()).unwrap();
+        let c = &m.settings().connection;
+        assert!(!c.allow_remote_dashboard, "a vr_start resets what an earlier session opened");
+        assert!(matches!(c.client_discovery, Switch::Disabled));
     }
 
     #[test]

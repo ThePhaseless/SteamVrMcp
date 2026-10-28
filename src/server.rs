@@ -369,7 +369,7 @@ impl VrServer {
         self.run(move |s| json(s.audio_level(args.window_s)?)).await.map_err(message)
     }
 
-    #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). A bad path or value fails before any restart. With a restart the call can take minutes.")]
+    #[tool(description = "Set ALVR session values by path (ALVR's syntax from the session JSON root, e.g. session_settings.video.preferred_fps) and check ALVR stored them. Unless ALVR's settings schema flags every path real-time, SteamVR then restarts and the call returns once the headset streams again (restarted, restarts, streaming). Needs a vr_start session. Paths under client_connections, session_settings.connection or session_settings.headset.vmc (network exposure) are refused. A bad or refused path or value fails before any restart. With a restart the call can take minutes.")]
     async fn set_alvr_settings(&self, Parameters(args): Parameters<SettingsArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.set_alvr_settings(args.values)?)).await.map_err(message)
     }
