@@ -1,7 +1,7 @@
 //! xr_probe: a native OpenXR app that binds every Valve Index input and prints what it reads.
 //!
 //! Adapted from the openxrs 0.22 example `examples/vulkan.rs` (and its two shaders in
-//! `examples/xr_probe/`), by Benjamin Saunders and the openxrs contributors, MIT OR Apache-2.0
+//! `examples/xr_probe/`: the GLSL sources and openxrs's compiled `.spv`, unchanged), by Benjamin Saunders and the openxrs contributors, MIT OR Apache-2.0
 //! (https://github.com/Ralith/openxrs). Changes: Index profile actions for both hands instead of
 //! the pose printout, one JSON line per 100 ms on stdout, a haptic pulse on each A press, exit on
 //! SIGTERM/SIGINT or after `--seconds N`, no ctrlc or Android code.

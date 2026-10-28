@@ -486,6 +486,7 @@ mod tests {
         assert_eq!(s.status.hud_message, "");
     }
 
+    // 128x64, red left, blue right; regenerate with: ffmpeg -f lavfi -i "color=red:s=64x64,format=yuv420p" -f lavfi -i "color=blue:s=64x64,format=yuv420p" -filter_complex hstack -frames:v 1 -c:v libx264 -profile:v baseline -f h264 red_blue.h264
     const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/red_blue.h264");
 
     #[test]
