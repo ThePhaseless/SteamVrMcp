@@ -198,7 +198,7 @@ pub struct LaunchArgs {
     /// Proton only: the exe's arguments, passed as given (no shell). Chromium/CEF switches that run a program (--renderer-cmd-prefix, --gpu-launcher, --utility-cmd-prefix, --browser-subprocess-path) are refused.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; values must hold no "..".
+    /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes upper-case [A-Z0-9_] names starting MESA_, RADV_, VK_, DXVK_, VKD3D_, PROTON_, SDL_ or __GL_, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; also WINEDEBUG, WINEDLLOVERRIDES, DRI_PRIME, __NV_PRIME_RENDER_OFFLOAD, __VK_LAYER_NV_optimus, MANGOHUD, WINE_FULLSCREEN_FSR, WINEFSYNC, WINEESYNC, PULSE_LATENCY_MSEC, AMD_VULKAN_ICD, and __GLX_VENDOR_LIBRARY_NAME with a [a-z0-9_] value. Values must hold no "..".
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -217,7 +217,7 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
     if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL"));
     }
-    if let Some(k) = a.env.keys().find(|k| !env_allowed(k)) {
+    if let Some(k) = a.env.iter().find_map(|(k, v)| (!env_allowed(k, v)).then_some(k)) {
         return Err(format!("env {k} refused: {ENV_ALLOWED}"));
     }
     match a.env.iter().find(|(_, v)| v.contains("..")) {
@@ -230,16 +230,26 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
 const COMMAND_SWITCHES: [&str; 4] = ["renderer-cmd-prefix", "gpu-launcher", "utility-cmd-prefix", "browser-subprocess-path"];
 
 /// What launch_app's env takes, for its errors.
-pub const ENV_ALLOWED: &str = "env takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES \
-    and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API, GL_DRIVER or ending in _CMD, \
-    which run or load code (Proton runs PROTON_REMOTE_DEBUG_CMD; VK_ICD_FILENAMES and VK_LAYER_PATH load drivers and layers)";
+pub const ENV_ALLOWED: &str = "env takes names of [A-Z0-9_] only (Wine matches names ignoring case) starting MESA_*, RADV_*, VK_*, DXVK_*, \
+    VKD3D_*, PROTON_*, SDL_* or __GL_*, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API, GL_DRIVER or ending in _CMD, \
+    which run or load code (Proton runs PROTON_REMOTE_DEBUG_CMD; VK_ICD_FILENAMES and VK_LAYER_PATH load drivers and layers); \
+    also WINEDEBUG, WINEDLLOVERRIDES, DRI_PRIME, __NV_PRIME_RENDER_OFFLOAD, __VK_LAYER_NV_optimus, MANGOHUD, WINE_FULLSCREEN_FSR, \
+    WINEFSYNC, WINEESYNC, PULSE_LATENCY_MSEC, AMD_VULKAN_ICD, and __GLX_VENDOR_LIBRARY_NAME with a [a-z0-9_] value";
 
-/// Whether launch_app may pass env var `name` to the Proton launcher: tuning a game, never a
+/// Whether launch_app may pass env var `name=value` to the Proton launcher: tuning a game, never a
 /// command, library or search path it would run or load.
-fn env_allowed(name: &str) -> bool {
+fn env_allowed(name: &str, value: &str) -> bool {
+    let only = |s: &str, ok: fn(&u8) -> bool| !s.is_empty() && s.bytes().all(|b| ok(&b) || b.is_ascii_digit() || b == b'_');
+    if name == "__GLX_VENDOR_LIBRARY_NAME" {
+        return only(value, u8::is_ascii_lowercase); // loads libGLX_<value>.so: a name, never a path
+    }
+    let names = [
+        "WINEDEBUG", "WINEDLLOVERRIDES", "DRI_PRIME", "__NV_PRIME_RENDER_OFFLOAD", "__VK_LAYER_NV_optimus", "MANGOHUD",
+        "WINE_FULLSCREEN_FSR", "WINEFSYNC", "WINEESYNC", "PULSE_LATENCY_MSEC", "AMD_VULKAN_ICD",
+    ];
     let prefixes = ["MESA_", "RADV_", "VK_", "DXVK_", "VKD3D_", "PROTON_", "SDL_", "__GL_"];
     let loads_code = ["PATH", "FILENAMES", "_FILES", "LIBRARY", "DYNAMIC_API", "GL_DRIVER"].iter().any(|p| name.contains(p)) || name.ends_with("_CMD");
-    (prefixes.iter().any(|p| name.starts_with(p)) || ["WINEDEBUG", "WINEDLLOVERRIDES", "DRI_PRIME"].contains(&name)) && !loads_code
+    names.contains(&name) || (only(name, u8::is_ascii_uppercase) && prefixes.iter().any(|p| name.starts_with(p)) && !loads_code)
 }
 
 #[derive(Debug, Serialize)]
@@ -2091,10 +2101,16 @@ mod tests {
             "STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId", "PROTON_REMOTE_DEBUG_CMD", "LD_PRELOAD",
             "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "PRESSURE_VESSEL_FILESYSTEMS_RW", "VK_ICD_FILENAMES", "VK_DRIVER_FILES",
             "VK_LAYER_PATH", "VK_ADD_LAYER_PATH", "SDL_DYNAMIC_API", "SDL_VIDEO_GL_DRIVER", "WINEDLLPATH", "HOME",
+            // Wine looks env names up ignoring case on the Windows side, so these would dodge the substring rules
+            "SDL_Dynamic_Api", "DXVK_Log_Path", "Mesa_Loader_Driver_Override", "mangohud",
         ];
         for key in refused {
             let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err();
-            assert!(e.contains(key) && e.contains("MESA_*"), "{key}: {e}");
+            assert!(e.contains(key) && e.contains("MESA_*") && e.contains("[A-Z0-9_]"), "{key}: {e}");
+        }
+        for glx in ["/tmp/x", "Mesa", ""] {
+            let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[("__GLX_VENDOR_LIBRARY_NAME", glx)])).unwrap_err();
+            assert!(e.contains("__GLX_VENDOR_LIBRARY_NAME"), "{glx:?}: {e}");
         }
         for arg in ["--renderer-cmd-prefix=Z:\\usr\\bin\\sh -c x", "--gpu-launcher", "/Utility-Cmd-Prefix=x", "-browser-subprocess-path=Z:\\x"] {
             let e = check_launch(&a(Via::Proton, Some("Game.exe"), &["-vr", arg], &[])).unwrap_err();
@@ -2105,7 +2121,9 @@ mod tests {
         let allowed = [
             ("DRI_PRIME", "1"), ("MESA_VK_DEVICE_SELECT", "1002:73bf"), ("RADV_PERFTEST", "gpl"), ("VK_INSTANCE_LAYERS", "x"),
             ("DXVK_HUD", "fps"), ("VKD3D_CONFIG", "dxr"), ("WINEDEBUG", "-all"), ("WINEDLLOVERRIDES", "dxgi=n,b"),
-            ("PROTON_LOG", "1"), ("SDL_VIDEODRIVER", "x11"), ("__GL_SYNC_TO_VBLANK", "0"),
+            ("PROTON_LOG", "1"), ("SDL_VIDEODRIVER", "x11"), ("__GL_SYNC_TO_VBLANK", "0"), ("__NV_PRIME_RENDER_OFFLOAD", "1"),
+            ("__VK_LAYER_NV_optimus", "NVIDIA_only"), ("__GLX_VENDOR_LIBRARY_NAME", "mesa"), ("MANGOHUD", "1"), ("WINE_FULLSCREEN_FSR", "1"),
+            ("WINEFSYNC", "1"), ("WINEESYNC", "0"), ("PULSE_LATENCY_MSEC", "60"), ("AMD_VULKAN_ICD", "RADV"),
         ];
         assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &allowed)), Ok(()));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1"})).unwrap();
