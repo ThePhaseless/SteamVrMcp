@@ -49,6 +49,8 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
+const RESTART_FAILED: &str = "the last SteamVR restart failed and the headset is not streaming; run vr_start";
+
 const SESSION_LOST: &str = "SteamVR exited without vr_stop (it crashed or was quit), so the session ended; run vr_start";
 
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -460,7 +462,7 @@ struct State {
     dashboard: Option<Child>,
     started_steam: bool,
     restarts: u32,
-    /// The watchdog restarts SteamVR at most once per start().
+    /// The watchdog restarts SteamVR at most once per stream: re-armed by vr_start and whenever the headset streams.
     watchdog_fired: bool,
     leaked: bool,
     managing: bool,
@@ -1313,7 +1315,10 @@ impl Stack {
         let reader_connected = self.reader_connected();
         let (warnings, last_restart_error) = {
             let state = self.state.lock();
-            let warnings: Vec<&str> = [state.leaked.then_some(LEAKED), state.ended].into_iter().flatten().collect();
+            let streaming = state.headset.as_ref().is_some_and(|h| h.status().streaming);
+            // the supervisor does not retry a failed restart
+            let stuck = state.managing && state.last_restart_error.is_some() && !streaming && !self.starting.is_locked() && !self.restarting.is_locked();
+            let warnings: Vec<&str> = [state.leaked.then_some(LEAKED), state.ended, stuck.then_some(RESTART_FAILED)].into_iter().flatten().collect();
             (warnings, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
         };
         let now = clock::now_s();
@@ -1864,6 +1869,9 @@ fn supervise(stack: Weak<Stack>) {
             },
         }
         let status = s.headset_status().unwrap_or_default();
+        if status.streaming {
+            s.state.lock().watchdog_fired = false;
+        }
         // a request sent before the events stream attached still shows on the headset's HUD
         restart |= is_restart_hud(&status.hud_message) && !is_restart_hud(&last_hud);
         last_hud = status.hud_message;
@@ -2490,6 +2498,20 @@ mod tests {
         assert!(!watch_renews(true, false, Some(&ours(100)), me, ttl, now), "SteamVR is gone");
         assert!(!watch_renews(true, true, None, me, ttl, now), "vr_release gave it up: do not take it back");
         assert!(!watch_renews(true, true, Some(&Lease { pid: 11, ..ours(100) }), me, ttl, now), "another MCP's lease");
+    }
+
+    #[test]
+    fn a_failed_restart_asks_for_vr_start() {
+        let stack = test_stack();
+        stack.state.lock().last_restart_error = Some((Instant::now(), "SteamVR restart failed: boom".into()));
+        assert_eq!(stack.status().warning, None, "no session: nothing to rerun");
+        stack.state.lock().managing = true;
+        assert!(stack.status().warning.is_some_and(|w| w.contains("run vr_start")), "the supervisor does not retry");
+        let starting = stack.starting.lock();
+        assert_eq!(stack.status().warning, None, "vr_start runs");
+        drop(starting);
+        stack.state.lock().last_restart_error = None;
+        assert_eq!(stack.status().warning, None);
     }
 
     #[test]
