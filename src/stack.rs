@@ -847,26 +847,31 @@ impl Stack {
         }
     }
 
-    /// From the watcher: ends a session whose SteamVR has been gone for `gone_for` (it crashed, or the user
-    /// quit it), so its lease is no longer renewed and no supervisor restart starts SteamVR again. Not while
-    /// a vr_start, vr_stop or restart runs, which bring SteamVR down on purpose. Whether it ended one.
-    fn end_lost_session(&self, gone_for: Duration) -> bool {
-        if gone_for < steamvr::VR_EXIT_GRACE {
-            return false;
-        }
+    /// From the watcher, once VrGone::lost: ends a session whose SteamVR is gone (it crashed, the user quit
+    /// it, or a restart failed after vrserver last ran at `vrserver_seen`), so its lease is no longer renewed,
+    /// no supervisor restart starts SteamVR again and vr_release works. Not while a vr_start, vr_stop or
+    /// restart runs, which bring SteamVR down on purpose. Whether it ended one.
+    fn end_lost_session(&self, vrserver_seen: Option<Instant>) -> bool {
         let (Some(_start), Some(_restart)) = (self.starting.try_lock(), self.restarting.try_lock()) else { return false };
-        let headset = {
+        let (headset, dashboard, why) = {
             let mut state = self.state.lock();
             if !state.managing {
                 return false;
             }
             state.managing = false;
-            state.ended = Some(SESSION_LOST);
-            state.headset.take()
+            let restart_failed = state.last_restart_error.as_ref().is_some_and(|(t, _)| vrserver_seen.is_none_or(|s| *t > s));
+            let why = if restart_failed { RESTART_FAILED } else { SESSION_LOST };
+            state.ended = Some(why);
+            // started_steam stays: vr_stop still closes the Steam this MCP started
+            (state.headset.take(), state.dashboard.take(), why)
         };
-        warn!("{SESSION_LOST}");
+        warn!("{why}");
         if let Some(h) = headset {
             self.dispose(h);
+        }
+        if let Some(mut child) = dashboard {
+            child.kill().ok();
+            child.wait().ok();
         }
         true
     }
@@ -1934,17 +1939,45 @@ fn app_exited(launcher: Option<std::process::ExitStatus>, scene_pid: Option<u32>
     scene_pid.filter(|&pid| !alive(pid)).map(|pid| format!("scene pid {pid} is gone"))
 }
 
+/// The watcher's clocks on a managed session's SteamVR.
+#[derive(Debug, Default)]
+struct VrGone {
+    /// Since when vrserver is gone, and since when every SteamVR process is.
+    vrserver: Option<Instant>,
+    all: Option<Instant>,
+    /// When vrserver last ran.
+    seen: Option<Instant>,
+}
+
+impl VrGone {
+    /// Takes this tick's live SteamVR processes; true once the session is lost: no SteamVR process for VR_EXIT_GRACE,
+    /// or no vrserver for LAUNCH_SETTLE (SteamVR's own restart keeps vrmonitor up while vrserver is gone for seconds).
+    /// Not `watching` (no session, or a vr_start, vr_stop or restart, which take SteamVR down on purpose) resets the clocks.
+    fn lost(&mut self, watching: bool, alive: &[&str], now: Instant) -> bool {
+        let vrserver = alive.contains(&"vrserver");
+        if vrserver {
+            self.seen = Some(now);
+        }
+        let since = |t: Option<Instant>, gone: bool| (watching && gone).then(|| t.unwrap_or(now));
+        self.vrserver = since(self.vrserver, !vrserver);
+        self.all = since(self.all, alive.is_empty());
+        let held = |t: Option<Instant>, grace| t.is_some_and(|t| now.duration_since(t) >= grace);
+        held(self.all, steamvr::VR_EXIT_GRACE) || held(self.vrserver, steamvr::LAUNCH_SETTLE)
+    }
+}
+
 /// Recomputes readiness every 1 s and reports changes. Not in `supervise`, which blocks for a whole restart.
 fn watch(stack: Weak<Stack>) {
     let mut last = Readiness::default();
-    // since when a managed session has had no vrserver
-    let mut vr_gone: Option<Instant> = None;
+    let mut gone = VrGone::default();
     loop {
         let Some(s) = stack.upgrade() else { return };
         s.pump_reader();
-        vr_gone = (s.state.lock().managing && !steamvr::is_steamvr_running()).then(|| vr_gone.unwrap_or_else(Instant::now));
-        if let Some(t) = vr_gone {
-            s.end_lost_session(t.elapsed());
+        let managing = s.state.lock().managing;
+        let alive = if managing { s.vr.alive() } else { vec![] };
+        let watching = managing && !s.starting.is_locked() && !s.restarting.is_locked();
+        if gone.lost(watching, &alive, Instant::now()) {
+            s.end_lost_session(gone.seen);
         }
         s.keep_lease();
         let steam = s.paths().steam_dir;
@@ -2872,21 +2905,75 @@ mod tests {
     fn a_session_whose_steamvr_died_ends() {
         let (stack, root) = blocked_stack("lost", false);
         stack.state.lock().managing = true;
-        let long = Duration::from_secs(10);
-        assert!(!stack.end_lost_session(Duration::from_secs(1)), "a relaunching vrserver leaves a short gap");
         let starting = stack.starting.lock();
-        assert!(!stack.end_lost_session(long), "vr_start brings SteamVR up");
+        assert!(!stack.end_lost_session(None), "vr_start brings SteamVR up");
         drop(starting);
         let restarting = stack.restarting.lock();
-        assert!(!stack.end_lost_session(long), "a restart takes SteamVR down on purpose");
+        assert!(!stack.end_lost_session(None), "a restart takes SteamVR down on purpose");
         drop(restarting);
         assert!(stack.state.lock().managing && stack.status().warning.is_none());
-        assert!(stack.end_lost_session(long));
+        assert!(stack.end_lost_session(Some(Instant::now())));
         assert!(!stack.state.lock().managing, "no more lease renewal, supervisor restarts or stop_guard bypass");
-        assert!(stack.status().warning.is_some_and(|w| w.contains("run vr_start")), "{:?}", stack.status().warning);
-        assert!(!stack.end_lost_session(long), "already ended");
+        assert_eq!(stack.status().warning.as_deref(), Some(SESSION_LOST));
+        assert!(!stack.end_lost_session(None), "already ended");
         stack.stop().unwrap();
         assert_eq!(stack.status().warning, None, "vr_stop clears it");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_session_ends_only_once_steamvr_stays_gone() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut g = VrGone::default();
+        assert!(!g.lost(true, &["vrserver", "vrmonitor"], at(0)));
+        // SteamVR's own restart: vrmonitor and vrstartup live on while vrserver is gone for seconds
+        assert!(!g.lost(true, &["vrmonitor", "vrstartup"], at(1)));
+        assert!(!g.lost(true, &["vrmonitor", "vrstartup"], at(15)), "a relaunching vrserver may take a while");
+        assert!(g.lost(true, &["vrmonitor"], at(21)), "but not past LAUNCH_SETTLE");
+        assert_eq!(g.seen, Some(at(0)));
+        let mut g = VrGone::default();
+        assert!(!g.lost(true, &[], at(0)));
+        assert!(!g.lost(true, &[], at(2)));
+        assert!(g.lost(true, &[], at(3)), "nothing of SteamVR for VR_EXIT_GRACE");
+        let mut g = VrGone::default();
+        assert!(!g.lost(false, &[], at(0)), "our own restart holds `restarting`");
+        assert!(!g.lost(false, &[], at(30)));
+        assert!(!g.lost(true, &[], at(31)), "the clock starts when the restart lets go");
+        assert!(g.lost(true, &[], at(34)));
+    }
+
+    #[test]
+    fn a_session_lost_to_a_failed_restart_says_so() {
+        let stack = test_stack();
+        let seen = Instant::now();
+        let session = |error_at: Instant| {
+            let mut state = stack.state.lock();
+            state.managing = true;
+            state.last_restart_error = Some((error_at, "SteamVR restart failed: boom".into()));
+        };
+        session(seen + Duration::from_secs(1));
+        assert!(stack.end_lost_session(Some(seen)));
+        assert_eq!(stack.status().warning.as_deref(), Some(RESTART_FAILED), "the restart took SteamVR down and failed");
+        session(seen - Duration::from_secs(60));
+        assert!(stack.end_lost_session(Some(seen)));
+        assert_eq!(stack.status().warning.as_deref(), Some(SESSION_LOST), "an older failure; SteamVR ran after it");
+    }
+
+    #[test]
+    fn a_lost_session_ends_its_dashboard_so_vr_release_works() {
+        let (stack, root) = blocked_stack("lost-release", false);
+        stack.claim().unwrap();
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        {
+            let mut state = stack.state.lock();
+            (state.managing, state.started_steam, state.dashboard) = (true, true, Some(child));
+        }
+        assert!(stack.end_lost_session(None));
+        assert!(steamvr::stat(pid).is_none(), "the dashboard child is killed and reaped");
+        assert!(stack.state.lock().started_steam, "kept: vr_stop closes the Steam it started");
+        assert!(stack.release().unwrap(), "no lease left blocking other MCPs until its ttl");
         std::fs::remove_dir_all(&root).ok();
     }
 
