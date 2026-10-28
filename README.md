@@ -87,11 +87,11 @@ claude mcp add --scope user vr-test-mcp -- <path>/target/release/vr-test-mcp
 
 Do not add the same server to `~/.omp/agent/mcp.json` as well. The server's startup checks only read state, so registering it starts nothing. Logs go to stderr and stdout carries the protocol only.
 
-Only `vr_status`, `get_logs`, `vr_acquire` and `vr_release` are always listed. Every other tool appears while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes. A call to a gated tool answers `not ready: <reason>`.
+For most hosts, only `vr_status`, `get_logs`, `vr_acquire` and `vr_release` are always listed. Every other tool appears while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes. Hosts in `HOSTS_WITHOUT_LIST_CHANGED` (`src/server.rs`) get every tool listed. In every case, a call to a gated tool answers `not ready: <reason>`.
 
 ### Host notes
 
-- Claude Code acts on `tools/list_changed`. For protocol 2026-07-28 it needed `subscriptions/listen`, which the server serves.
+- Claude Code gets every tool listed. It acts on `tools/list_changed` (for protocol 2026-07-28 through `subscriptions/listen`, which the server serves), but its subagents keep the tool list they were spawned with, and a refresh mid-turn removes tools the model already planned to call.
 - omp handles the notification at the protocol level (checked with a manual stdio probe). It is not verified live, because omp's API credit ran out during testing.
 
 ## Tools

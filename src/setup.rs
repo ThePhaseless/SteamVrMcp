@@ -208,6 +208,11 @@ fn wrapped_vrcompositor(compositor: &Path) -> Result<Option<VrcompositorWrap>> {
     Ok(Some(VrcompositorWrap { link_target, real_path }))
 }
 
+fn read_state(paths: &Paths) -> Result<RestoreState> {
+    serde_json::from_str(&fs::read_to_string(paths.restore_file()).context("no restore.json: nothing to restore")?)
+        .context("parsing restore.json")
+}
+
 fn write_state(paths: &Paths, state: &RestoreState) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
     fs::write(paths.restore_file(), serde_json::to_string_pretty(state)?).context("writing restore.json")
@@ -262,8 +267,7 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     let config_dir = session_file.parent().context("session file has no parent")?;
 
     // 1. snapshot
-    let mut state = snapshot(paths)?;
-    let snapshot_written = state.is_some();
+    let snapshot_written = snapshot(paths)?.is_some();
 
     // 2. driver registration, as the dashboard's launch_steamvr does it
     let others: Vec<_> = alvr_server_io::get_registered_drivers()
@@ -295,10 +299,12 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
     for action in client_actions() {
         session.update_client_connections(hostname.into(), action);
     }
-    if let Some(state) = &mut state {
-        // ALVR writes session_old.json when it extrapolates an older session
-        state.created_files = list_dir(config_dir).difference(&before).cloned().collect();
-        write_state(paths, state)?;
+    // ALVR writes session_old.json when it extrapolates an older session; the snapshot may predate this prepare
+    let created: Vec<_> = list_dir(config_dir).difference(&before).cloned().collect();
+    if !created.is_empty() {
+        let mut state = read_state(paths)?;
+        state.created_files.extend(created);
+        write_state(paths, &state)?;
     }
 
     Ok(PrepareReport { snapshot_written, unblocked_safe_mode, unwrapped_vrcompositor: wrap.is_some() })
@@ -306,10 +312,7 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
 
 /// Puts back everything restore.json recorded, then deletes it.
 pub fn restore(paths: &Paths) -> Result<()> {
-    let state: RestoreState = serde_json::from_str(
-        &fs::read_to_string(paths.restore_file()).context("no restore.json: nothing to restore")?,
-    )
-    .context("parsing restore.json")?;
+    let state = read_state(paths)?;
 
     let mut json = alvr_server_io::load_openvr_paths_json()?;
     json.as_object_mut()

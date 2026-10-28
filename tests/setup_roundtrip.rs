@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::{fs, os::unix::fs::symlink, path::PathBuf, sync::Mutex};
 use vr_test_mcp::{
     config::{Config, Paths},
-    setup::{prepare, restore, session_values},
+    setup::{prepare, restore, session_values, snapshot},
 };
 
 // The tests set XDG_CONFIG_HOME, which is process-wide.
@@ -111,6 +111,22 @@ fn restore_from_file_only() {
     restore(&fresh).unwrap();
     assert_eq!(Snap::take(&fresh), before);
     assert!(!created.exists() && !fresh.restore_file().exists());
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn restore_deletes_files_created_after_an_earlier_snapshot() {
+    let f = fixture("snapfirst", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    // a cold vr_start snapshots before prepare, so it can clear safe-mode blocks in between
+    snapshot(&f.paths).unwrap();
+    prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap();
+    let created = f.paths.session_file().unwrap().with_file_name("session_old.json");
+    assert!(created.exists());
+
+    restore(&f.paths).unwrap();
+    assert_eq!(Snap::take(&f.paths), before);
+    assert!(!created.exists());
     fs::remove_dir_all(&f.root).ok();
 }
 

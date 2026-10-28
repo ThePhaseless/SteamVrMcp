@@ -25,8 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Client names of hosts that ignore `notifications/tools/list_changed`. They get every tool
-/// listed, and a gated one answers `not ready: <reason>`.
-pub const HOSTS_WITHOUT_LIST_CHANGED: &[&str] = &[];
+/// listed, and a gated one answers `not ready: <reason>`. Claude Code applies it, but its subagents
+/// keep the tool list from their spawn and a mid-turn refresh drops tools the model planned to call.
+pub const HOSTS_WITHOUT_LIST_CHANGED: &[&str] = &["claude-code"];
 
 pub struct VrServer {
     stack: Arc<Stack>,
