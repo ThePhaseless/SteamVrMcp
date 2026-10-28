@@ -1,24 +1,29 @@
 use alvr_common::{
     anyhow::{Context, Result, anyhow, bail},
     semver::Version,
+    parking_lot::Mutex,
     warn,
 };
 use alvr_events::Event;
 use alvr_session::SessionConfig;
 use serde::Serialize;
 use std::{
+    collections::HashSet,
+    fs,
     io::{ErrorKind, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
     time::Duration,
 };
-use tungstenite::{Message, WebSocket, client::IntoClientRequest};
+use tungstenite::{Message, WebSocket, client::IntoClientRequest, protocol::WebSocketConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// For probes that must answer at once even when ALVR stalls (readiness, vr_status).
 const QUICK: Duration = Duration::from_millis(500);
 /// The events websocket handshake; ALVR answers it at once on loopback.
 const HANDSHAKE: Duration = Duration::from_secs(3);
+/// The most a response or an event may hold; a whole session is far below it.
+const MAX_MESSAGE: usize = 8 << 20;
 
 /// The ALVR server's REST and events API on 127.0.0.1.
 #[derive(Clone, Copy)]
@@ -38,14 +43,21 @@ impl Api {
 
     // shortcut: no chunked decoding; axum answers these routes with Content-Length, switch to a client crate if a route streams
     fn request(&self, method: &str, path: &str, body: Option<&str>, timeout: Duration) -> Result<String> {
-        refuse_foreign(method, self.port, crate::steamvr::vrserver_has_alvr)?;
+        refuse_foreign(self.port, || crate::steamvr::pids_named("vrserver"))?;
+        self.send(method, path, body, timeout)
+    }
+
+    fn send(&self, method: &str, path: &str, body: Option<&str>, timeout: Duration) -> Result<String> {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
         let mut stream = TcpStream::connect_timeout(&addr, timeout.min(Duration::from_secs(1)))
             .with_context(|| format!("ALVR API not reachable on port {}", self.port))?;
         stream.set_read_timeout(Some(timeout))?;
         stream.write_all(build_request(method, path, body).as_bytes())?;
         let mut response = String::new();
-        stream.read_to_string(&mut response)?;
+        stream.take(MAX_MESSAGE as u64 + 1).read_to_string(&mut response)?;
+        if response.len() > MAX_MESSAGE {
+            bail!("{method} {path}: response over {MAX_MESSAGE} bytes");
+        }
         let (head, body) = response.split_once("\r\n\r\n").context("malformed HTTP response")?;
         let status = head.lines().next().unwrap_or_default();
         if !status.split(' ').nth(1).is_some_and(|code| code.starts_with('2')) {
@@ -80,6 +92,11 @@ impl Api {
     }
 
     pub fn events(&self) -> Result<EventStream> {
+        refuse_foreign(self.port, || crate::steamvr::pids_named("vrserver"))?;
+        self.connect_events()
+    }
+
+    fn connect_events(&self) -> Result<EventStream> {
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
         let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))
             .with_context(|| format!("ALVR API not reachable on port {}", self.port))?;
@@ -87,7 +104,8 @@ impl Api {
         stream.set_write_timeout(Some(HANDSHAKE))?;
         let mut request = format!("ws://127.0.0.1:{}/api/events", self.port).into_client_request()?;
         request.headers_mut().insert("X-ALVR", "1".parse()?);
-        let (socket, _) = tungstenite::client(request, stream).map_err(|e| anyhow!("ALVR events handshake: {e}"))?;
+        let config = WebSocketConfig::default().max_message_size(Some(MAX_MESSAGE)).max_frame_size(Some(MAX_MESSAGE));
+        let (socket, _) = tungstenite::client::client_with_config(request, stream, Some(config)).map_err(|e| anyhow!("ALVR events handshake: {e}"))?;
         Ok(EventStream(socket))
     }
 }
@@ -116,14 +134,53 @@ impl EventStream {
     }
 }
 
-/// Refuses a mutating call unless this user's vrserver hosts ALVR (`ours`): another user's SteamVR
-/// can hold the port, and a POST would restart, shut down or reconfigure it.
-// shortcut: point-in-time; a foreign ALVR holding the port while ours failed to bind still passes, check the server pid if that shows up
-fn refuse_foreign(method: &str, port: u16, ours: impl FnOnce() -> bool) -> Result<()> {
-    if method != "GET" && !ours() {
+/// Refuses a call unless every socket listening on `port` is held by one of `vrservers` (this
+/// user's): another user or program can hold the port, and would take our POSTs and feed us forged
+/// sessions, restart requests and log lines. A verified set of sockets is kept until it changes.
+// shortcut: checked before connecting, so a listener swapped in between is missed; compare the accepted socket's inode if that matters
+fn refuse_foreign(port: u16, vrservers: impl FnOnce() -> Vec<u32>) -> Result<()> {
+    static VERIFIED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let mut listening: Vec<u64> = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .flat_map(|t| listening_inodes(&fs::read_to_string(t).unwrap_or_default(), port))
+        .collect();
+    listening.sort();
+    if listening.is_empty() {
+        bail!("ALVR API not reachable on port {port}");
+    }
+    let mut verified = VERIFIED.lock();
+    if *verified == listening {
+        return Ok(());
+    }
+    let held: HashSet<u64> = vrservers().into_iter().flat_map(socket_inodes).collect();
+    if !listening.iter().all(|i| held.contains(i)) {
         bail!("not ours: the ALVR on port {port} does not belong to this user's SteamVR");
     }
+    *verified = listening;
     Ok(())
+}
+
+/// The inodes of the sockets in LISTEN state on `port` in a /proc/net/tcp or tcp6 table.
+fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
+    let port = format!(":{port:04X}");
+    table
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let (local, state, inode) = (f.get(1)?, f.get(3)?, f.get(9)?);
+            (local.ends_with(&port) && *state == "0A").then(|| inode.parse().ok()).flatten()
+        })
+        .collect()
+}
+
+/// The inodes of the sockets `pid` holds open.
+fn socket_inodes(pid: u32) -> Vec<u64> {
+    fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|fd| fs::read_link(fd.path()).ok()?.to_str()?.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok())
+        .collect()
 }
 
 pub fn build_request(method: &str, path: &str, body: Option<&str>) -> String {
@@ -207,7 +264,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
         let api = Api { port: listener.local_addr().unwrap().port() };
         let started = std::time::Instant::now();
-        assert!(!api.ping());
+        assert!(api.send("GET", "/api/ping", None, QUICK).is_err());
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
@@ -216,21 +273,56 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); // accepts, never answers
         let api = Api { port: listener.local_addr().unwrap().port() };
         let started = std::time::Instant::now();
-        assert!(api.quick_version().is_err());
+        assert!(api.send("GET", "/api/version", None, QUICK).is_err());
         assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
         let started = std::time::Instant::now();
-        assert!(api.events().is_err());
+        assert!(api.connect_events().is_err());
         assert!(started.elapsed() < HANDSHAKE + Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]
-    fn only_our_alvr_takes_posts() {
-        assert_eq!(
-            refuse_foreign("POST", 8082, || false).unwrap_err().to_string(),
-            "not ours: the ALVR on port 8082 does not belong to this user's SteamVR"
-        );
-        assert!(refuse_foreign("POST", 8082, || true).is_ok());
-        assert!(refuse_foreign("GET", 8082, || panic!("reads go to any ALVR")).is_ok());
+    fn only_the_listener_our_vrserver_holds_is_ours() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let e = refuse_foreign(port, Vec::new).unwrap_err().to_string();
+        assert_eq!(e, format!("not ours: the ALVR on port {port} does not belong to this user's SteamVR"));
+        // every call goes through the check, reads and the events stream included; no vrserver holds this listener
+        let api = Api { port };
+        for e in [api.get("/api/session").unwrap_err(), api.post("/api/x").unwrap_err(), api.events().err().unwrap()] {
+            assert!(e.to_string().starts_with("not ours"), "{e}");
+        }
+        assert!(refuse_foreign(port, || vec![std::process::id()]).is_ok(), "this process holds it");
+        assert!(refuse_foreign(port, || panic!("verified once")).is_ok());
+        drop(listener);
+        assert!(refuse_foreign(port, Vec::new).unwrap_err().to_string().contains("not reachable"));
+    }
+
+    #[test]
+    fn listening_inodes_reads_proc_net_tables() {
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:1F92 0100007F:D0A2 01 00000000:00000000 00:00000000 00000000  1000        0 4343 1 0000000000000000 20 4 30 10 -1
+   2: 0100007F:1F93 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4444 1 0000000000000000 100 0 0 10 0";
+        assert_eq!(listening_inodes(tcp, 8082), [4242], "LISTEN on the port only");
+        let tcp6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 77 1 0000000000000000 100 0 0 10 0";
+        assert_eq!(listening_inodes(tcp6, 8082), [77]);
+    }
+
+    #[test]
+    fn responses_are_capped() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = Api { port: listener.local_addr().unwrap().port() };
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.read(&mut [0; 4096]).ok(); // the request; unread, closing would reset the connection
+            s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").ok();
+            let chunk = vec![b'a'; 1 << 20];
+            while s.write_all(&chunk).is_ok() {} // endless: only the client's cap ends it
+        });
+        let e = api.send("GET", "/api/session", None, TIMEOUT).unwrap_err();
+        assert!(e.to_string().contains("response over"), "{e}");
+        server.join().unwrap();
     }
 
     #[test]
