@@ -75,6 +75,24 @@ pub(crate) fn within<T: Send + 'static>(timeout: Duration, f: impl FnOnce() -> T
     rx.recv_timeout(timeout).ok()
 }
 
+/// One call counted in `openvr_calls`; dropping it, also in a panic, uncounts it.
+struct Pending(Arc<AtomicUsize>);
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, SeqCst);
+    }
+}
+
+/// `within(timeout, f)`, counted in `calls` until `f` returns and, after a timeout, until its result is dropped:
+/// a late OpenVR reader's drop is VR_ShutdownInternal, which must not overlap a new connect.
+fn counted_call<T: Send + 'static>(calls: &Arc<AtomicUsize>, timeout: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    calls.fetch_add(1, SeqCst);
+    let pending = Pending(Arc::clone(calls));
+    // a tuple drops in field order: a result nobody received goes before its count
+    within(timeout, move || (f(), pending)).map(|(out, _pending)| out)
+}
+
 /// A file stem no earlier MCP run used, so a stray old file is never read back.
 fn unique_stem(wall: SystemTime, pid: u32) -> String {
     let ms = wall.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
@@ -1136,13 +1154,7 @@ impl Stack {
 
     /// `within(OPENVR_TIMEOUT, f)`, counted in `openvr_calls` until `f` returns, also after a timeout.
     fn openvr_call<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let calls = Arc::clone(&self.openvr_calls);
-        calls.fetch_add(1, SeqCst);
-        within(OPENVR_TIMEOUT, move || {
-            let out = f();
-            calls.fetch_sub(1, SeqCst);
-            out
-        })
+        counted_call(&self.openvr_calls, OPENVR_TIMEOUT, f)
     }
 
     /// Whether an earlier OpenVR call still hangs; meaningful only while the reader lock is held.
@@ -2589,6 +2601,33 @@ mod tests {
     fn within_reports_a_stuck_closure_as_leaked() {
         assert_eq!(within(Duration::from_secs(1), || 5), Some(5));
         assert_eq!(within(Duration::from_millis(20), || thread::sleep(Duration::from_millis(300))), None);
+    }
+
+    /// Records the call count when dropped, as a late OpenVR reader's VR_ShutdownInternal would run then.
+    struct DropProbe(Arc<AtomicUsize>, Arc<Mutex<Option<usize>>>);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            *self.1.lock() = Some(self.0.load(SeqCst));
+        }
+    }
+
+    #[test]
+    fn a_late_openvr_call_counts_until_its_result_is_dropped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(None));
+        let probe = DropProbe(Arc::clone(&calls), Arc::clone(&seen));
+        let late = counted_call(&calls, Duration::from_millis(20), move || {
+            thread::sleep(Duration::from_millis(200));
+            probe
+        });
+        assert!(late.is_none());
+        assert!(steamvr::wait_for(Duration::from_secs(2), || seen.lock().is_some()));
+        assert_eq!(*seen.lock(), Some(1), "still counted while the late result shuts down");
+        assert!(steamvr::wait_for(Duration::from_secs(1), || calls.load(SeqCst) == 0));
+        assert_eq!(counted_call(&calls, Duration::from_secs(1), || 5), Some(5));
+        assert_eq!(calls.load(SeqCst), 0, "a call that returned in time is not counted");
+        assert_eq!(counted_call(&calls, Duration::from_secs(1), || -> () { panic!("boom") }), None);
+        assert!(steamvr::wait_for(Duration::from_secs(1), || calls.load(SeqCst) == 0), "a panic counts as returned");
     }
 
     #[test]
