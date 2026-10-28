@@ -95,11 +95,6 @@ fn parse_stat(stat: &str) -> Option<(char, u64)> {
     Some((state, fields.nth(18)?.parse().ok()?))
 }
 
-/// Every SteamVR process as (pid, start time), so a later check finds it whatever its comm becomes.
-pub fn vr_snapshot() -> Vec<(u32, u64)> {
-    VR_PROCESS_NAMES.iter().flat_map(|n| pids_named(n)).filter_map(|pid| Some((pid, stat(pid)?.1))).collect()
-}
-
 /// The `snapshot` pids still the same process (start time) and not a zombie, whatever their name now.
 pub fn survivors(snapshot: &[(u32, u64)], stat: impl Fn(u32) -> Option<(char, u64)>) -> Vec<u32> {
     snapshot.iter().filter(|&&(pid, start)| stat(pid).is_some_and(|(state, t)| t == start && state != 'Z')).map(|&(pid, _)| pid).collect()
@@ -216,21 +211,87 @@ pub fn terminate(pid: u32, sig: i32) {
     }
 }
 
-/// SIGTERM, then SIGKILL, to every SteamVR process (vrmonitor last), 5 s apart. True when none remain.
-pub fn kill_vr_processes() -> bool {
-    for sig in [libc::SIGTERM, libc::SIGKILL] {
-        for name in VR_PROCESS_NAMES {
-            pids_named(name).into_iter().for_each(|pid| terminate(pid, sig));
-        }
-        if wait_gone(VR_PROCESS_NAMES, KILL_WAIT) {
-            return true;
-        }
-    }
-    false
+/// How long VrProcs::kill waits after each signal.
+pub const KILL_WAIT: Duration = Duration::from_secs(5);
+
+/// How long after a launch Steam may take to start SteamVR's first process.
+pub const LAUNCH_SETTLE: Duration = URL_TAKEN_WAIT;
+
+/// The processes vr_stop and a SteamVR restart end, and how long they wait on them: SteamVR's, or a unit test's fakes.
+#[derive(Clone, Copy, Debug)]
+pub struct VrProcs {
+    pub names: &'static [&'static str],
+    /// How long they get to exit after ALVR's shutdown request, before signals.
+    pub grace: Duration,
+    /// How long each signal round waits.
+    pub kill_wait: Duration,
 }
 
-/// How long kill_vr_processes waits after each signal.
-pub const KILL_WAIT: Duration = Duration::from_secs(5);
+/// What VrProcs::end did: whether every process is gone, and whether it took signals.
+#[derive(Debug, PartialEq)]
+pub struct Ended {
+    pub gone: bool,
+    pub used_signals: bool,
+}
+
+impl VrProcs {
+    pub const STEAMVR: VrProcs = VrProcs { names: VR_PROCESS_NAMES, grace: Duration::from_secs(30), kill_wait: KILL_WAIT };
+    /// Matches no process: what unit tests get, so none can signal the user's SteamVR.
+    pub const NONE: VrProcs = VrProcs { names: &[], ..Self::STEAMVR };
+
+    /// Every such process as (pid, start time), so a later check finds it whatever its comm becomes.
+    pub fn snapshot(&self) -> Vec<(u32, u64)> {
+        self.names.iter().flat_map(|n| pids_named(n)).filter_map(|pid| Some((pid, stat(pid)?.1))).collect()
+    }
+
+    /// The names with a running process.
+    pub fn alive(&self) -> Vec<&'static str> {
+        running(self.names)
+    }
+
+    /// SIGTERM, then SIGKILL, by name (in order, so vrmonitor goes last), kill_wait apart. True when none remain.
+    pub fn kill(&self) -> bool {
+        for sig in [libc::SIGTERM, libc::SIGKILL] {
+            for name in self.names {
+                pids_named(name).into_iter().for_each(|pid| terminate(pid, sig));
+            }
+            if wait_gone(self.names, self.kill_wait) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// After ALVR was asked to shut SteamVR down: waits `grace`, then kills by name, then SIGKILLs the
+    /// `snapshot` pids still alive under another name (a vrserver that renamed itself lived on 30 s).
+    pub fn end(&self, snapshot: &[(u32, u64)]) -> Ended {
+        let mut used_signals = false;
+        let mut gone = wait_gone(self.names, self.grace) || {
+            used_signals = true;
+            self.kill()
+        };
+        let survivors = || survivors(snapshot, stat);
+        if !survivors().is_empty() {
+            used_signals = true;
+            survivors().into_iter().for_each(|pid| terminate(pid, libc::SIGKILL));
+            gone = wait_for(self.kill_wait, || survivors().is_empty()) && gone;
+        }
+        Ended { gone, used_signals }
+    }
+
+    /// The names still running, then the `snapshot` pids still alive under another name.
+    pub fn remaining(&self, snapshot: &[(u32, u64)]) -> Vec<String> {
+        let named = self.alive().into_iter().map(str::to_owned);
+        named.chain(survivors(snapshot, stat).into_iter().map(|pid| format!("pid {pid} ({})", process_name(pid).unwrap_or_default()))).collect()
+    }
+
+    /// After a launch the caller gave up on (vr_stop): waits until one of these processes runs, or
+    /// LAUNCH_SETTLE after `launched`, so the stop that follows finds the SteamVR Steam was handed.
+    // shortcut: a Steam still starting up (login, self-update) can start SteamVR after the settle, track Steam's console log for AppID 250820 if that shows up
+    pub fn settle(&self, launched: Instant) {
+        wait_for(LAUNCH_SETTLE.saturating_sub(launched.elapsed()), || !self.alive().is_empty());
+    }
+}
 
 /// True when `now` holds a vrserver pid that `old` does not: SteamVR really relaunched.
 pub fn is_new_vrserver(old: &[u32], now: &[u32]) -> bool {
@@ -241,11 +302,6 @@ pub fn is_new_vrserver(old: &[u32], now: &[u32]) -> bool {
 /// (console_log: WaitingPrevProcess, AppError_16), so start() kills them first.
 pub fn has_leftovers(alive: &[&str]) -> bool {
     !alive.is_empty() && !alive.contains(&"vrserver")
-}
-
-/// The VR_PROCESS_NAMES with a running process.
-pub fn alive_vr_processes() -> Vec<&'static str> {
-    running(VR_PROCESS_NAMES)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -557,6 +613,9 @@ pub fn steam_env(host: impl IntoIterator<Item = (OsString, OsString)>, extra: &B
 /// Runs `steam <url>` with only the desktop-session environment. Only when Steam is not running yet
 /// does it get `steam.env` and `steam.args`, because a running Steam just forwards the URL. True if this started Steam.
 pub fn launch(cfg: &Config, url: &str) -> Result<bool> {
+    if cfg!(test) {
+        bail!("unit tests never run steam"); // it would start or shut down the user's Steam and SteamVR
+    }
     let start_steam = !is_steam_running();
     let no_extra = BTreeMap::new();
     let mut command = Command::new("steam");
@@ -626,10 +685,13 @@ pub fn run_dashboard_child() -> ! {
 }
 
 /// The dashboard's restart: ALVR shuts SteamVR down cleanly, then SteamVR is launched again. The
-/// wait for the relaunch ends early once `stopped`; `started_steam` is set when the relaunch started Steam.
-pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn() -> bool, started_steam: &mut bool) -> Result<()> {
+/// wait for the relaunch takes up to `timeout` and ends early once `stopped`; `started_steam` is set when the relaunch started Steam.
+pub fn restart_steamvr(
+    cfg: &Config, paths: &Paths, api: &Api, procs: &VrProcs, timeout: Duration, stopped: impl Fn() -> bool, started_steam: &mut bool,
+) -> Result<()> {
     let vrsettings = paths.vrsettings_file().context("Steam not found; set steam_dir in config.toml")?;
     let old = pids_named("vrserver");
+    let snapshot = procs.snapshot();
     // on failure (also when Api refuses a foreign ALVR) the wait and signals below still stop our SteamVR, so it is always relaunched
     if let Err(e) = api.post("/api/steamvr/restart") {
         error!("{e:#}");
@@ -638,17 +700,19 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
     // (sockets/src/stream_socket/tcp.rs:137-147), so escalate to signals. Every SteamVR process
     // must be gone: a steamtours that outlives vrserver keeps Steam's AppID 250820 running, and
     // Steam then refuses the relaunch (console_log: WaitingPrevProcess, AppError_16)
-    if !wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) {
-        if !kill_vr_processes() {
-            bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", alive_vr_processes(), KILL_WAIT.as_secs());
-        }
+    if !procs.end(&snapshot).gone {
+        bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", procs.remaining(&snapshot), procs.kill_wait.as_secs());
     }
     // SteamVR has exited, so it no longer rewrites the file; a failure only leaves other drivers
     // blocked, so log it and relaunch anyway
     setup::undo_safe_mode_blocks(paths).map_err(|e| error!("{e:#}")).ok();
     setup::unblock_safe_mode(&vrsettings)?;
+    if stopped() {
+        bail!("failed: vr_stop ended the SteamVR restart");
+    }
     let log_from = paths.steam_dir.as_deref().map_or(0, console_log_len);
     *started_steam = launch(cfg, STEAMVR_URL)?;
+    let launched = Instant::now();
     let handed = (!*started_steam).then_some(STEAMVR_URL);
     // the old server can still answer ping while it hangs in shutdown
     let (mut seen, mut exited) = (Vec::new(), None);
@@ -656,10 +720,11 @@ pub fn restart_steamvr(cfg: &Config, paths: &Paths, api: &Api, stopped: impl Fn(
         exited = vr_exited(&mut seen);
         stopped() || exited.is_some() || (is_new_vrserver(&old, &pids_named("vrserver")) && api.ping())
     };
-    if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, Duration::from_secs(cfg.timeouts.streaming_s), relaunched)? {
-        bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", cfg.timeouts.streaming_s);
+    if !wait_launched(paths.steam_dir.as_deref(), log_from, handed, timeout, relaunched)? {
+        bail!("ALVR did not come back after the SteamVR restart (deadline {} s)", timeout.as_secs());
     }
     if stopped() {
+        procs.settle(launched); // the stop waiting for this restart then finds the SteamVR Steam starts
         bail!("failed: vr_stop ended the SteamVR restart");
     }
     if let Some(name) = exited {
@@ -1015,5 +1080,17 @@ mod tests {
         assert_eq!(env_mismatches(b"A=1\0B=9\0C=3", &want), ["B=2 but has 9"]);
         // a non-UTF-8 entry elsewhere must not hide a match or a mismatch
         assert_eq!(env_mismatches(b"JUNK=\xff\xfe\0A=1\0B=2\0C=0", &want), ["C=3 but has 0"]);
+    }
+
+    #[test]
+    fn a_restart_that_vr_stop_ended_never_relaunches() {
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-steamvr-restart-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(root.join("steam/config")).unwrap();
+        fs::write(root.join("steam/config/steamvr.vrsettings"), "{}").unwrap();
+        let paths = Paths { steam_dir: Some(root.join("steam")), flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
+        let e = restart_steamvr(&Config::default(), &paths, &Api { port: 1 }, &VrProcs::NONE, Duration::from_secs(1), || true, &mut false).unwrap_err();
+        assert_eq!(e.to_string(), "failed: vr_stop ended the SteamVR restart", "stopped before launch(), which unit tests refuse");
+        fs::remove_dir_all(&root).ok();
     }
 }

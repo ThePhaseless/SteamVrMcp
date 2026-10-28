@@ -49,6 +49,10 @@ const WATCHDOG: Duration = Duration::from_secs(30);
 
 const LEAKED: &str = "headset leaked; restart the MCP to free a CPU core";
 
+const RESTART_FAILED: &str = "the last SteamVR restart failed and the headset is not streaming; run vr_start";
+
+const SESSION_LOST: &str = "SteamVR exited without vr_stop (it crashed or was quit), so the session ended; run vr_start";
+
 const HEADSET_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a cold vr_start waits for vrserver to log ALVR's HMD activation before it resumes the headset.
@@ -140,7 +144,8 @@ pub struct StatusReport {
     pub on_head: bool,
     /// Only while the OpenVR reader is connected, so vr_status never connects one.
     pub scene_app: Option<openvr::SceneApp>,
-    pub warning: Option<&'static str>,
+    /// What needs the agent's action, "; "-joined: a leaked headset, a session SteamVR's exit ended, a failed restart.
+    pub warning: Option<String>,
     /// The last SteamVR restart that failed, also one the supervisor ran: "<age> s ago: <reason>".
     pub last_restart_error: Option<String>,
     /// Session clock: seconds since MCP start, and the same instant and T0 as RFC 3339 UTC.
@@ -457,10 +462,14 @@ struct State {
     dashboard: Option<Child>,
     started_steam: bool,
     restarts: u32,
-    /// The watchdog restarts SteamVR at most once per start().
+    /// The watchdog restarts SteamVR at most once per stream: re-armed by vr_start and whenever the headset streams.
     watchdog_fired: bool,
     leaked: bool,
     managing: bool,
+    /// Bumped by every vr_stop; a vr_start that saw another value bails at its next check.
+    stops: u64,
+    /// Why the session ended without vr_stop, for vr_status; cleared by vr_start and vr_stop.
+    ended: Option<&'static str>,
     /// When and why the last SteamVR restart failed.
     last_restart_error: Option<(Instant, String)>,
     /// The last `launch_app via proton` run, until stop_app ends it.
@@ -494,6 +503,8 @@ pub struct Stack {
     lease: Mutex<(String, Duration)>,
     /// The game log rings from `[app_logs]`; rebuilt when the config reloads. Locked briefly, never while sleeping.
     app_logs: Mutex<AppLogs>,
+    /// The processes vr_stop, a restart and a cold vr_start signal.
+    vr: steamvr::VrProcs,
 }
 
 const RECENTER_NOT_STAGE: &str =
@@ -527,6 +538,21 @@ pub fn foreign_alvr_guard(our_vrserver: bool, api_answers: impl FnOnce() -> bool
     Ok(())
 }
 
+/// How long vr_start waits for the API of a running SteamVR's loaded ALVR driver: it answers a few seconds after vrserver starts.
+const ALVR_API_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether vr_start can adopt a running SteamVR: its vrserver loaded ALVR's driver (`has_alvr`) and ALVR's API answers within `wait`.
+/// A loaded driver whose API stays silent is ALVR's TCP EOF spin or a hung start, which only vr_stop clears.
+fn adoptable(has_alvr: bool, answers: impl FnMut() -> bool, wait: Duration, port: u16) -> Result<()> {
+    if !has_alvr {
+        bail!("SteamVR is running without the ALVR driver; close SteamVR and retry");
+    }
+    if !steamvr::wait_for(wait, answers) {
+        bail!("ALVR's API does not answer on port {port} (deadline {} s); run vr_stop", wait.as_secs_f64());
+    }
+    Ok(())
+}
+
 /// A game that finds no SteamVR would start one from its own process, under its own prefix and process group.
 pub fn launch_guard(steamvr_running: bool) -> Result<()> {
     if !steamvr_running {
@@ -544,6 +570,11 @@ pub fn restore_guard(steamvr_running: bool) -> Result<()> {
 
 impl Stack {
     pub fn new(cfg: Config, paths: Paths) -> Arc<Stack> {
+        // a unit test that reaches stop() must never signal the user's SteamVR
+        Self::with_procs(cfg, paths, if cfg!(test) { steamvr::VrProcs::NONE } else { steamvr::VrProcs::STEAMVR })
+    }
+
+    fn with_procs(cfg: Config, paths: Paths, vr: steamvr::VrProcs) -> Arc<Stack> {
         let app_log_patterns = cfg.app_logs.clone();
         let stack = Arc::new(Stack {
             api: Mutex::new(api_for(&paths)),
@@ -560,6 +591,7 @@ impl Stack {
             alvr_logs: Mutex::default(),
             lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
             app_logs: Mutex::new(AppLogs::new(&app_log_patterns)),
+            vr,
         });
         stack.run_checks();
         let weak = Arc::downgrade(&stack);
@@ -694,9 +726,35 @@ impl Stack {
         let managing = self.state.lock().managing;
         let (owner, ttl) = self.lease.lock().clone();
         let dir = self.paths().runtime_dir;
-        if watch_renews(managing, lease::read(&dir).as_ref(), std::process::id(), ttl, SystemTime::now()) {
-            lease::acquire(&dir, &owner, ttl).map_err(|e| warn!("{e:#}")).ok();
+        // the unlocked read only spares the lock on most ticks; renew checks again under it
+        let held = lease::read(&dir);
+        if watch_renews(managing, managing && steamvr::is_steamvr_running(), held.as_ref(), std::process::id(), ttl, SystemTime::now()) {
+            lease::renew(&dir, &owner, ttl).map_err(|e| warn!("{e:#}")).ok();
         }
+    }
+
+    /// From the watcher: ends a session whose SteamVR has been gone for `gone_for` (it crashed, or the user
+    /// quit it), so its lease is no longer renewed and no supervisor restart starts SteamVR again. Not while
+    /// a vr_start, vr_stop or restart runs, which bring SteamVR down on purpose. Whether it ended one.
+    fn end_lost_session(&self, gone_for: Duration) -> bool {
+        if gone_for < steamvr::VR_EXIT_GRACE {
+            return false;
+        }
+        let (Some(_start), Some(_restart)) = (self.starting.try_lock(), self.restarting.try_lock()) else { return false };
+        let headset = {
+            let mut state = self.state.lock();
+            if !state.managing {
+                return false;
+            }
+            state.managing = false;
+            state.ended = Some(SESSION_LOST);
+            state.headset.take()
+        };
+        warn!("{SESSION_LOST}");
+        if let Some(h) = headset {
+            self.dispose(h);
+        }
+        true
     }
 
     /// A finished stop or restore leaves nothing running, so hold nothing.
@@ -945,11 +1003,12 @@ impl Stack {
     /// changed. A reader that does not answer within OPENVR_TIMEOUT is left on its thread.
     // shortcut: a reader left stuck keeps OpenVR's process-global client, so the next connect may fail until the MCP restarts; fine while no hang is seen
     fn read<T: Send + 'static>(&self, f: impl FnOnce(&OpenVr) -> Result<T> + Send + 'static) -> Result<T> {
-        // the reader was dropped for a vrserver that is going away; do not reconnect to it
+        let mut slot = self.reader.lock();
+        // the reader was dropped for a vrserver that is going away; do not reconnect to it. Checked with
+        // the slot held: a stop or restart that begins later drops the reader only after this read
         if self.restarting.is_locked() {
             bail!("SteamVR is stopping or restarting");
         }
-        let mut slot = self.reader.lock();
         let vrserver = steamvr::pids_named("vrserver").first().copied();
         let reader = match slot.take() {
             Some((pid, reader)) if Some(pid) == vrserver => Some(reader),
@@ -1010,32 +1069,63 @@ impl Stack {
     }
 
     pub fn start(&self) -> Result<StartReport> {
-        let Some(_starting) = self.starting.try_lock() else { bail!("not ready: vr_start is already running") };
-        if self.restarting.is_locked() {
-            bail!("not ready: SteamVR is restarting");
-        }
-        self.state.lock().watchdog_fired = false;
-        let started = self.start_inner();
+        // vr_stop holds it too, to wait for a start it ended
+        let Some(_starting) = self.starting.try_lock() else { bail!("not ready: vr_start or vr_stop is running") };
+        // held until start_inner's waits, so no SteamVR restart moves the headset while it sets up
+        let Some(no_restart) = self.restarting.try_lock() else { bail!("not ready: SteamVR is restarting") };
+        let epoch = {
+            let mut state = self.state.lock();
+            state.watchdog_fired = false;
+            state.ended = None;
+            state.stops
+        };
+        let started = self.start_inner(epoch, no_restart);
         if let Err(e) = &started {
             let mut state = self.state.lock();
             state.managing = false;
-            // the auto-claimed lease stays while leftovers hold the machine; vr_stop frees both
-            if state.headset.is_some() || state.dashboard.is_some() || state.started_steam {
+            // the auto-claimed lease stays while leftovers hold the machine; vr_stop frees both (and one that ended this start is about to)
+            if state.stops == epoch && (state.headset.is_some() || state.dashboard.is_some() || state.started_steam) {
                 bail!("{e:#}; run vr_stop to free SteamVR");
             }
         }
         started.map(|report| StartReport { dashboard_visible: self.dashboard_visible(), ..report })
     }
 
-    fn start_inner(&self) -> Result<StartReport> {
+    /// Err once a vr_stop ran since `epoch`, State::stops when the vr_start began.
+    fn check_stop(&self, epoch: u64) -> Result<()> {
+        if self.state.lock().stops != epoch {
+            bail!("failed: vr_stop ended the session");
+        }
+        Ok(())
+    }
+
+    /// Hands the session to the supervisor, unless a vr_stop ran since `epoch`: it already gave the session up.
+    fn begin_managing(&self, epoch: u64) -> Result<u32> {
+        let mut state = self.state.lock();
+        if state.stops != epoch {
+            bail!("failed: vr_stop ended the session");
+        }
+        state.managing = true;
+        Ok(state.restarts)
+    }
+
+    /// The error of a vr_start that vr_stop ended. After a launch it first lets Steam's hand-off start SteamVR, so the stop that waits for this start finds it.
+    fn stopped_start(&self, launched: Option<Instant>) -> alvr_common::anyhow::Error {
+        if let Some(t) = launched {
+            self.vr.settle(t);
+        }
+        anyhow!("failed: vr_stop ended the session")
+    }
+
+    fn start_inner(&self, epoch: u64, no_restart: alvr_common::parking_lot::MutexGuard<'_, ()>) -> Result<StartReport> {
         let began = Instant::now();
+        // one deadline for the whole start, an adopted SteamVR's restart included
+        let timeout = Duration::from_secs(self.cfg().timeouts.streaming_s);
+        let deadline = began + timeout;
+        let left = || deadline.saturating_duration_since(Instant::now());
         let mut report = StartReport::default();
         if let Some(h) = self.headset_status().filter(|h| h.streaming) {
-            let restarts = {
-                let mut state = self.state.lock();
-                state.managing = true; // a stream the MCP left unmanaged gets its supervisor back
-                state.restarts
-            };
+            let restarts = self.begin_managing(epoch)?; // a stream the MCP left unmanaged gets its supervisor back
             return Ok(StartReport { already_streaming: true, restarts, view_resolution: h.view_resolution, fps: h.fps, codec: h.codec, ..report });
         }
         self.paths().session_file().context("ALVR streamer not found; set streamer_dir in config.toml")?;
@@ -1063,15 +1153,15 @@ impl Stack {
                 self.state.lock().headset.get_or_insert(h);
             }
         }
+        // a stop that came meanwhile disposes the headset once this start returns
+        self.check_stop(epoch)?;
         let hostname = headset::client_hostname()?;
         let values = setup::session_values(&self.cfg())?;
         let mut restart_adopted = false;
         if !steamvr_running {
             foreign_alvr_guard(false, || self.api().ping(), self.api().port)?;
-            if steamvr::has_leftovers(&steamvr::alive_vr_processes()) {
-                if !steamvr::kill_vr_processes() {
-                    bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", steamvr::alive_vr_processes(), steamvr::KILL_WAIT.as_secs());
-                }
+            if steamvr::has_leftovers(&self.vr.alive()) && !self.vr.kill() {
+                bail!("SteamVR processes still running after SIGKILL: {:?} (deadline {} s)", self.vr.alive(), self.vr.kill_wait.as_secs());
             }
             // nothing runs, so SteamVR no longer rewrites the file; a crash or kill left blocks behind
             setup::snapshot(&self.paths())?;
@@ -1081,7 +1171,10 @@ impl Stack {
             }
             report.unblocked_safe_mode = setup::prepare(&self.paths(), &values, &hostname)?.unblocked_safe_mode
                 || unblocked.iter().any(|d| d == "driver_alvr_server");
-        } else if steamvr::vrserver_has_alvr() && self.api().ping() {
+        } else {
+            // a vr_stop ends the wait too
+            adoptable(steamvr::vrserver_has_alvr(), || self.check_stop(epoch).is_err() || self.api().ping(), ALVR_API_WAIT, self.api().port)?;
+            self.check_stop(epoch)?;
             self.check_version()?;
             setup::snapshot(&self.paths())?;
             self.api().post_json("/api/session/values", &values)?;
@@ -1091,12 +1184,13 @@ impl Stack {
             report.adopted = true;
             // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
             restart_adopted = client_stuck(&self.session()?, &hostname);
-        } else {
-            bail!("SteamVR is running without the ALVR driver; close SteamVR and retry");
         }
 
         {
             let mut state = self.state.lock();
+            if state.stops != epoch {
+                bail!("failed: vr_stop ended the session");
+            }
             if state.dashboard.is_none() {
                 state.dashboard = Some(steamvr::spawn_dashboard_child(&self.paths().runtime_dir)?);
             }
@@ -1105,30 +1199,30 @@ impl Stack {
         let steam_dir = paths.steam_dir.as_deref();
         let log_from = steam_dir.map_or(0, steamvr::console_log_len);
         let vrserver_from = steam_dir.map_or((0, None), |d| steamvr::log_mark(d, "vrserver"));
-        let mut handed = None;
+        let (mut handed, mut launched) = (None, None);
         if !steamvr_running {
             report.started_steam = steamvr::launch(&self.cfg(), STEAMVR_URL)?;
+            launched = Some(Instant::now());
             self.state.lock().started_steam |= report.started_steam;
             handed = (!report.started_steam).then_some(STEAMVR_URL);
         }
 
-        self.state.lock().managing = true;
+        self.begin_managing(epoch).map_err(|_| self.stopped_start(launched))?;
+        drop(no_restart);
         if restart_adopted {
-            self.restart_steamvr(false)?;
+            self.restart_within(false, left())?;
         }
-        let timeout = Duration::from_secs(self.cfg().timeouts.streaming_s);
-        let deadline = Instant::now() + timeout;
-        let stopped = || !self.state.lock().managing;
+        let stopped = || self.check_stop(epoch).is_err();
         let (mut seen, mut exited) = (Vec::new(), None);
         let answered = || {
             exited = self.vr_exited(&mut seen);
             stopped() || exited.is_some() || self.api().ping()
         };
-        if !steamvr::wait_launched(steam_dir, log_from, handed, timeout, answered)? {
+        if !steamvr::wait_launched(steam_dir, log_from, handed, left(), answered)? {
             bail!("ALVR server did not answer on port {} (deadline {} s)", self.api().port, timeout.as_secs());
         }
         if stopped() {
-            bail!("failed: vr_stop ended the session");
+            return Err(self.stopped_start(launched));
         }
         if let Some(name) = exited {
             bail!("failed: {name} exited before ALVR answered");
@@ -1161,7 +1255,7 @@ impl Stack {
                 HeadsetStep::Skip => (),
             }
         }
-        let streaming = self.wait_streaming(began, deadline.saturating_duration_since(Instant::now()), 0)?;
+        let streaming = self.wait_streaming(began, left(), 0)?;
         let h = self.headset_status().unwrap_or_default();
         if !streaming {
             let mut reason = format!("headset not streaming (deadline {} s); last HUD message: {:?}", timeout.as_secs(), h.hud_message);
@@ -1180,7 +1274,14 @@ impl Stack {
             state.managing || state.started_steam
         };
         stop_guard(steamvr::is_steamvr_running(), || ours || self.api().ping() || steamvr::vrserver_has_alvr())?;
-        self.state.lock().managing = false;
+        {
+            let mut state = self.state.lock();
+            state.managing = false;
+            state.stops += 1;
+            state.ended = None;
+        }
+        // an in-flight vr_start bails at its next check; what it left (headset, dashboard, the SteamVR it launched) goes below
+        let _no_start = self.starting.lock();
         let _no_restart = self.restarting.lock();
         self.drop_reader();
         // a game spawned by the MCP may not quit with SteamVR, and its wineserver blocks the next proton launch
@@ -1191,23 +1292,15 @@ impl Stack {
         if let Some(h) = headset {
             self.dispose(h);
         }
-        // by pid: the name checks below missed a vrserver that lived on 30 s and needed SIGKILL
-        let snapshot = steamvr::vr_snapshot();
+        // by pid: the name checks missed a vrserver that lived on 30 s and needed SIGKILL
+        let snapshot = self.vr.snapshot();
         if self.api().ping() {
             // on failure the signals below still stop SteamVR
             self.api().post("/api/steamvr/shutdown").map_err(|e| error!("{e:#}")).ok();
         }
-        let mut gone = steamvr::wait_gone(VR_PROCESS_NAMES, Duration::from_secs(30)) || {
-            report.used_signals = true;
-            steamvr::kill_vr_processes()
-        };
-        let survivors = || steamvr::survivors(&snapshot, steamvr::stat);
-        if !survivors().is_empty() {
-            report.used_signals = true;
-            survivors().into_iter().for_each(|pid| steamvr::terminate(pid, libc::SIGKILL));
-            gone = steamvr::wait_for(steamvr::KILL_WAIT, || survivors().is_empty()) && gone;
-        }
-        if gone {
+        let ended = self.vr.end(&snapshot);
+        report.used_signals = ended.used_signals;
+        if ended.gone {
             // SteamVR has exited, so it no longer rewrites the file
             setup::undo_safe_mode_blocks(&self.paths()).map_err(|e| error!("{e:#}")).ok();
         }
@@ -1226,12 +1319,7 @@ impl Stack {
             }
             report.closed_steam = steamvr::wait_gone(&["steam"], Duration::from_secs(60));
         }
-        report.remaining_processes = VR_PROCESS_NAMES
-            .iter()
-            .filter(|n| !steamvr::pids_named(n).is_empty())
-            .map(|n| n.to_string())
-            .chain(survivors().into_iter().map(|pid| format!("pid {pid} ({})", steamvr::process_name(pid).unwrap_or_default())))
-            .collect();
+        report.remaining_processes = self.vr.remaining(&snapshot);
         self.release_if_clean(&report);
         Ok(report)
     }
@@ -1243,9 +1331,13 @@ impl Stack {
 
     pub fn status(&self) -> StatusReport {
         let reader_connected = self.reader_connected();
-        let (leaked, last_restart_error) = {
+        let (warnings, last_restart_error) = {
             let state = self.state.lock();
-            (state.leaked, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
+            let streaming = state.headset.as_ref().is_some_and(|h| h.status().streaming);
+            // the supervisor does not retry a failed restart
+            let stuck = state.managing && state.last_restart_error.is_some() && !streaming && !self.starting.is_locked() && !self.restarting.is_locked();
+            let warnings: Vec<&str> = [state.leaked.then_some(LEAKED), state.ended, stuck.then_some(RESTART_FAILED)].into_iter().flatten().collect();
+            (warnings, state.last_restart_error.as_ref().map(|(t, e)| format!("{} s ago: {e}", t.elapsed().as_secs())))
         };
         let now = clock::now_s();
         let held = lease::read(&self.paths().runtime_dir);
@@ -1259,7 +1351,7 @@ impl Stack {
             headset: self.headset_status(),
             on_head: self.rig.lock().on_head,
             scene_app: reader_connected.then(|| self.scene_app()).flatten(),
-            warning: leaked.then_some(LEAKED),
+            warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
             last_restart_error,
             now_t_s: now,
             now_at: clock::at(now),
@@ -1278,7 +1370,7 @@ impl Stack {
             let exited = self.vr_exited(&mut seen); // own statement: it reads `restarting`, not `state`
             let state = self.state.lock();
             aborted = match &state.last_restart_error {
-                _ if !state.managing => Some("vr_stop ended the session".to_owned()),
+                _ if !state.managing => Some(state.ended.unwrap_or("vr_stop ended the session").to_owned()),
                 Some((t, e)) if *t >= since => Some(e.clone()),
                 _ => exited.map(|name| format!("{name} exited before the headset streamed")),
             };
@@ -1600,6 +1692,11 @@ impl Stack {
     /// Restarts SteamVR around the headset, or with a new headset if `fresh_headset`. A failure is
     /// kept for vr_status and for the streaming waits.
     fn restart_steamvr(&self, fresh_headset: bool) -> Result<()> {
+        self.restart_within(fresh_headset, Duration::from_secs(self.cfg().timeouts.streaming_s))
+    }
+
+    /// restart_steamvr with up to `timeout` for ALVR to come back.
+    fn restart_within(&self, fresh_headset: bool, timeout: Duration) -> Result<()> {
         let _restart = self.restarting.lock();
         if !self.state.lock().managing {
             bail!("SteamVR is being stopped; no restart");
@@ -1614,15 +1711,26 @@ impl Stack {
         self.drop_reader();
         let mut started_steam = false;
         let stopped = || !self.state.lock().managing;
-        let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), stopped, &mut started_steam);
-        let headset = headset.inspect(Headset::resume).unwrap_or_else(|| Headset::start(Arc::clone(&self.rig)));
-        let spare = {
+        let restarted = steamvr::restart_steamvr(&self.cfg(), &self.paths(), &self.api(), &self.vr, timeout, stopped, &mut started_steam);
+        // after a vr_stop no client comes back: the stop waiting for this restart would have to dispose it
+        let managing = self.state.lock().managing;
+        let headset = match headset_step(managing, headset.is_some()) {
+            HeadsetStep::Resume => headset.inspect(Headset::resume),
+            HeadsetStep::StartNew => Some(Headset::start(Arc::clone(&self.rig))),
+            HeadsetStep::Skip => {
+                if let Some(h) = headset {
+                    self.dispose(h);
+                }
+                None
+            }
+        };
+        let spare = headset.and_then(|headset| {
             let mut state = self.state.lock();
             match state.headset {
                 None => state.headset.replace(headset),
                 Some(_) => Some(headset), // start() made one meanwhile; ours goes, outside the lock
             }
-        };
+        });
         if let Some(h) = spare {
             self.dispose(h);
         }
@@ -1653,6 +1761,9 @@ fn record_restart(state: &mut State, restarted: Result<()>) -> Result<()> {
 /// The API at the session's port, ALVR's default 8082 while no streamer is known.
 // shortcut: port read at MCP start and reload, re-read after prepare if web_server_port overrides must apply to a first start
 fn api_for(paths: &Paths) -> Api {
+    if cfg!(test) {
+        return Api { port: 1 }; // a unit test must never ask the user's ALVR to shut SteamVR down
+    }
     paths.session_file().map_or(Api { port: 8082 }, |f| Api::from_session_file(&f))
 }
 
@@ -1664,9 +1775,9 @@ fn dispose_reader(reader: OpenVr) {
 }
 
 /// Whether the watcher renews the lease: only our own (vr_release gave it up for good), only
-/// while we manage a session, and once half the ttl is gone.
-fn watch_renews(managing: bool, held: Option<&Lease>, me: u32, ttl: Duration, now: SystemTime) -> bool {
-    managing && held.is_some_and(|l| l.pid == me && lease::renew_due(l, ttl, now))
+/// while we manage a session whose SteamVR runs, and once half the ttl is gone.
+fn watch_renews(managing: bool, steamvr_running: bool, held: Option<&Lease>, me: u32, ttl: Duration, now: SystemTime) -> bool {
+    managing && steamvr_running && held.is_some_and(|l| l.pid == me && lease::renew_due(l, ttl, now))
 }
 
 /// Why a log wait ends early: the Proton launcher exited, or the scene pid seen at the wait's start is gone.
@@ -1680,9 +1791,15 @@ fn app_exited(launcher: Option<std::process::ExitStatus>, scene_pid: Option<u32>
 /// Recomputes readiness every 1 s and reports changes. Not in `supervise`, which blocks for a whole restart.
 fn watch(stack: Weak<Stack>) {
     let mut last = Readiness::default();
+    // since when a managed session has had no vrserver
+    let mut vr_gone: Option<Instant> = None;
     loop {
         let Some(s) = stack.upgrade() else { return };
         s.pump_reader();
+        vr_gone = (s.state.lock().managing && !steamvr::is_steamvr_running()).then(|| vr_gone.unwrap_or_else(Instant::now));
+        if let Some(t) = vr_gone {
+            s.end_lost_session(t.elapsed());
+        }
         s.keep_lease();
         let steam = s.paths().steam_dir;
         s.app_logs.lock().poll(steam.as_deref());
@@ -1775,6 +1892,9 @@ fn supervise(stack: Weak<Stack>) {
             },
         }
         let status = s.headset_status().unwrap_or_default();
+        if status.streaming {
+            s.state.lock().watchdog_fired = false;
+        }
         // a request sent before the events stream attached still shows on the headset's HUD
         restart |= is_restart_hud(&status.hud_message) && !is_restart_hud(&last_hud);
         last_hud = status.hud_message;
@@ -1912,15 +2032,88 @@ mod tests {
 
     #[test]
     fn vr_stop_clears_safe_mode_blocks_when_steamvr_is_gone() {
-        if !steamvr::alive_vr_processes().is_empty() {
-            return eprintln!("skipped: SteamVR is running");
-        }
         let (stack, root) = blocked_stack("stop", true);
+        assert_eq!(stack.vr.names, steamvr::VrProcs::NONE.names, "unit tests never see the user's SteamVR");
         let file = stack.paths().vrsettings_file().unwrap();
         stack.claim().unwrap();
-        stack.stop().unwrap();
+        stack.state.lock().managing = true; // passes stop_guard whatever SteamVR runs on this machine
+        let report = stack.stop().unwrap();
+        assert!(!report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
         assert!(setup::blocked_drivers(&file).is_empty());
         assert!(stack.status().owner.is_none(), "a finished stop gives up the lease");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A name only this test's fake processes carry.
+    fn fake_name(tag: &str) -> &'static str {
+        Box::leak(format!("vrfake{}{tag}", std::process::id()).into_boxed_str())
+    }
+
+    /// A stack whose stop() ends only processes named `name`, holding its lease in a temp dir.
+    fn fake_vr_stack(name: &'static str, grace_ms: u64) -> (Arc<Stack>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("vr-test-mcp-stack-{name}"));
+        std::fs::remove_dir_all(&root).ok();
+        let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: root.join("state"), runtime_dir: root.join("run") };
+        let names = Box::leak(Box::new([name]));
+        let procs = steamvr::VrProcs { names, grace: Duration::from_millis(grace_ms), kill_wait: Duration::from_millis(300) };
+        let stack = Stack::with_procs(Config::default(), paths, procs);
+        *stack.api.lock() = Api { port: 1 };
+        stack.claim().unwrap();
+        stack.state.lock().managing = true;
+        (stack, root)
+    }
+
+    /// Runs `script` in sh with argv0 `name`, reaped by a thread so a killed one leaves no zombie; waits until /proc shows it.
+    fn fake_vr(name: &str, script: &str) -> u32 {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh").arg0(name).args(["-c", script]).spawn().unwrap();
+        let pid = child.id();
+        thread::spawn(move || child.wait());
+        assert!(steamvr::wait_for(Duration::from_secs(5), || steamvr::pids_named(name) == [pid]));
+        pid
+    }
+
+    #[test]
+    fn vr_stop_kills_a_process_that_ignores_sigterm() {
+        let name = fake_name("t");
+        let (stack, root) = fake_vr_stack(name, 200);
+        let pid = fake_vr(name, "trap '' TERM; while :; do sleep 1; done");
+        let report = stack.stop().unwrap();
+        assert!(report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
+        assert!(steamvr::wait_for(Duration::from_secs(2), || steamvr::stat(pid).is_none()), "SIGKILL ended it");
+        assert!(stack.status().owner.is_none(), "clean, so the lease is given up");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_kills_a_snapshot_pid_that_changed_its_name() {
+        let name = fake_name("r");
+        let (stack, root) = fake_vr_stack(name, 5000);
+        // gone by name after 1 s, as a vrserver that renames itself
+        let pid = fake_vr(name, "sleep 1; exec sleep 30");
+        let began = Instant::now();
+        let report = stack.stop().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(4), "the name wait ended when the name went");
+        assert!(report.used_signals && report.remaining_processes.is_empty(), "{report:?}");
+        assert!(steamvr::wait_for(Duration::from_secs(2), || steamvr::stat(pid).is_none()));
+        assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vr_stop_keeps_the_lease_while_a_process_remains() {
+        let name = fake_name("z");
+        let (stack, root) = fake_vr_stack(name, 200);
+        // an unreaped zombie keeps its comm in /proc and outlives every signal
+        let link = root.join(name);
+        std::os::unix::fs::symlink("/usr/bin/true", &link).unwrap();
+        let mut zombie = std::process::Command::new(&link).spawn().unwrap();
+        assert!(steamvr::wait_for(Duration::from_secs(5), || steamvr::stat(zombie.id()).is_some_and(|(s, _)| s == 'Z')));
+        let report = stack.stop().unwrap();
+        assert!(report.used_signals && report.remaining_processes == [name], "{report:?}");
+        assert!(stack.status().owner.is_some_and(|o| o.mine), "processes remain, so the lease stays");
+        zombie.wait().unwrap();
+        stack.release_lease().unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2074,11 +2267,35 @@ mod tests {
     }
 
     #[test]
+    fn vr_stop_waits_for_an_in_flight_vr_start_to_bail() {
+        let (stack, root) = blocked_stack("stop-start", false);
+        let epoch = stack.state.lock().stops;
+        let (held, start_holds) = std::sync::mpsc::channel();
+        let start = {
+            let stack = Arc::clone(&stack);
+            thread::spawn(move || {
+                let _starting = stack.starting.lock(); // as start() holds it
+                held.send(()).unwrap();
+                // start_inner's next check sees the stop
+                assert!(steamvr::wait_for(Duration::from_secs(5), || stack.check_stop(epoch).is_err()));
+                assert!(stack.begin_managing(epoch).is_err() && !stack.state.lock().managing, "a stopped start does not take the session back");
+                thread::sleep(Duration::from_millis(300)); // bailing out of a wait takes a moment
+                Instant::now()
+            })
+        };
+        start_holds.recv().unwrap();
+        stack.stop().unwrap();
+        let stopped = Instant::now();
+        assert!(stopped >= start.join().unwrap(), "stop cleaned up only after the start let go");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn vr_start_refuses_while_a_start_or_restart_runs() {
         let stack = test_stack();
         stack.state.lock().managing = true;
         let starting = stack.starting.lock();
-        assert_eq!(stack.start().unwrap_err().to_string(), "not ready: vr_start is already running");
+        assert_eq!(stack.start().unwrap_err().to_string(), "not ready: vr_start or vr_stop is running");
         drop(starting);
         let restarting = stack.restarting.lock();
         assert_eq!(stack.start().unwrap_err().to_string(), "not ready: SteamVR is restarting");
@@ -2107,6 +2324,19 @@ mod tests {
         );
         assert!(foreign_alvr_guard(false, || false, 8082).is_ok());
         assert!(foreign_alvr_guard(true, || panic!("our vrserver hosts the ALVR that answers"), 8082).is_ok());
+    }
+
+    #[test]
+    fn adoption_tells_a_missing_driver_from_a_silent_api() {
+        let wait = Duration::from_millis(300);
+        let e = adoptable(false, || panic!("no driver: nothing to ask"), wait, 8082).unwrap_err();
+        assert_eq!(e.to_string(), "SteamVR is running without the ALVR driver; close SteamVR and retry");
+        let mut pings = 0;
+        assert!(adoptable(true, || { pings += 1; pings == 3 }, Duration::from_secs(5), 8082).is_ok(), "ALVR still starting");
+        let began = Instant::now();
+        let e = adoptable(true, || false, wait, 8082).unwrap_err().to_string();
+        assert_eq!(e, "ALVR's API does not answer on port 8082 (deadline 0.3 s); run vr_stop");
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -2297,12 +2527,49 @@ mod tests {
     fn watch_renews_only_our_lease_while_managing() {
         let (me, ttl, now) = (10, Duration::from_secs(1800), SystemTime::now());
         let ours = |left_s| Lease { owner: "a".into(), pid: me, expires_at: clock::rfc3339(now + Duration::from_secs(left_s)) };
-        assert!(watch_renews(true, Some(&ours(100)), me, ttl, now), "half the ttl is gone");
-        assert!(!watch_renews(true, Some(&ours(1700)), me, ttl, now), "fresh");
-        assert!(watch_renews(true, Some(&Lease { expires_at: "garbage".into(), ..ours(0) }), me, ttl, now), "expired or unreadable");
-        assert!(!watch_renews(false, Some(&ours(100)), me, ttl, now), "no session to keep");
-        assert!(!watch_renews(true, None, me, ttl, now), "vr_release gave it up: do not take it back");
-        assert!(!watch_renews(true, Some(&Lease { pid: 11, ..ours(100) }), me, ttl, now), "another MCP's lease");
+        assert!(watch_renews(true, true, Some(&ours(100)), me, ttl, now), "half the ttl is gone");
+        assert!(!watch_renews(true, true, Some(&ours(1700)), me, ttl, now), "fresh");
+        assert!(watch_renews(true, true, Some(&Lease { expires_at: "garbage".into(), ..ours(0) }), me, ttl, now), "expired or unreadable");
+        assert!(!watch_renews(false, true, Some(&ours(100)), me, ttl, now), "no session to keep");
+        assert!(!watch_renews(true, false, Some(&ours(100)), me, ttl, now), "SteamVR is gone");
+        assert!(!watch_renews(true, true, None, me, ttl, now), "vr_release gave it up: do not take it back");
+        assert!(!watch_renews(true, true, Some(&Lease { pid: 11, ..ours(100) }), me, ttl, now), "another MCP's lease");
+    }
+
+    #[test]
+    fn a_failed_restart_asks_for_vr_start() {
+        let stack = test_stack();
+        stack.state.lock().last_restart_error = Some((Instant::now(), "SteamVR restart failed: boom".into()));
+        assert_eq!(stack.status().warning, None, "no session: nothing to rerun");
+        stack.state.lock().managing = true;
+        assert!(stack.status().warning.is_some_and(|w| w.contains("run vr_start")), "the supervisor does not retry");
+        let starting = stack.starting.lock();
+        assert_eq!(stack.status().warning, None, "vr_start runs");
+        drop(starting);
+        stack.state.lock().last_restart_error = None;
+        assert_eq!(stack.status().warning, None);
+    }
+
+    #[test]
+    fn a_session_whose_steamvr_died_ends() {
+        let (stack, root) = blocked_stack("lost", false);
+        stack.state.lock().managing = true;
+        let long = Duration::from_secs(10);
+        assert!(!stack.end_lost_session(Duration::from_secs(1)), "a relaunching vrserver leaves a short gap");
+        let starting = stack.starting.lock();
+        assert!(!stack.end_lost_session(long), "vr_start brings SteamVR up");
+        drop(starting);
+        let restarting = stack.restarting.lock();
+        assert!(!stack.end_lost_session(long), "a restart takes SteamVR down on purpose");
+        drop(restarting);
+        assert!(stack.state.lock().managing && stack.status().warning.is_none());
+        assert!(stack.end_lost_session(long));
+        assert!(!stack.state.lock().managing, "no more lease renewal, supervisor restarts or stop_guard bypass");
+        assert!(stack.status().warning.is_some_and(|w| w.contains("run vr_start")), "{:?}", stack.status().warning);
+        assert!(!stack.end_lost_session(long), "already ended");
+        stack.stop().unwrap();
+        assert_eq!(stack.status().warning, None, "vr_stop clears it");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
