@@ -193,9 +193,9 @@ pub struct LaunchArgs {
     /// "steam" (default) or "proton".
     #[serde(default)]
     pub via: Via,
-    /// Proton only, required: the exe relative to the app's install dir, e.g. "Game.exe" or "bin\\Game.exe".
+    /// Proton only, required: the exe relative to the app's install dir, e.g. "Game.exe" or "bin\\Game.exe". Must be a Windows .exe (MZ header) and not a shell, interpreter or loader (cmd, powershell, python*, java*, wine*, rundll32 and the like).
     pub exe: Option<String>,
-    /// Proton only: the exe's arguments, passed as given (no shell).
+    /// Proton only: the exe's arguments, passed as given (no shell). Chromium/CEF switches that run a program (--renderer-cmd-prefix, --gpu-launcher, --utility-cmd-prefix, --browser-subprocess-path) are refused.
     #[serde(default)]
     pub args: Vec<String>,
     /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; values must hold no "..".
@@ -211,6 +211,9 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
         Via::Proton if a.app_id.trim().parse() == Ok(steamvr::STEAMVR_APP_ID) => return Err("via \"proton\" cannot launch SteamVR (app 250820)".into()),
         _ => (),
     }
+    if let Some((arg, switch)) = a.args.iter().find_map(|arg| COMMAND_SWITCHES.iter().find(|s| arg.to_ascii_lowercase().contains(*s)).map(|s| (arg, s))) {
+        return Err(format!("arg {arg:?} refused: {switch} is a Chromium/CEF switch that runs a program of the caller's choice"));
+    }
     if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL"));
     }
@@ -222,6 +225,9 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
         None => Ok(()),
     }
 }
+
+/// Chromium/CEF switches (any of `--`, `-` or `/` on Windows, any case) naming a program to run.
+const COMMAND_SWITCHES: [&str; 4] = ["renderer-cmd-prefix", "gpu-launcher", "utility-cmd-prefix", "browser-subprocess-path"];
 
 /// What launch_app's env takes, for its errors.
 pub const ENV_ALLOWED: &str = "env takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES \
@@ -2089,6 +2095,10 @@ mod tests {
         for key in refused {
             let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err();
             assert!(e.contains(key) && e.contains("MESA_*"), "{key}: {e}");
+        }
+        for arg in ["--renderer-cmd-prefix=Z:\\usr\\bin\\sh -c x", "--gpu-launcher", "/Utility-Cmd-Prefix=x", "-browser-subprocess-path=Z:\\x"] {
+            let e = check_launch(&a(Via::Proton, Some("Game.exe"), &["-vr", arg], &[])).unwrap_err();
+            assert!(e.contains(&format!("{arg:?}")) && e.contains("Chromium"), "{arg}: {e}");
         }
         let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[("MESA_LOADER_DRIVER_OVERRIDE", "../../tmp/x")])).unwrap_err();
         assert!(e.contains(".."), "{e}");
