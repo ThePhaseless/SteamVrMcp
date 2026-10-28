@@ -814,6 +814,10 @@ impl Stack {
     /// vr_release: gives up our lease, unless this MCP still runs something on SteamVR: the next
     /// holder could not start, and our supervisor would go on restarting SteamVR without the lease.
     pub fn release(&self) -> Result<bool> {
+        // held to the release, so no vr_start begins before the lease goes
+        let (Some(_starting), Some(_restarting)) = (self.starting.try_lock(), self.restarting.try_lock()) else {
+            bail!("vr_start, vr_stop or a SteamVR restart is running; run vr_stop, then vr_release");
+        };
         let state = self.state.lock();
         if state.managing || state.headset.is_some() || state.dashboard.is_some() {
             bail!("this MCP still runs a session (headset or ALVR dashboard); run vr_stop first");
@@ -2330,6 +2334,14 @@ mod tests {
         assert!(e.contains("vr_stop"), "{e}");
         assert!(stack.status().owner.is_some_and(|o| o.mine), "the lease stays with the session");
         stack.state.lock().managing = false;
+        // a cold vr_start holds the headset outside state and sets managing only late
+        for lock in [&stack.starting, &stack.restarting] {
+            let held = lock.lock();
+            let e = stack.release().unwrap_err().to_string();
+            assert!(e.contains("vr_stop"), "{e}");
+            drop(held);
+        }
+        assert!(stack.status().owner.is_some_and(|o| o.mine));
         assert!(stack.release().unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
