@@ -198,7 +198,7 @@ pub struct LaunchArgs {
     /// Proton only: the exe's arguments, passed as given (no shell).
     #[serde(default)]
     pub args: Vec<String>,
-    /// Proton only: env vars over the desktop session's, e.g. GPU selection. STEAM_COMPAT_*, SteamAppId and SteamGameId are refused: the MCP sets them.
+    /// Proton only: env vars over the desktop session's, e.g. GPU selection. Takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API or GL_DRIVER or ending in _CMD; values must hold no "..".
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
@@ -214,10 +214,26 @@ pub fn check_launch(a: &LaunchArgs) -> Result<(), String> {
     if let Some((k, _)) = a.env.iter().find(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(format!("env key {k:?} must be non-empty and hold no '=' or NUL, and its value no NUL"));
     }
-    match a.env.keys().find(|k| k.starts_with("STEAM_COMPAT_") || ["SteamAppId", "SteamGameId"].contains(&k.as_str())) {
-        Some(k) => Err(format!("env must not set {k}: the MCP sets STEAM_COMPAT_*, SteamAppId and SteamGameId itself")),
+    if let Some(k) = a.env.keys().find(|k| !env_allowed(k)) {
+        return Err(format!("env {k} refused: {ENV_ALLOWED}"));
+    }
+    match a.env.iter().find(|(_, v)| v.contains("..")) {
+        Some((k, _)) => Err(format!("env {k} refused: a value must hold no \"..\", which name-based loaders follow out of their dir")),
         None => Ok(()),
     }
+}
+
+/// What launch_app's env takes, for its errors.
+pub const ENV_ALLOWED: &str = "env takes MESA_*, RADV_*, VK_*, DXVK_*, VKD3D_*, PROTON_*, SDL_*, __GL_*, WINEDEBUG, WINEDLLOVERRIDES \
+    and DRI_PRIME, except names holding PATH, FILENAMES, _FILES, LIBRARY, DYNAMIC_API, GL_DRIVER or ending in _CMD, \
+    which run or load code (Proton runs PROTON_REMOTE_DEBUG_CMD; VK_ICD_FILENAMES and VK_LAYER_PATH load drivers and layers)";
+
+/// Whether launch_app may pass env var `name` to the Proton launcher: tuning a game, never a
+/// command, library or search path it would run or load.
+fn env_allowed(name: &str) -> bool {
+    let prefixes = ["MESA_", "RADV_", "VK_", "DXVK_", "VKD3D_", "PROTON_", "SDL_", "__GL_"];
+    let loads_code = ["PATH", "FILENAMES", "_FILES", "LIBRARY", "DYNAMIC_API", "GL_DRIVER"].iter().any(|p| name.contains(p)) || name.ends_with("_CMD");
+    (prefixes.iter().any(|p| name.starts_with(p)) || ["WINEDEBUG", "WINEDLLOVERRIDES", "DRI_PRIME"].contains(&name)) && !loads_code
 }
 
 #[derive(Debug, Serialize)]
@@ -345,9 +361,30 @@ fn severity(level: &str) -> Option<LogSeverity> {
     [LogSeverity::Error, LogSeverity::Warning, LogSeverity::Info, LogSeverity::Debug].into_iter().find(|s| level_name(*s) == level)
 }
 
-/// The values in ALVR's own types; a bad path fails here, before any request.
+/// Session paths set_alvr_settings refuses, with everything above and below them: they open ALVR
+/// to the network (a trusted client it dials and streams to, the API on every interface, discovery,
+/// ports, connect scripts) or send tracking to any host (VMC).
+pub const REFUSED_PATHS: [&str; 3] = ["client_connections", "session_settings.connection", "session_settings.headset.vmc"];
+
+/// The values in ALVR's own types; a bad or refused path fails here, before any request.
 pub fn parse_values(values: Vec<SettingValue>) -> Result<Vec<PathValuePair>> {
-    values.into_iter().map(|v| Ok(PathValuePair { path: parse_path(&v.path)?, value: v.value })).collect()
+    values
+        .into_iter()
+        .map(|v| {
+            let path = parse_path(&v.path)?;
+            // one is a prefix of the other when they agree up to the shorter one's length
+            let same = |s: (&PathSegment, &PathSegment)| match s {
+                (PathSegment::Name(a), PathSegment::Name(b)) => a == b,
+                (PathSegment::Index(a), PathSegment::Index(b)) => a == b,
+                _ => false,
+            };
+            let overlaps = |r: &&str| parse_path(r).is_ok_and(|r| path.iter().zip(&r).all(same));
+            if REFUSED_PATHS.iter().any(overlaps) {
+                bail!("{} refused: set_alvr_settings cannot change {REFUSED_PATHS:?} or a path holding them", v.path);
+            }
+            Ok(PathValuePair { path, value: v.value })
+        })
+        .collect()
 }
 
 /// Ok when `session` (ALVR's session as JSON) holds every value.
@@ -365,6 +402,28 @@ pub fn verify_applied(session: &Value, values: &[PathValuePair]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Reads events from `next` until ALVR's session holds `values`, by `deadline`.
+// ALVR answers 200 even when it rejects the values: it logs why and sends no new session
+// (server_core web_server.rs:181-185, server_io lib.rs:156-187)
+pub fn wait_applied(mut next: impl FnMut(Duration) -> Result<Option<Event>>, values: &[PathValuePair], deadline: Instant) -> Result<()> {
+    let mut mismatch = "ALVR sent no session".to_owned();
+    while Instant::now() < deadline {
+        match next(Duration::from_millis(200))? {
+            Some(Event { event_type: EventType::Session(session), .. }) => match verify_applied(&serde_json::to_value(&*session)?, values) {
+                Ok(()) => return Ok(()),
+                Err(e) => mismatch = e,
+            },
+            Some(Event { event_type: EventType::Log(LogEntry { severity: LogSeverity::Error, content }), .. })
+                if content.starts_with("Failed to set session values") =>
+            {
+                bail!("failed: {content}")
+            }
+            _ => (),
+        }
+    }
+    bail!("ALVR did not apply the values: {mismatch} (deadline 3 s)")
 }
 
 /// Equality with numbers compared at f32 precision: ALVR stores most numbers as f32.
@@ -1465,32 +1524,13 @@ impl Stack {
         }
         let values = parse_values(values)?;
         let restart = !values.iter().all(|v| is_real_time(&v.path));
-        if restart && !self.state.lock().managing {
-            bail!("these settings need a SteamVR restart, which only a vr_start session does; run vr_start first");
+        // without vr_start the session.json is the user's own, with no snapshot for vr_restore
+        if !self.state.lock().managing {
+            bail!("set_alvr_settings changes only the session vr_start set up; run vr_start first");
         }
         let mut events = self.api().events()?;
         self.api().post_json("/api/session/values", &values)?;
-        // ALVR answers 200 even when it rejects the values: it logs why and sends no new session
-        // (server_core web_server.rs:181-185, server_io lib.rs:156-187)
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut mismatch = "ALVR sent no session".to_owned();
-        while Instant::now() < deadline {
-            match events.next(Duration::from_millis(200))? {
-                Some(Event { event_type: EventType::Session(session), .. }) => match verify_applied(&serde_json::to_value(&*session)?, &values) {
-                    Ok(()) => break,
-                    Err(e) => mismatch = e,
-                },
-                Some(Event { event_type: EventType::Log(LogEntry { severity: LogSeverity::Error, content }), .. })
-                    if content.starts_with("Failed to set session values") =>
-                {
-                    bail!("failed: {content}")
-                }
-                _ => (),
-            }
-        }
-        if Instant::now() >= deadline {
-            bail!("ALVR did not apply the values: {mismatch} (deadline 3 s)");
-        }
+        wait_applied(|t| events.next(t), &values, Instant::now() + Duration::from_secs(3))?;
         drop(events);
 
         let status = || self.headset_status().unwrap_or_default();
@@ -2032,10 +2072,23 @@ mod tests {
             let vr = LaunchArgs { app_id: id.into(), ..a(Via::Proton, Some("vrstartup.exe"), &[], &[]) };
             assert!(check_launch(&vr).unwrap_err().contains("SteamVR"), "{id:?}");
         }
-        for key in ["STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId"] {
-            assert!(check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err().contains(key), "the MCP sets {key}");
+        let refused = [
+            "STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_MOUNTS", "SteamAppId", "SteamGameId", "PROTON_REMOTE_DEBUG_CMD", "LD_PRELOAD",
+            "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "PRESSURE_VESSEL_FILESYSTEMS_RW", "VK_ICD_FILENAMES", "VK_DRIVER_FILES",
+            "VK_LAYER_PATH", "VK_ADD_LAYER_PATH", "SDL_DYNAMIC_API", "SDL_VIDEO_GL_DRIVER", "WINEDLLPATH", "HOME",
+        ];
+        for key in refused {
+            let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[(key, "1")])).unwrap_err();
+            assert!(e.contains(key) && e.contains("MESA_*"), "{key}: {e}");
         }
-        assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &[("DRI_PRIME", "1")])), Ok(()));
+        let e = check_launch(&a(Via::Proton, Some("Game.exe"), &[], &[("MESA_LOADER_DRIVER_OVERRIDE", "../../tmp/x")])).unwrap_err();
+        assert!(e.contains(".."), "{e}");
+        let allowed = [
+            ("DRI_PRIME", "1"), ("MESA_VK_DEVICE_SELECT", "1002:73bf"), ("RADV_PERFTEST", "gpl"), ("VK_INSTANCE_LAYERS", "x"),
+            ("DXVK_HUD", "fps"), ("VKD3D_CONFIG", "dxr"), ("WINEDEBUG", "-all"), ("WINEDLLOVERRIDES", "dxgi=n,b"),
+            ("PROTON_LOG", "1"), ("SDL_VIDEODRIVER", "x11"), ("__GL_SYNC_TO_VBLANK", "0"),
+        ];
+        assert_eq!(check_launch(&a(Via::Proton, Some("Game.exe"), &["-a"], &allowed)), Ok(()));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1"})).unwrap();
         assert_eq!((parsed.via, parsed.exe, parsed.args.len(), parsed.env.len()), (Via::Steam, None, 0, 0));
         let parsed: LaunchArgs = serde_json::from_value(json!({"app_id": "1", "via": "proton", "exe": "a.exe"})).unwrap();
@@ -2560,6 +2613,55 @@ mod tests {
         assert_eq!(verify_applied(&session, &pairs(index, json!(true))), Ok(()));
         let e = verify_applied(&session, &pairs("session_settings.video.nope", json!(1))).unwrap_err();
         assert!(e.contains("session_settings.video.nope"), "{e}");
+    }
+
+    #[test]
+    fn settings_refuse_network_exposure() {
+        let parse = |p: &str| parse_values(vec![SettingValue { path: p.into(), value: json!(true) }]);
+        for p in [
+            "client_connections",
+            "client_connections.x.manual_ips",
+            "session_settings",
+            "session_settings.connection",
+            "session_settings.connection.allow_remote_dashboard",
+            "session_settings.connection.client_discovery.enabled",
+            "session_settings.connection.stream_port",
+            "session_settings.connection.enable_on_connect_script",
+            "session_settings.headset",
+            "session_settings.headset.vmc.content.host",
+        ] {
+            let e = format!("{:#}", parse(p).unwrap_err());
+            assert!(e.contains("refused") && e.contains("session_settings.connection"), "{p}: {e}");
+        }
+        assert!(parse("session_settings.video.preferred_fps").is_ok());
+        assert!(parse("session_settings.headset.controllers.content.hand_skeleton.content.steamvr_input_2_0").is_ok());
+    }
+
+    fn session_event(session: &SessionConfig) -> Event {
+        Event { timestamp: String::new(), event_type: EventType::Session(Box::new(session.clone())) }
+    }
+
+    #[test]
+    fn wait_applied_takes_a_match_that_lands_at_the_deadline() {
+        let mut session = SessionConfig::default();
+        session.session_settings.video.preferred_fps = 90.0;
+        let values = pairs("session_settings.video.preferred_fps", json!(90.0));
+        let deadline = Instant::now() + Duration::from_millis(50);
+        // the read blocks past the deadline, then hands over the matching session
+        let late = |_| {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20));
+            Ok(Some(session_event(&session)))
+        };
+        assert!(wait_applied(late, &values, deadline).is_ok());
+        let none = |t| {
+            std::thread::sleep(t);
+            Ok(None)
+        };
+        let e = wait_applied(none, &values, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(e.to_string().contains("ALVR did not apply the values: ALVR sent no session"), "{e}");
+        let mismatch = |_| Ok(Some(session_event(&SessionConfig::default())));
+        let e = wait_applied(mismatch, &values, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(e.to_string().contains("preferred_fps is"), "{e}");
     }
 
     #[test]
