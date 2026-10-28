@@ -669,13 +669,12 @@ impl Stack {
         stack
     }
 
-    /// A stack with no Steam, its lease in `runtime_dir`, and an API port no live ALVR answers on.
+    /// A stack with no Steam and its lease in `runtime_dir`; Stack::new and api_for keep every test stack
+    /// off the user's SteamVR processes and ALVR port.
     #[cfg(test)]
     pub(crate) fn for_tests(runtime_dir: PathBuf) -> Arc<Stack> {
         let paths = Paths { steam_dir: None, flatpak_steam: false, steamvr_dir: None, streamer_dir: None, state_dir: "/nonexistent".into(), runtime_dir };
-        let stack = Stack::new(Config::default(), paths);
-        *stack.api.lock() = Api { port: 1 };
-        stack
+        Stack::new(Config::default(), paths)
     }
 
     fn cfg(&self) -> Config {
@@ -2121,15 +2120,7 @@ mod tests {
     }
 
     fn test_stack() -> Arc<Stack> {
-        let paths = Paths {
-            steam_dir: None,
-            flatpak_steam: false,
-            steamvr_dir: None,
-            streamer_dir: None,
-            state_dir: "/nonexistent".into(),
-            runtime_dir: "/nonexistent".into(),
-        };
-        Stack::new(Config::default(), paths)
+        Stack::for_tests("/nonexistent".into())
     }
 
     /// A temp Steam tree with a blocked driver and, when `restore`, a restore.json that unblocks it.
@@ -2155,15 +2146,14 @@ mod tests {
             runtime_dir: root.join("run"),
             state_dir,
         };
-        let stack = Stack::new(Config::default(), paths);
-        *stack.api.lock() = Api { port: 1 }; // not the default ALVR port, where a real dashboard may answer
-        (stack, root)
+        (Stack::new(Config::default(), paths), root)
     }
 
     #[test]
     fn vr_stop_clears_safe_mode_blocks_when_steamvr_is_gone() {
         let (stack, root) = blocked_stack("stop", true);
         assert_eq!(stack.vr.names, steamvr::VrProcs::NONE.names, "unit tests never see the user's SteamVR");
+        assert_eq!(stack.api().port, 1, "nor ask the user's ALVR to shut it down");
         let file = stack.paths().vrsettings_file().unwrap();
         stack.claim().unwrap();
         stack.state.lock().managing = true; // passes stop_guard whatever SteamVR runs on this machine
@@ -2187,7 +2177,6 @@ mod tests {
         let names = Box::leak(Box::new([name]));
         let procs = steamvr::VrProcs { names, grace: Duration::from_millis(grace_ms), kill_wait: Duration::from_millis(300) };
         let stack = Stack::with_procs(Config::default(), paths, procs);
-        *stack.api.lock() = Api { port: 1 };
         stack.claim().unwrap();
         stack.state.lock().managing = true;
         (stack, root)
@@ -2313,7 +2302,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-vr-release-{}", std::process::id()));
         let stack = test_stack();
         stack.paths.lock().runtime_dir = dir.clone();
-        *stack.api.lock() = Api { port: 1 }; // the supervisor runs while managing: keep it off a live ALVR
         stack.claim().unwrap();
         stack.state.lock().managing = true;
         let e = stack.release().unwrap_err().to_string();
@@ -2780,6 +2768,22 @@ mod tests {
         drop(starting);
         stack.state.lock().last_restart_error = None;
         assert_eq!(stack.status().warning, None);
+    }
+
+    #[test]
+    fn vr_status_joins_every_warning() {
+        let stack = test_stack();
+        {
+            let mut state = stack.state.lock();
+            state.leaked = true;
+            state.ended = Some(SESSION_LOST);
+            state.managing = true;
+            state.last_restart_error = Some((Instant::now(), "boom".into()));
+        }
+        stack.openvr_calls.fetch_add(1, SeqCst);
+        assert_eq!(stack.status().warning.unwrap(), [LEAKED, WEDGED, SESSION_LOST, RESTART_FAILED].join("; "));
+        stack.openvr_calls.fetch_sub(1, SeqCst);
+        stack.state.lock().managing = false;
     }
 
     #[test]
