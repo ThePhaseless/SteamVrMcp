@@ -538,6 +538,21 @@ pub fn foreign_alvr_guard(our_vrserver: bool, api_answers: impl FnOnce() -> bool
     Ok(())
 }
 
+/// How long vr_start waits for the API of a running SteamVR's loaded ALVR driver: it answers a few seconds after vrserver starts.
+const ALVR_API_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether vr_start can adopt a running SteamVR: its vrserver loaded ALVR's driver (`has_alvr`) and ALVR's API answers within `wait`.
+/// A loaded driver whose API stays silent is ALVR's TCP EOF spin or a hung start, which only vr_stop clears.
+fn adoptable(has_alvr: bool, answers: impl FnMut() -> bool, wait: Duration, port: u16) -> Result<()> {
+    if !has_alvr {
+        bail!("SteamVR is running without the ALVR driver; close SteamVR and retry");
+    }
+    if !steamvr::wait_for(wait, answers) {
+        bail!("ALVR's API does not answer on port {port} (deadline {} s); run vr_stop", wait.as_secs_f64());
+    }
+    Ok(())
+}
+
 /// A game that finds no SteamVR would start one from its own process, under its own prefix and process group.
 pub fn launch_guard(steamvr_running: bool) -> Result<()> {
     if !steamvr_running {
@@ -1156,7 +1171,10 @@ impl Stack {
             }
             report.unblocked_safe_mode = setup::prepare(&self.paths(), &values, &hostname)?.unblocked_safe_mode
                 || unblocked.iter().any(|d| d == "driver_alvr_server");
-        } else if steamvr::vrserver_has_alvr() && self.api().ping() {
+        } else {
+            // a vr_stop ends the wait too
+            adoptable(steamvr::vrserver_has_alvr(), || self.check_stop(epoch).is_err() || self.api().ping(), ALVR_API_WAIT, self.api().port)?;
+            self.check_stop(epoch)?;
             self.check_version()?;
             setup::snapshot(&self.paths())?;
             self.api().post_json("/api/session/values", &values)?;
@@ -1166,8 +1184,6 @@ impl Stack {
             report.adopted = true;
             // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
             restart_adopted = client_stuck(&self.session()?, &hostname);
-        } else {
-            bail!("SteamVR is running without the ALVR driver; close SteamVR and retry");
         }
 
         {
@@ -2308,6 +2324,19 @@ mod tests {
         );
         assert!(foreign_alvr_guard(false, || false, 8082).is_ok());
         assert!(foreign_alvr_guard(true, || panic!("our vrserver hosts the ALVR that answers"), 8082).is_ok());
+    }
+
+    #[test]
+    fn adoption_tells_a_missing_driver_from_a_silent_api() {
+        let wait = Duration::from_millis(300);
+        let e = adoptable(false, || panic!("no driver: nothing to ask"), wait, 8082).unwrap_err();
+        assert_eq!(e.to_string(), "SteamVR is running without the ALVR driver; close SteamVR and retry");
+        let mut pings = 0;
+        assert!(adoptable(true, || { pings += 1; pings == 3 }, Duration::from_secs(5), 8082).is_ok(), "ALVR still starting");
+        let began = Instant::now();
+        let e = adoptable(true, || false, wait, 8082).unwrap_err().to_string();
+        assert_eq!(e, "ALVR's API does not answer on port 8082 (deadline 0.3 s); run vr_stop");
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
