@@ -17,7 +17,7 @@ use std::{
 pub const STEAMVR_URL: &str = "steam://rungameid/250820";
 pub const STEAMVR_APP_ID: u32 = 250820;
 
-/// SteamVR's processes, as `/proc/<pid>/comm` names them (pinned from a live SteamVR 2.x run).
+/// SteamVR's processes, by comm or argv0 as is_named matches them (pinned from a live SteamVR 2.x run).
 /// vrmonitor is last: killing it first makes SteamVR's safe mode block the ALVR driver.
 pub const VR_PROCESS_NAMES: &[&str] = &[
     "vrserver", "vrcompositor", "vrdashboard", "vrwebhelper", "vrstartup", "vrstartup.sh", "steamtours", "steamtours.sh",
@@ -45,15 +45,37 @@ fn real_uid(status: &str) -> Option<u32> {
     status.lines().find_map(|l| l.strip_prefix("Uid:"))?.split_whitespace().next()?.parse().ok()
 }
 
-// comm before uid: the status read is the costly part, and few pids match the name
+// name before uid: the status read is the costly part, and few pids match the name
+// shortcut: reads every non-matching pid's cmdline (one extra small read per pid per poll), filter on cheaper /proc data if polls show up in profiles
 pub fn pids_named(name: &str) -> Vec<u32> {
-    proc_pids().filter(|&pid| comm(pid).is_some_and(|c| c == name) && ours(pid)).collect()
+    proc_pids().filter(|&pid| name_of(pid, &[name]).is_some() && ours(pid)).collect()
 }
 
 /// The `names` (in their order) with a process of this user, from one /proc pass.
 pub fn running<'a>(names: &[&'a str]) -> Vec<&'a str> {
-    let up: Vec<String> = proc_pids().filter_map(|pid| comm(pid).filter(|c| names.contains(&c.as_str()) && ours(pid))).collect();
-    names.iter().copied().filter(|n| up.iter().any(|u| u == n)).collect()
+    let up: Vec<&str> = proc_pids().filter_map(|pid| name_of(pid, names).filter(|_| ours(pid))).collect();
+    names.iter().copied().filter(|n| up.contains(n)).collect()
+}
+
+/// Whether a process with this comm and NUL-separated cmdline is `name`: its comm, or argv0's basename
+/// (vrserver renames its main thread; a script's argv0 is its shell, so comm stays a key too).
+pub fn is_named(name: &str, comm: &str, cmdline: &[u8]) -> bool {
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+    comm == name || argv0.rsplit(|&b| b == b'/').next() == Some(name.as_bytes())
+}
+
+/// The first of `names` that `pid` is (see is_named); the cmdline is read only when its comm is none of them.
+pub fn name_of<'a>(pid: u32, names: &[&'a str]) -> Option<&'a str> {
+    let comm = comm(pid)?;
+    names.iter().copied().find(|&n| n == comm).or_else(|| {
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        names.iter().copied().find(|n| is_named(n, &comm, &cmdline))
+    })
+}
+
+/// The VR_PROCESS_NAMES entry `pid` is, else its comm.
+pub fn process_name(pid: u32) -> Option<String> {
+    name_of(pid, VR_PROCESS_NAMES).map(str::to_owned).or_else(|| comm(pid))
 }
 
 /// `/proc/<pid>/comm`: the process name.
@@ -955,6 +977,28 @@ mod tests {
         assert!(has_mapped(std::process::id(), "libc.so"));
         assert!(!has_mapped(std::process::id(), "driver_alvr_server.so"));
         assert!(!has_mapped(0, "libc.so"), "no such process");
+    }
+
+    #[test]
+    fn a_process_is_named_by_comm_or_argv0() {
+        let vrserver = b"/s/SteamVR/bin/linux64/vrserver\0-waitformonitor\0-ipccontrolfilepath\0/tmp/SteamVR-IPCControlFile-1153238\0";
+        assert!(is_named("vrserver", "1153238: vrstar", vrserver), "vrserver renames its main thread; argv0 still names it");
+        assert!(is_named("vrstartup.sh", "vrstartup.sh", b"/bin/bash\0/s/SteamVR/bin/vrstartup.sh\0"), "a script: comm names it, argv0 is the shell");
+        assert!(!is_named("vrserver", "tail", b"/usr/bin/tail\0-f\0/s/SteamVR/bin/linux64/vrserver\0"), "vrserver only in a later argument");
+        assert!(!is_named("vrserver", "vrserver-x", b"/opt/vrserver-x\0"));
+        assert!(is_named("kworker/0:1", "kworker/0:1", b""), "a kernel thread or zombie has an empty cmdline: comm alone");
+        assert!(!is_named("vrserver", "kworker/0:1", b""));
+    }
+
+    #[test]
+    fn pids_named_finds_a_process_that_renamed_itself() {
+        let mut child = Command::new("sh").args(["-c", "printf renamed > /proc/self/comm; read x"]).stdin(Stdio::piped()).spawn().unwrap();
+        let pid = child.id();
+        assert!(wait_for(Duration::from_secs(2), || comm(pid).as_deref() == Some("renamed")));
+        let found = pids_named("sh").contains(&pid);
+        child.kill().ok();
+        child.wait().ok();
+        assert!(found, "argv0 still names it");
     }
 
     #[test]

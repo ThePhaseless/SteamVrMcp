@@ -499,11 +499,11 @@ pub struct Stack {
 const RECENTER_NOT_STAGE: &str =
     "recentering_mode is not Stage: ALVR re-origins the playspace around the head's last pose on every playspace update, so poses sent are no longer absolute";
 
-/// The scene app's pid, unless the scene is SteamVR's own (Home runs as steamtours). `comm` names a
-/// pid; one without a readable comm, or out of kill()'s single-process range, is refused.
-pub fn game_pid(scene: Option<&openvr::SceneApp>, comm: impl Fn(u32) -> Option<String>) -> Result<u32, &'static str> {
+/// The scene app's pid, unless the scene is SteamVR's own (Home runs as steamtours). `name` names a
+/// pid (steamvr::process_name); one without a readable name, or out of kill()'s single-process range, is refused.
+pub fn game_pid(scene: Option<&openvr::SceneApp>, name: impl Fn(u32) -> Option<String>) -> Result<u32, &'static str> {
     let pid = scene.map(|a| a.pid).filter(|&pid| pid != 0).ok_or("no scene app is running")?;
-    let name = comm(pid).filter(|_| steamvr::signalable(pid).is_some()).ok_or("the scene app's pid is not a running process")?;
+    let name = name(pid).filter(|_| steamvr::signalable(pid).is_some()).ok_or("the scene app's pid is not a running process")?;
     match VR_PROCESS_NAMES.contains(&name.as_str()) {
         true => Err("no app running (scene is SteamVR Home)"),
         false => Ok(pid),
@@ -1230,7 +1230,7 @@ impl Stack {
             .iter()
             .filter(|n| !steamvr::pids_named(n).is_empty())
             .map(|n| n.to_string())
-            .chain(survivors().into_iter().map(|pid| format!("pid {pid} ({})", steamvr::comm(pid).unwrap_or_default())))
+            .chain(survivors().into_iter().map(|pid| format!("pid {pid} ({})", steamvr::process_name(pid).unwrap_or_default())))
             .collect();
         self.release_if_clean(&report);
         Ok(report)
@@ -1402,7 +1402,7 @@ impl Stack {
         let launcher_exited = || exited.as_ref().and_then(|e| *e.lock());
         let started = || {
             let scene = self.scene_app().filter(|a| Some(a.pid) != before);
-            let pid = game_pid(scene.as_ref(), steamvr::comm).ok();
+            let pid = game_pid(scene.as_ref(), steamvr::process_name).ok();
             scene_pid = pid.filter(|_| scene.as_ref().is_some_and(|a| a.state == "running")).unwrap_or(0);
             // a new scene pid, in any state, whose process is gone again: the game quit or crashed
             // shortcut: a scene pid that hands off to a child process reads as a crash, ignore an exit while a new scene pid follows within a grace if a game does this
@@ -1442,7 +1442,7 @@ impl Stack {
     /// Stops the app: SIGTERM to the scene pid, to the group launch_app started, and to every
     /// process with the game's STEAM_COMPAT_DATA_PATH and app id (wine processes leave the group); SIGKILL after 15 s.
     pub fn stop_app(&self) -> Result<Value> {
-        let scene = game_pid(self.scene_app().as_ref(), steamvr::comm);
+        let scene = game_pid(self.scene_app().as_ref(), steamvr::process_name);
         let launched = self.state.lock().launched.clone();
         if launched.is_none() {
             scene.map_err(|e| anyhow!(e))?;
@@ -1496,7 +1496,7 @@ impl Stack {
         let launcher = self.state.lock().launched.as_ref().filter(|l| l.app_id == id).map(|l| l.exited.clone());
         // shortcut: the scene may be another app than `id`, compare the scene's app key if two apps run at once
         let scene = self.scene_app().filter(|s| s.state == "running");
-        let scene = game_pid(scene.as_ref(), steamvr::comm).ok().map(|pid| (pid, steamvr::comm(pid)));
+        let scene = game_pid(scene.as_ref(), steamvr::process_name).ok().map(|pid| (pid, steamvr::comm(pid)));
         loop {
             let steam = self.paths().steam_dir;
             let hit = {

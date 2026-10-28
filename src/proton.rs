@@ -275,7 +275,7 @@ pub fn game_pids(compatdata: &str, app_id: &str) -> Vec<u32> {
 /// SteamVR's own processes, which all carry SteamVR's compat env (app 250820): never a game's.
 fn is_steamvr(pid: u32, environ: &[u8]) -> bool {
     let id = STEAMVR_APP_ID.to_string();
-    APP_ID_KEYS.iter().any(|k| environ_has(environ, k, &id)) || steamvr::comm(pid).is_some_and(|c| VR_PROCESS_NAMES.contains(&c.as_str()))
+    APP_ID_KEYS.iter().any(|k| environ_has(environ, k, &id)) || steamvr::name_of(pid, VR_PROCESS_NAMES).is_some()
 }
 
 /// kill(-pgid, sig); false, and nothing sent, for 0, 1 and this MCP's own group.
