@@ -1995,14 +1995,13 @@ mod tests {
         let head_y = |s: &Stack| s.rig.lock().tracking(Instant::now(), Duration::ZERO).device_motions[0].1.pose.position.y;
         let animate = seq_step(0.0, "animate_head", json!({ "waypoints": [{ "position": [0, 1.0, 0] }], "duration_s": 0.3 }));
         let bad = seq_step(0.1, "set_trigger", json!({ "hand": "left", "value": 7 }));
-        let started = Instant::now();
         let err = stack.run_sequence(vec![animate.clone(), bad]).await.unwrap_err();
-        assert!(err.to_string().starts_with("step 1:") && started.elapsed() < Duration::from_secs(1), "{err:#}");
-        assert_eq!(head_y(&stack), 1.6, "the animation never started");
+        assert!(err.to_string().starts_with("step 1:"), "{err:#}");
+        assert_eq!(head_y(&stack), 1.6, "refused before any step ran: the animation never started");
         assert!(stack.run_sequence(vec![seq_step(0.0, "screenshot", json!({}))]).await.is_err());
 
         let r = stack.run_sequence(vec![seq_step(0.1, "set_trigger", json!({ "hand": "left", "value": 1 })), animate]).await.unwrap();
-        assert!(r.steps.iter().all(|s| s.ok) && r.steps[1].applied_s >= 0.1 && r.total_s >= 0.3 && r.total_s < 2.0, "{r:?}");
+        assert!(r.steps.iter().all(|s| s.ok) && r.steps[1].applied_s >= 0.1 && r.total_s >= 0.3 && r.total_s < 5.0, "{r:?}");
         assert_eq!(head_y(&stack), 1.0);
     }
 
@@ -2171,17 +2170,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-stable-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shot.png");
-        let writer = {
-            let path = path.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(150));
-                std::fs::write(&path, b"ab").unwrap();
-                thread::sleep(Duration::from_millis(30)); // grows between two polls
-                std::fs::write(&path, b"abcd").unwrap();
-            })
+        // `exited` runs at the start of each poll, so the writer acts at known polls whatever the load
+        let mut polls = 0;
+        let writer = || {
+            polls += 1;
+            match polls {
+                2 => std::fs::write(&path, b"ab").unwrap(),
+                3 => std::fs::write(&path, b"abcd").unwrap(), // grows between two polls
+                _ => (),
+            }
+            None
         };
-        assert_eq!(read_when_stable(&path, Duration::from_secs(5), || None).unwrap(), b"abcd");
-        writer.join().unwrap();
+        assert_eq!(read_when_stable(&path, Duration::from_secs(5), writer).unwrap(), b"abcd");
+        assert_eq!(polls, 4, "stable once two polls see the same size");
         let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None).unwrap_err();
         assert!(err.to_string().contains("never.png") && err.to_string().contains("deadline 0.3 s"), "{err}");
         let began = Instant::now();

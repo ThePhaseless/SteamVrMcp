@@ -1030,7 +1030,9 @@ mod tests {
         assert_eq!(signalable(0), None, "0 is our own process group");
         assert_eq!(signalable(i32::MAX as u32 + 1), None, "negative as i32: a process group");
         assert_eq!(signalable(u32::MAX), None, "-1: every process");
-        assert_eq!(signalable(4242), Some(4242));
+        let (me, group) = (std::process::id(), unsafe { libc::getpgrp() } as u32);
+        let other = (4242..).find(|p| ![me, group].contains(p)).unwrap();
+        assert_eq!(signalable(other), Some(other as i32));
         assert_eq!(signalable(1), None, "init");
         assert_eq!(signalable(std::process::id()), None, "this MCP");
         assert_eq!(signalable(unsafe { libc::getpgrp() } as u32), None, "our group's leader, e.g. the agent that started the MCP");
