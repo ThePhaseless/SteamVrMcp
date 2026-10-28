@@ -159,15 +159,18 @@ fn refuse_foreign(port: u16, vrservers: impl FnOnce() -> Vec<u32>) -> Result<()>
     Ok(())
 }
 
-/// The inodes of the sockets in LISTEN state on `port` in a /proc/net/tcp or tcp6 table.
+/// The inodes of the sockets in LISTEN state on `port` in a /proc/net/tcp or tcp6 table, at an
+/// address a connect to 127.0.0.1 reaches: 127.0.0.1, 0.0.0.0, [::] or [::ffff:127.0.0.1].
+/// Others (127.0.0.2, a LAN address, [::1]) never take our requests, so they are not in the way.
 fn listening_inodes(table: &str, port: u16) -> Vec<u64> {
-    let port = format!(":{port:04X}");
+    const REACHES_LOOPBACK: [&str; 4] = ["0100007F", "00000000", "00000000000000000000000000000000", "0000000000000000FFFF00000100007F"];
     table
         .lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
             let (local, state, inode) = (f.get(1)?, f.get(3)?, f.get(9)?);
-            (local.ends_with(&port) && *state == "0A").then(|| inode.parse().ok()).flatten()
+            let (addr, p) = local.split_once(':')?;
+            (u16::from_str_radix(p, 16) == Ok(port) && REACHES_LOOPBACK.contains(&addr) && *state == "0A").then(|| inode.parse().ok()).flatten()
         })
         .collect()
 }
@@ -304,9 +307,16 @@ mod tests {
    1: 0100007F:1F92 0100007F:D0A2 01 00000000:00000000 00:00000000 00000000  1000        0 4343 1 0000000000000000 20 4 30 10 -1
    2: 0100007F:1F93 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4444 1 0000000000000000 100 0 0 10 0";
         assert_eq!(listening_inodes(tcp, 8082), [4242], "LISTEN on the port only");
+        // only listeners a connect to 127.0.0.1 can reach: another user's on 127.0.0.2 or a LAN address is not in the way
+        let other = "   0: 0200007F:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 11 1 0000000000000000 100 0 0 10 0
+   1: 0A00A8C0:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 12 1 0000000000000000 100 0 0 10 0
+   2: 00000000:1F92 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 13 1 0000000000000000 100 0 0 10 0";
+        assert_eq!(listening_inodes(other, 8082), [13], "0.0.0.0 takes 127.0.0.1, 127.0.0.2 and 192.168.0.10 do not");
         let tcp6 = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
-   0: 00000000000000000000000000000000:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 77 1 0000000000000000 100 0 0 10 0";
-        assert_eq!(listening_inodes(tcp6, 8082), [77]);
+   0: 00000000000000000000000000000000:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 77 1 0000000000000000 100 0 0 10 0
+   1: 00000000000000000000000001000000:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 78 1 0000000000000000 100 0 0 10 0
+   2: 0000000000000000FFFF00000100007F:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  1001        0 79 1 0000000000000000 100 0 0 10 0";
+        assert_eq!(listening_inodes(tcp6, 8082), [77, 79], "[::] and [::ffff:127.0.0.1], not [::1]");
     }
 
     #[test]
