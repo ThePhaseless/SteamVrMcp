@@ -684,6 +684,17 @@ impl Stack {
         lease::release(&self.paths().runtime_dir)
     }
 
+    /// vr_release: gives up our lease, unless this MCP still runs something on SteamVR: the next
+    /// holder could not start, and our supervisor would go on restarting SteamVR without the lease.
+    pub fn release(&self) -> Result<bool> {
+        let state = self.state.lock();
+        if state.managing || state.headset.is_some() || state.dashboard.is_some() {
+            bail!("this MCP still runs a session (headset or ALVR dashboard); run vr_stop first");
+        }
+        drop(state);
+        self.release_lease()
+    }
+
     /// Called from the watcher thread whenever `readiness` changes.
     pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
         *self.on_change.lock() = Some(f);
@@ -1989,6 +2000,22 @@ mod tests {
         assert_eq!(stack.acquire_lease("driver".into(), Some(600)).unwrap().owner, "driver");
         assert!(stack.release_lease().unwrap());
         assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn vr_release_refuses_while_this_mcp_runs_a_session() {
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-release-{}", std::process::id()));
+        let stack = test_stack();
+        stack.paths.lock().runtime_dir = dir.clone();
+        *stack.api.lock() = Api { port: 1 }; // the supervisor runs while managing: keep it off a live ALVR
+        stack.claim().unwrap();
+        stack.state.lock().managing = true;
+        let e = stack.release().unwrap_err().to_string();
+        assert!(e.contains("vr_stop"), "{e}");
+        assert!(stack.status().owner.is_some_and(|o| o.mine), "the lease stays with the session");
+        stack.state.lock().managing = false;
+        assert!(stack.release().unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

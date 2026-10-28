@@ -180,9 +180,9 @@ impl VrServer {
         self.run(move |s| json(Owner { lease: s.acquire_lease(args.owner, args.ttl_s)?, mine: true })).await.map_err(message)
     }
 
-    #[tool(description = "Give up this MCP's lease on SteamVR so another agent can take it at once. Returns released: false when this MCP did not hold it. Leaves SteamVR running.")]
+    #[tool(description = "Give up this MCP's lease on SteamVR so another agent can take it at once. Returns released: false when this MCP did not hold it. Leaves SteamVR running. Refuses while this MCP still runs a session (its headset or ALVR dashboard): run vr_stop first.")]
     async fn vr_release(&self) -> Result<CallToolResult, String> {
-        self.run(|s| json(serde_json::json!({ "released": s.release_lease()? }))).await.map_err(message)
+        self.run(|s| json(serde_json::json!({ "released": s.release()? }))).await.map_err(message)
     }
 
     #[tool(description = "Start Steam if needed, SteamVR with ALVR and the virtual headset, and return once it streams, or with the reason it stopped. Can take minutes (up to timeouts.streaming_s, default 240 s). The result's dashboard_visible says whether SteamVR's dashboard is open at that moment (null when unknown); SteamVR opens it about 10 s after no scene app runs, so call close_dashboard once your game reaches its scene.")]
