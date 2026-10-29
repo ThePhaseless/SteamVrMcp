@@ -415,6 +415,7 @@ fn forget_missing_drops_only_what_is_still_gone() {
 #[test]
 fn forget_missing_drops_the_compositor_wrap_with_its_directory() {
     let f = fixture("forgetsteamvr", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
     prep(&f.paths);
     let compositor = f.paths.vrcompositor().unwrap();
     fs::remove_dir_all(f.root.join("steamvr")).unwrap();
@@ -422,6 +423,87 @@ fn forget_missing_drops_the_compositor_wrap_with_its_directory() {
     assert!(notes.iter().any(|n| n.contains("forgot") && n.contains(&compositor.display().to_string())), "{notes:?}");
     assert!(!f.paths.restore_file().exists());
     assert!(!f.root.join("steamvr").exists());
+    // the Steam and ALVR parts came back
+    assert_eq!(Snap::take(&f.paths), Snap { vrcompositor_target: None, vrcompositor_real_exists: false, ..before });
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn forget_missing_drops_the_wrap_when_valves_binary_is_gone() {
+    let f = fixture("forgetbinary", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    prep(&f.paths);
+    // prepare moved Valve's binary to vrcompositor; bin/linux64 stays
+    fs::remove_file(f.paths.vrcompositor().unwrap()).unwrap();
+    let notes = restore(&f.paths, false).unwrap();
+    assert!(notes.iter().any(|n| n.contains("verify SteamVR's files in Steam") && n.contains("forget_missing")), "{notes:?}");
+    assert!(f.paths.restore_file().exists());
+    let notes = restore(&f.paths, true).unwrap();
+    assert!(notes.iter().any(|n| n.contains("forgot the vrcompositor wrap: Valve's binary is gone")), "{notes:?}");
+    assert!(!f.paths.restore_file().exists());
+    assert_eq!(Snap::take(&f.paths), Snap { vrcompositor_target: None, vrcompositor_real_exists: false, ..before });
+    fs::remove_dir_all(&f.root).ok();
+}
+
+/// restore.json as written, for checking what a restore kept.
+fn kept_state(paths: &Paths) -> Value {
+    serde_json::from_slice(&fs::read(paths.restore_file()).unwrap()).unwrap()
+}
+
+#[test]
+fn forget_missing_forgets_nothing_past_a_torn_openvrpaths() {
+    let f = fixture("forgettorn", |v20| json!([v20]));
+    prep(&f.paths);
+    fs::rename(f.root.join("steam"), f.root.join("steam.away")).unwrap();
+    fs::write(f.root.join("xdg/openvr/openvrpaths.vrpath"), r#"{"external_drivers": ["#).unwrap();
+    let notes = restore(&f.paths, true).unwrap();
+    assert!(!notes.iter().any(|n| n.contains("forgot")), "{notes:?}");
+    let kept = kept_state(&f.paths);
+    assert!(!kept["vrsettings_file"].is_null() && !kept["session"].is_null() && kept["partial"] == false, "kept whole: {kept}");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn forget_missing_keeps_an_entry_whose_directory_cannot_be_checked() {
+    let f = fixture("forgetunreachable", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    prep(&f.paths);
+    // as a dead FUSE or NFS mount: the directory is there but stat fails
+    let steam = f.root.join("steam");
+    fs::set_permissions(&steam, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&steam).is_ok() {
+        // root ignores the mode
+        fs::set_permissions(&steam, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&f.root).ok();
+        return;
+    }
+    let notes = restore(&f.paths, true);
+    fs::set_permissions(&steam, fs::Permissions::from_mode(0o755)).unwrap();
+    let notes = notes.unwrap();
+    assert!(!notes.iter().any(|n| n.contains("forgot")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("steamvr.vrsettings") && n.contains("ermission denied")), "{notes:?}");
+    assert!(!kept_state(&f.paths)["vrsettings_file"].is_null());
+    assert!(restore(&f.paths, false).unwrap().is_empty());
+    assert_eq!(Snap::take(&f.paths), before);
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn forget_missing_is_ignored_for_an_old_restore_json() {
+    let f = fixture("forgetold", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
+    prep(&f.paths);
+    strip_paths(&f.paths, |_| ());
+    // the paths are detected now, so a gone directory may be a stale config.toml override
+    let (steam, away) = (f.root.join("steam"), f.root.join("steam.away"));
+    fs::rename(&steam, &away).unwrap();
+    let notes = restore(&f.paths, true).unwrap();
+    assert!(!notes.iter().any(|n| n.contains("forgot")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("config.toml")), "{notes:?}");
+    assert!(!kept_state(&f.paths)["vrsettings_file"].is_null());
+    fs::rename(&away, &steam).unwrap();
+    assert!(restore(&f.paths, false).unwrap().is_empty());
+    assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
 

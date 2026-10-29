@@ -61,7 +61,7 @@ struct TrackedStateArgs {
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 struct RestoreArgs {
-    /// Drop, with a note, each recorded file whose directory is still gone (an install removed on purpose), then delete restore.json. Never drops one whose directory exists.
+    /// Drop, with a note, each recorded file whose directory is gone (an install removed on purpose), and the vrcompositor wrap when Valve's binary is gone, then delete restore.json. Never drops a file whose directory exists or cannot be checked; ignored for a restore.json that recorded no paths.
     #[serde(default)]
     forget_missing: bool,
 }
