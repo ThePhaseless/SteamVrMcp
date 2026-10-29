@@ -470,19 +470,32 @@ fn forget_missing_keeps_an_entry_whose_directory_cannot_be_checked() {
     prep(&f.paths);
     // as a dead FUSE or NFS mount: the directory is there but stat fails
     let steam = f.root.join("steam");
-    fs::set_permissions(&steam, fs::Permissions::from_mode(0o000)).unwrap();
+    let bin = f.paths.vrcompositor().unwrap().parent().unwrap().to_owned();
+    let mode = |m| {
+        fs::set_permissions(&steam, fs::Permissions::from_mode(m)).unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(m)).unwrap();
+    };
+    mode(0o000);
     if fs::read_dir(&steam).is_ok() {
         // root ignores the mode
-        fs::set_permissions(&steam, fs::Permissions::from_mode(0o755)).unwrap();
+        mode(0o755);
         fs::remove_dir_all(&f.root).ok();
         return;
     }
     let notes = restore(&f.paths, true);
-    fs::set_permissions(&steam, fs::Permissions::from_mode(0o755)).unwrap();
+    mode(0o755);
     let notes = notes.unwrap();
     assert!(!notes.iter().any(|n| n.contains("forgot")), "{notes:?}");
     assert!(notes.iter().any(|n| n.contains("steamvr.vrsettings") && n.contains("ermission denied")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("vrcompositor") && n.contains("ermission denied")), "{notes:?}");
     assert!(!kept_state(&f.paths)["vrsettings_file"].is_null());
+    // forget_missing never drops these, so neither message may offer it
+    let config = steam.join("config").display().to_string();
+    let closing = notes.last().unwrap();
+    assert!(closing.contains("restore access to") && closing.contains(&config) && closing.contains(&bin.display().to_string()), "{closing}");
+    assert!(!closing.contains("forget_missing: true"), "{closing}");
+    let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
+    assert!(e.contains("restore access to") && e.contains(&config) && !e.contains("forget_missing: true"), "{e}");
     assert!(restore(&f.paths, false).unwrap().is_empty());
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
@@ -497,10 +510,20 @@ fn forget_missing_is_ignored_for_an_old_restore_json() {
     // the paths are detected now, so a gone directory may be a stale config.toml override
     let (steam, away) = (f.root.join("steam"), f.root.join("steam.away"));
     fs::rename(&steam, &away).unwrap();
-    let notes = restore(&f.paths, true).unwrap();
-    assert!(!notes.iter().any(|n| n.contains("forgot")), "{notes:?}");
-    assert!(notes.iter().any(|n| n.contains("config.toml")), "{notes:?}");
-    assert!(!kept_state(&f.paths)["vrsettings_file"].is_null());
+    // the first call stores the detected paths; forget stays off for the second too
+    for call in [1, 2] {
+        let notes = restore(&f.paths, true).unwrap();
+        assert!(!notes.iter().any(|n| n.contains("forgot")), "call {call}: {notes:?}");
+        let closing = notes.last().unwrap();
+        let file = f.paths.restore_file().display().to_string();
+        assert!(closing.contains("forget_missing stays off for this file") && closing.contains(&format!("a human must correct the paths in {file}")), "call {call}: {closing}");
+        assert!(closing.contains(&steam.join("config/steamvr.vrsettings").display().to_string()), "names the paths: {closing}");
+        let kept = kept_state(&f.paths);
+        assert!(!kept["vrsettings_file"].is_null() && kept["paths_detected"] == true, "call {call}: {kept}");
+    }
+    let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
+    assert!(e.contains("forget_missing stays off") && !e.contains("forget_missing: true"), "{e}");
+    // the flag never blocks a plain retry
     fs::rename(&away, &steam).unwrap();
     assert!(restore(&f.paths, false).unwrap().is_empty());
     assert_eq!(Snap::take(&f.paths), before);
