@@ -454,6 +454,8 @@ const LOG_SOURCES: [&str; 5] = ["alvr", "vrserver", "vrcompositor", "vrmonitor",
 const STEAMVR_LOGS: [&str; 3] = ["vrserver", "vrcompositor", "vrmonitor"];
 /// ALVR events kept, and SteamVR lines read per log.
 const LOGS_KEPT: usize = 1000;
+/// ALVR statistics summaries kept: ALVR sends one every 500 ms, so two of get_frame_timing's longest (60 s) windows.
+const STATS_KEPT: usize = 240;
 
 fn level_name(severity: LogSeverity) -> String {
     format!("{severity:?}").to_lowercase()
@@ -671,6 +673,9 @@ pub struct Stack {
     rig: Arc<Mutex<Rig>>,
     /// The newest LOGS_KEPT ALVR log events the supervisor saw, oldest first. Locked only briefly.
     alvr_logs: Mutex<VecDeque<LogLine>>,
+    /// The newest STATS_KEPT ALVR statistics summaries the supervisor saw, with when, oldest first, for
+    /// get_frame_timing: a stream of its own per call made ALVR log a failed send when it closed. Locked only briefly.
+    alvr_stats: Mutex<VecDeque<(Instant, alvr_events::StatisticsSummary)>>,
     /// The owner name and ttl the lease is taken and renewed with.
     lease: Mutex<(String, Duration)>,
     /// The game log rings from `[app_logs]`; rebuilt when the config reloads. Locked briefly, never while sleeping.
@@ -764,6 +769,7 @@ impl Stack {
             on_change: Mutex::new(None),
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
+            alvr_stats: Mutex::default(),
             lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
             app_logs: Mutex::new(AppLogs::new(&app_log_patterns)),
             vr,
@@ -1182,24 +1188,10 @@ impl Stack {
             bail!("window_s must be from 0.5 to 60, got {window_s}");
         }
         let mut notes = Vec::new();
-        let mut events = self.api().events().map_err(|e| notes.push(format!("alvr: {e:#}"))).ok();
+        let start = Instant::now();
         let s0 = self.frame_stats().map_err(|e| notes.push(format!("counts: {e:#}")));
-        let (end, mut summaries) = (Instant::now() + Duration::from_secs_f64(window_s), Vec::new());
-        loop {
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            match events.as_mut().map(|e| e.next(left)) {
-                Some(Ok(Some(Event { event_type: EventType::StatisticsSummary(s), .. }))) => summaries.push(s),
-                Some(Ok(_)) => (),
-                Some(Err(e)) => {
-                    notes.push(format!("alvr: {e:#}"));
-                    events = None;
-                }
-                None => std::thread::sleep(left),
-            }
-        }
+        std::thread::sleep(Duration::from_secs_f64(window_s).saturating_sub(start.elapsed()));
+        let summaries = self.stats_since(start);
         let s1 = self.frame_stats().map_err(|e| notes.push(format!("counts: {e:#}")));
         let counts = s0.ok().zip(s1.ok()).map(|(a, b)| {
             serde_json::json!({
@@ -1216,8 +1208,8 @@ impl Stack {
             }
         };
         let alvr = alvr_api::average(&summaries);
-        if alvr.is_none() && events.is_some() {
-            notes.push("alvr: no statistics summary arrived, the headset may not be streaming".to_owned());
+        if alvr.is_none() {
+            notes.push("alvr: no statistics summary arrived, the headset may not be streaming or the MCP's ALVR events stream is down".to_owned());
         }
         let t_s = clock::now_s();
         Ok(serde_json::json!({ "window_s": window_s, "t_s": t_s, "at": clock::at(t_s), "compositor": compositor, "counts": counts, "alvr": alvr, "notes": notes }))
@@ -1938,6 +1930,19 @@ impl Stack {
         ring.push_back(LogLine { t_s, at: clock::at(t_s), t, source: "alvr".into(), level: level_name(entry.severity), text: entry.content });
     }
 
+    fn keep_stats(&self, at: Instant, summary: alvr_events::StatisticsSummary) {
+        let mut ring = self.alvr_stats.lock();
+        if ring.len() == STATS_KEPT {
+            ring.pop_front();
+        }
+        ring.push_back((at, summary));
+    }
+
+    /// The kept statistics summaries that arrived at or after `start`, oldest first.
+    fn stats_since(&self, start: Instant) -> Vec<alvr_events::StatisticsSummary> {
+        self.alvr_stats.lock().iter().filter(|(at, _)| *at >= start).map(|(_, s)| s.clone()).collect()
+    }
+
     /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
     pub fn recreate_headset(&self) -> Result<()> {
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
@@ -2211,6 +2216,7 @@ fn supervise(stack: Weak<Stack>) {
             Some(stream) => match stream.next(Duration::from_millis(500)) {
                 Ok(Some(Event { event_type: EventType::ServerRequestsSelfRestart, .. })) => restart = true,
                 Ok(Some(Event { timestamp, event_type: EventType::Log(entry) })) => s.keep_log(timestamp, entry),
+                Ok(Some(Event { event_type: EventType::StatisticsSummary(summary), .. })) => s.keep_stats(Instant::now(), summary),
                 Ok(_) => (),
                 Err(e) => {
                     warn!("ALVR events stream closed: {e:#}");
@@ -2891,6 +2897,23 @@ mod tests {
         assert_eq!(calls.load(SeqCst), 0, "a call that returned in time is not counted");
         assert_eq!(counted_call(&calls, Duration::from_secs(1), || -> () { panic!("boom") }), None);
         assert!(steamvr::wait_for(Duration::from_secs(1), || calls.load(SeqCst) == 0), "a panic counts as returned");
+    }
+
+    #[test]
+    fn frame_timing_reads_the_supervisors_statistics() {
+        let stack = test_stack();
+        let summary = |ms| alvr_events::StatisticsSummary { total_latency_ms: ms, ..Default::default() };
+        let start = Instant::now();
+        let ms = |n| start + Duration::from_millis(n);
+        stack.keep_stats(start - Duration::from_millis(1), summary(1.0));
+        stack.keep_stats(start, summary(2.0));
+        stack.keep_stats(ms(500), summary(3.0));
+        let got: Vec<f32> = stack.stats_since(start).iter().map(|s| s.total_latency_ms).collect();
+        assert_eq!(got, [2.0, 3.0], "only the summaries that arrived in the window");
+        for _ in 0..STATS_KEPT {
+            stack.keep_stats(ms(600), summary(4.0));
+        }
+        assert_eq!(stack.stats_since(start).len(), STATS_KEPT, "the ring keeps the newest STATS_KEPT");
     }
 
     #[test]
