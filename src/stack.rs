@@ -213,6 +213,13 @@ pub struct StartReport {
     pub notes: Vec<String>,
 }
 
+/// vr_restore's result. restored is false while restore.json stays for a retry (a step was skipped; see notes).
+#[derive(Debug, Default, Serialize)]
+pub struct RestoreReport {
+    pub restored: bool,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct StopReport {
     pub remaining_processes: Vec<String>,
@@ -974,7 +981,7 @@ impl Stack {
     }
 
     /// Holds `starting` and `restarting` throughout, so no vr_start snapshots or prepares while restore.json goes away.
-    pub fn restore(&self) -> Result<Vec<String>> {
+    pub fn restore(&self) -> Result<RestoreReport> {
         let Some(_starting) = self.starting.try_lock() else { bail!("vr_start is running; run vr_stop first") };
         let Some(_restarting) = self.restarting.try_lock() else { bail!("SteamVR is stopping or restarting") };
         if self.state.lock().managing {
@@ -982,8 +989,16 @@ impl Stack {
         }
         restore_guard(&self.vr.alive())?; // the Stack's VrProcs: a unit test never sees the user's SteamVR
         let notes = setup::restore(&self.paths())?;
-        self.release_after_success();
-        Ok(notes)
+        Ok(self.finish_restore(notes))
+    }
+
+    /// A restore that kept restore.json is not done: the lease stays until a retry finishes it.
+    fn finish_restore(&self, notes: Vec<String>) -> RestoreReport {
+        let restored = !self.paths().restore_file().exists();
+        if restored {
+            self.release_after_success();
+        }
+        RestoreReport { restored, notes }
     }
 
     /// A screenshot of the headset's stream, or of the compositor's scene textures. The waits run outside the state lock.
@@ -2479,6 +2494,20 @@ mod tests {
         stack.release_if_clean(&dirty);
         assert!(stack.status().owner.is_some(), "processes remain, so the lease stays");
         stack.release_if_clean(&StopReport::default());
+        assert!(stack.status().owner.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_restore_that_kept_restore_json_reports_pending_and_keeps_the_lease() {
+        // as above: restore() itself rewrites the real openvrpaths.vrpath, so only its last step is tested
+        let (stack, root) = blocked_stack("restore-kept", true);
+        stack.claim().unwrap();
+        let kept = stack.finish_restore(vec!["openvrpaths.vrpath unreadable".into()]);
+        assert!(!kept.restored && kept.notes.len() == 1, "{kept:?}");
+        assert!(stack.status().owner.is_some(), "restore.json stays for a retry, and so does the lease");
+        std::fs::remove_file(stack.paths().restore_file()).unwrap();
+        assert!(stack.finish_restore(Vec::new()).restored);
         assert!(stack.status().owner.is_none());
         std::fs::remove_dir_all(&root).ok();
     }
