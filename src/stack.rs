@@ -5,7 +5,6 @@ use crate::{
     checks::{self, Check, Readiness},
     clock,
     config::{Config, Paths},
-    desktop,
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot, Source},
     lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
@@ -132,16 +131,6 @@ fn counted_call<T: Send + 'static>(calls: &Arc<AtomicUsize>, timeout: Duration, 
 fn unique_stem(wall: SystemTime, pid: u32) -> String {
     let ms = wall.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
     format!("vr-{ms}-{pid}")
-}
-
-fn desktop_screenshot(eye: Eye) -> Result<Screenshot> {
-    if eye != Eye::Both {
-        bail!("source desktop is the whole screen: eye must be both");
-    }
-    let t_s = clock::now_s();
-    let png = desktop::screenshot()?;
-    let info = png::Decoder::new(std::io::Cursor::new(&png)).read_info()?.info().clone();
-    Ok(Screenshot { png, width: info.width, height: info.height, source: Source::Desktop.name(), frame_timestamp_ms: None, t_s, at: clock::at(t_s) })
 }
 
 /// The file's bytes once its size is non-zero and the same on two polls 100 ms apart: vrserver writes it on its own schedule.
@@ -1012,7 +1001,6 @@ impl Stack {
     pub fn screenshot(&self, source: Source, eye: Eye) -> Result<Screenshot> {
         match source {
             Source::Compositor => return self.compositor_screenshot(eye),
-            Source::Desktop => return desktop_screenshot(eye),
             Source::Headset => (),
         }
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
@@ -2820,13 +2808,6 @@ mod tests {
         assert_eq!(game_pid(Some(&scene(9)), |_| None), Err("the scene app's pid is not a running process"), "unreadable comm");
         let big = i32::MAX as u32 + 1;
         assert_eq!(game_pid(Some(&scene(big)), comm), Err("the scene app's pid is not a running process"), "kill() would take it as a group");
-    }
-
-    #[test]
-    fn desktop_takes_both_eyes_only() {
-        for eye in [Eye::Left, Eye::Right] {
-            assert!(test_stack().screenshot(Source::Desktop, eye).unwrap_err().to_string().contains("both"), "{eye:?}");
-        }
     }
 
     #[test]
