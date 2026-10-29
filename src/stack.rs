@@ -58,12 +58,16 @@ const WATCHDOG_MAX: u32 = 3;
 
 const WATCHDOG_GAVE_UP: &str = "the headset went quiet again after 3 watchdog SteamVR restarts, which the watchdog no longer repeats; run vr_start";
 
+const WATCHDOG_STAYED_QUIET: &str = "the watchdog restarted SteamVR but the headset stayed quiet; run vr_start";
+
 /// The supervisor's watchdog, reset by vr_start.
 #[derive(Debug, Default)]
 struct Watchdog {
     fired: bool,
     restarts: u32,
     gave_up: bool,
+    /// Fired, then the headset stayed quiet past 2 × WATCHDOG: no restart follows until a stream re-arms it.
+    stayed_quiet: bool,
 }
 
 impl Watchdog {
@@ -71,8 +75,10 @@ impl Watchdog {
     /// past WATCHDOG, once per arming and WATCHDOG_MAX times per vr_start, after which it gives up.
     fn fires(&mut self, streaming_for: Option<Duration>, quiet_for: Option<Duration>) -> bool {
         if streaming_for.is_some_and(|d| d >= WATCHDOG_REARM) {
-            self.fired = false;
+            (self.fired, self.stayed_quiet) = (false, false);
         }
+        // a fired watchdog waits for a stream that never came back or held too briefly: say so
+        self.stayed_quiet |= self.fired && quiet_for.is_some_and(|q| q > 2 * WATCHDOG);
         if self.fired || !quiet_for.is_some_and(|q| q > WATCHDOG) {
             return false;
         }
@@ -1630,12 +1636,14 @@ impl Stack {
             // the supervisor does not retry a failed restart
             let stuck = state.managing && state.last_restart_error.is_some() && !streaming && !self.starting.is_locked() && !self.restarting.is_locked();
             let gave_up = state.managing && state.watchdog.gave_up && !streaming;
+            let stayed_quiet = state.managing && state.watchdog.stayed_quiet && !streaming && !gave_up && !stuck;
             let warnings: Vec<&str> = [
                 state.leaked.then_some(LEAKED),
                 wedged.then_some(WEDGED),
                 state.ended,
                 stuck.then_some(RESTART_FAILED),
                 gave_up.then_some(WATCHDOG_GAVE_UP),
+                stayed_quiet.then_some(WATCHDOG_STAYED_QUIET),
             ]
             .into_iter()
             .flatten()
@@ -3416,6 +3424,30 @@ mod tests {
         assert!(!w.fires(Some(WATCHDOG_REARM), None) && !w.gave_up);
         assert!(!w.fires(None, quiet), "WATCHDOG_MAX restarts per vr_start");
         assert!(w.gave_up && w.restarts == WATCHDOG_MAX);
+    }
+
+    #[test]
+    fn the_watchdog_flags_a_headset_that_stays_quiet_after_a_fire() {
+        let mut w = Watchdog::default();
+        let s = Duration::from_secs;
+        assert!(w.fires(None, Some(WATCHDOG + s(1))));
+        assert!(!w.fires(None, Some(2 * WATCHDOG)) && !w.stayed_quiet, "not quiet long enough yet");
+        assert!(!w.fires(None, Some(2 * WATCHDOG + s(1))) && w.stayed_quiet, "never came back");
+        assert!(!w.fires(Some(WATCHDOG_REARM), None) && !w.stayed_quiet, "a stream that held clears it");
+        // came back for less than WATCHDOG_REARM, then dropped
+        assert!(w.fires(None, Some(WATCHDOG + s(1))));
+        assert!(!w.fires(Some(s(5)), None));
+        assert!(!w.fires(None, Some(2 * WATCHDOG + s(1))) && w.stayed_quiet);
+    }
+
+    #[test]
+    fn vr_status_warns_when_the_headset_stayed_quiet_after_a_watchdog_restart() {
+        let stack = test_stack();
+        stack.state.lock().watchdog.stayed_quiet = true;
+        assert_eq!(stack.status().warning, None, "no session");
+        stack.state.lock().managing = true;
+        assert_eq!(stack.status().warning.as_deref(), Some(WATCHDOG_STAYED_QUIET));
+        stack.state.lock().managing = false;
     }
 
     #[test]
