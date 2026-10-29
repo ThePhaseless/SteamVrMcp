@@ -284,6 +284,9 @@ mod tests {
         let api = Api { port: listener.local_addr().unwrap().port() };
         let e = api.send("GET", "/api/ping", None, Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.to_string(), "GET /api/ping: ALVR accepted the connection but did not answer within 0.2 s");
+        // stack::timed_out reads the io::Error under the context to restart a stuck adopted ALVR
+        let io = e.chain().find_map(|c| c.downcast_ref::<std::io::Error>()).expect("the io::Error stays the source");
+        assert!(matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{io:?}");
     }
 
     #[test]
@@ -312,7 +315,16 @@ mod tests {
         assert!(refuse_foreign(port, || vec![std::process::id()]).is_ok(), "this process holds it");
         assert!(refuse_foreign(port, || panic!("verified once")).is_ok());
         drop(listener);
-        assert!(refuse_foreign(port, Vec::new).unwrap_err().to_string().contains("not reachable"));
+        // a child another test forks meanwhile holds the fd until its exec, so give the close a moment
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let closed = loop {
+            match refuse_foreign(port, Vec::new) {
+                Err(e) => break e.to_string(),
+                Ok(()) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Ok(()) => panic!("port {port} still listens 2 s after its listener closed"),
+            }
+        };
+        assert!(closed.contains("not reachable"), "{closed}");
     }
 
     #[test]
