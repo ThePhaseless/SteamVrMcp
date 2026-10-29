@@ -145,12 +145,14 @@ fn desktop_screenshot(eye: Eye) -> Result<Screenshot> {
 }
 
 /// The file's bytes once its size is non-zero and the same on two polls 100 ms apart: vrserver writes it on its own schedule.
-/// Fails at once when `exited` names a SteamVR process gone, or when vrcompositor's log since the request (`compositor_log`) shows it failed.
+/// Fails at once when `exited` names a SteamVR process gone, or when vrcompositor's log since the request (`compositor_log`) shows
+/// this request failed; the request is the one for `path`'s stem (`<stem>.png`).
 fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> Option<&'static str>, mut compositor_log: impl FnMut() -> String) -> Result<Vec<u8>> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let (mut last, mut gone, mut failed) = (0, None, None);
     let stable = steamvr::wait_for(timeout, || {
         gone = exited();
-        failed = compositor_shot(&compositor_log()).1.map(str::to_owned);
+        failed = compositor_shot(&compositor_log(), stem).1.map(str::to_owned);
         let size = std::fs::metadata(path).map_or(0, |m| m.len());
         gone.is_some() || failed.is_some() || (size > 0 && size == std::mem::replace(&mut last, size))
     });
@@ -161,7 +163,7 @@ fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> 
         bail!("failed: vrcompositor could not capture the scene app's textures ({line}); OpenXR or Proton scene apps may not support compositor screenshots; use source headset");
     }
     if !stable {
-        let why = match compositor_shot(&compositor_log()).0 {
+        let why = match compositor_shot(&compositor_log(), stem).0 {
             true => "vrcompositor logged the request but wrote no file",
             false => "vrcompositor logged no screenshot request; vrserver may not see this directory",
         };
@@ -170,10 +172,15 @@ fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> 
     std::fs::read(path).with_context(|| path.display().to_string())
 }
 
-/// Whether vrcompositor's log shows a stereo screenshot request, and its `Screenshot: Failed` line if it logged one.
-fn compositor_shot(log: &str) -> (bool, Option<&str>) {
-    let failed = log.lines().find_map(|l| l.find("Screenshot: Failed").map(|i| l[i..].trim_end()));
-    (log.contains("Take stereo screenshot request"), failed)
+/// Whether vrcompositor's log shows the stereo screenshot request for `stem`, and its `Screenshot: Failed` line if it logged one:
+/// one before the next request, since tool calls run concurrently and another request's failure is not this one's.
+fn compositor_shot<'a>(log: &'a str, stem: &str) -> (bool, Option<&'a str>) {
+    const REQUEST: &str = "Take stereo screenshot request";
+    let ours = format!("/{stem}-preview");
+    let mut lines = log.lines().skip_while(|l| !(l.contains(REQUEST) && l.contains(&ours)));
+    let requested = lines.next().is_some();
+    let failed = lines.take_while(|l| !l.contains(REQUEST)).find_map(|l| l.find("Screenshot: Failed").map(|i| l[i..].trim_end()));
+    (requested, failed)
 }
 
 /// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
@@ -2925,14 +2932,17 @@ mod tests {
         assert_eq!(polls, 4, "stable once two polls see the same size");
         let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None, String::new).unwrap_err().to_string();
         assert!(err.contains("never.png") && err.contains("deadline 0.3 s") && err.contains("vrserver may not see this directory"), "{err}");
-        let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None, || COMPOSITOR_REQUESTED.into()).unwrap_err().to_string();
+        let err = read_when_stable(&dir.join("vr-1-2.png"), Duration::from_millis(300), || None, || COMPOSITOR_REQUESTED.into()).unwrap_err().to_string();
         assert!(err.contains("vrcompositor logged the request") && !err.contains("may not see"), "{err}");
+        let other = || format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}").replace("vr-1-2", "vr-1-1");
+        let err = read_when_stable(&dir.join("vr-1-2.png"), Duration::from_millis(300), || None, other).unwrap_err().to_string();
+        assert!(err.contains("deadline") && err.contains("logged no screenshot request"), "another request's failure is not ours: {err}");
         let began = Instant::now();
         let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || Some("vrserver"), String::new).unwrap_err();
         assert!(err.to_string().contains("failed: vrserver exited") && began.elapsed() < Duration::from_secs(2), "{err}");
         let began = Instant::now();
         let failed = || format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}");
-        let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || None, failed).unwrap_err().to_string();
+        let err = read_when_stable(&dir.join("vr-1-2.png"), Duration::from_secs(30), || None, failed).unwrap_err().to_string();
         assert!(began.elapsed() < Duration::from_secs(2), "bails at the failure line, not the deadline: {err}");
         assert_eq!(
             err,
@@ -2942,18 +2952,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// vrcompositor.txt after a TakeStereoScreenshot with an OpenXR scene app under Proton.
-    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 - Take stereo screenshot request dest filename=/h/.local/state/vr-test-mcp/screenshots/vr-1-2\n\
-        Tue Oct 27 2026 21:14:02.104 - Marked submission of screenshot textures for screenshot type 2, flags 3\n\
-        Tue Oct 27 2026 21:14:02.110 - Capturing Stereo2D texture\n";
-    const COMPOSITOR_FAILED: &str = "Tue Oct 27 2026 21:14:02.116 - Screenshot: Failed to get the correct textures.\n";
+    /// vrcompositor.txt after a TakeStereoScreenshot (stem vr-1-2) with an OpenXR scene app under Proton.
+    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 [Info] - Screenshot: Take stereo screenshot request dest filename=\"/h/.local/state/vr-test-mcp/screenshots/vr-1-2-preview\"\n\
+        Tue Oct 27 2026 21:14:02.104 [Info] - Screenshot: Marked submission of screenshot textures for screenshot type 2, flags 3\n\
+        Tue Oct 27 2026 21:14:02.110 [Info] - Screenshot: Capturing Stereo2D texture\n";
+    const COMPOSITOR_FAILED: &str = "Tue Oct 27 2026 21:14:02.116 [Info] - Screenshot: Failed to get the correct textures.\n";
 
     #[test]
     fn compositor_log_shows_the_request_and_its_failure() {
-        assert_eq!(compositor_shot(""), (false, None));
-        assert_eq!(compositor_shot(COMPOSITOR_REQUESTED), (true, None));
+        assert_eq!(compositor_shot("", "vr-1-2"), (false, None));
+        assert_eq!(compositor_shot(COMPOSITOR_REQUESTED, "vr-1-2"), (true, None));
         let failed = format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}");
-        assert_eq!(compositor_shot(&failed), (true, Some("Screenshot: Failed to get the correct textures.")));
+        assert_eq!(compositor_shot(&failed, "vr-1-2"), (true, Some("Screenshot: Failed to get the correct textures.")));
+        assert_eq!(compositor_shot(&failed, "vr-1-22"), (false, None), "another request's lines");
+    }
+
+    #[test]
+    fn compositor_log_counts_only_this_requests_failure() {
+        // calls run concurrently: an earlier request (vr-1-1) fails after ours is logged, then ours (vr-1-2) fails
+        let other = COMPOSITOR_REQUESTED.replace("vr-1-2", "vr-1-1");
+        let log = format!("{other}{COMPOSITOR_FAILED}{COMPOSITOR_REQUESTED}");
+        assert_eq!(compositor_shot(&log, "vr-1-2"), (true, None), "the earlier request's failure is not ours");
+        assert_eq!(compositor_shot(&log, "vr-1-1"), (true, Some("Screenshot: Failed to get the correct textures.")));
+        let log = format!("{COMPOSITOR_REQUESTED}{other}{COMPOSITOR_FAILED}");
+        assert_eq!(compositor_shot(&log, "vr-1-2"), (true, None), "a failure after the next request belongs to that one");
+        assert_eq!(compositor_shot(&log, "vr-1-1"), (true, Some("Screenshot: Failed to get the correct textures.")));
     }
 
     fn pairs(path: &str, value: serde_json::Value) -> Vec<PathValuePair> {
