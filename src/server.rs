@@ -24,9 +24,9 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Client names of hosts that ignore `notifications/tools/list_changed`. They get every tool
-/// listed, and a gated one answers `not ready: <reason>`. Claude Code applies it, but its subagents
-/// keep the tool list from their spawn and a mid-turn refresh drops tools the model planned to call.
+/// Client names of hosts that get every tool listed, where a gated one answers `not ready: <reason>`.
+/// Claude Code acts on `notifications/tools/list_changed`, but its subagents keep the tool list from
+/// their spawn and a mid-turn refresh drops tools the model planned to call.
 pub const HOSTS_WITHOUT_LIST_CHANGED: &[&str] = &["claude-code"];
 
 pub struct VrServer {
@@ -173,7 +173,7 @@ impl VrServer {
         tokio::task::spawn_blocking(move || f(&stack)).await?
     }
 
-    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, with the ALVR dashboard check re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. Top-level dashboard_visible says whether SteamVR's dashboard is open (null when unknown: the OpenVR reader is not connected or lacks the interface). The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
+    #[tool(description = "Startup checks (ok, reason, fix) as of MCP start or the last vr_start, re-run (and config.toml re-read) here when config.toml changed or a core check fails, with the ALVR dashboard check always re-run, and the current state of Steam, SteamVR, ALVR, the virtual headset (streaming, fps, resolution, codec), on_head (the proximity it reports at every stream start) and, while the OpenVR reader is connected, the scene app. Top-level dashboard_visible says whether SteamVR's dashboard is open (null when unknown: the OpenVR reader is not connected or lacks the interface). The state also carries blocked_drivers (driver_* sections SteamVR blocked in safe mode; vr_start, vr_stop and a SteamVR restart clear them), owner (who holds the SteamVR lease, and whether this MCP does; null when free) and the session clock: now_t_s (seconds since MCP start), now_at and t0_at (RFC 3339 UTC, the instants of now and of t_s 0).")]
     async fn vr_status(&self) -> Result<CallToolResult, String> {
         self.run(|s| {
             let dashboard_visible = s.reader_connected().then(|| s.dashboard_visible()).flatten();
@@ -253,7 +253,7 @@ impl VrServer {
         self.rig(RigAction::AnimateHead(args)).await
     }
 
-    #[tool(description = "Set a Valve Index controller's pose, in the playspace or relative to the head's pose now (relative_to \"head\"). Same pose fields as set_head_pose.")]
+    #[tool(description = "Set a Valve Index controller's raw pose, in the playspace or relative to the head's pose now (relative_to \"head\"). ALVR moves it by its controller offset (11 cm along the controller's own -Z by default) and games aim and grip from poses SteamVR derives from it, so a level pose can aim tilted. Same pose fields as set_head_pose.")]
     async fn set_controller_pose(&self, Parameters(args): Parameters<ControllerPoseArgs>) -> Result<CallToolResult, String> {
         self.rig(RigAction::SetControllerPose(args)).await
     }
@@ -366,7 +366,7 @@ impl VrServer {
         self.run(move |s| json(s.haptics(args.since_s.unwrap_or(f64::NEG_INFINITY), args.clear))).await.map_err(message)
     }
 
-    #[tool(description = "Wait window_s (0.5 to 60, default 5), then report frame timing over it: compositor (SteamVR's GetFrameTimings for frames within window_s of the newest: frames, fps, interval_ms and gpu_ms p50/p95/p99 by nearest rank, dropped, mispresented, reprojected frames; nominal_hz is the headset's display frequency and throttled is true when fps is under 90% of it, which tells SteamVR throttling to 36/24/18 Hz from a real refresh change; both null when unknown), counts (compositor presents, dropped and reprojected frames during the window) and alvr (mean of ALVR's statistics summaries: samples, latencies in ms, client_fps, server_fps, video_mbits_per_sec), t_s and at of the window's end. A part that could not be read is null and its error is in notes. Limit: SteamVR keeps at most 1024 frames.")]
+    #[tool(description = "Wait window_s (0.5 to 60, default 5), then report frame timing over it: compositor (SteamVR's GetFrameTimings for frames within window_s of the newest: frames, fps, interval_ms and gpu_ms p50/p95/p99 by nearest rank, dropped, mispresented, reprojected frames; nominal_hz is the headset's display frequency and throttled is true when fps is under 90% of it, which tells SteamVR throttling to 36/24/18 Hz from a real refresh change; both null when unknown), counts (compositor presents, dropped and reprojected frames during the window) and alvr (mean of ALVR's statistics summaries: samples, latencies in ms, client_fps, server_fps, video_mbits_per_sec), t_s and at of the window's end. A part that could not be read is null and its error is in notes. Limit: the MCP asks SteamVR for up to 1024 frames, and SteamVR has been seen to return only about the newest 128, so at a high compositor rate the compositor block covers less than window_s; counts covers the whole window.")]
     async fn get_frame_timing(&self, Parameters(args): Parameters<FrameTimingArgs>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.frame_timing(args.window_s)?)).await.map_err(message)
     }
@@ -392,7 +392,7 @@ impl VrServer {
         self.run(move |s| json(s.set_hand_tracking_flavour(skeletal)?)).await.map_err(message)
     }
 
-    #[tool(description = "ALVR log events (kept since vr_start, newest 1000) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t_s, at (session clock: seconds since MCP start, and RFC 3339 UTC), t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
+    #[tool(description = "ALVR log events (the newest 1000 since MCP start) and the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs, merged in time order: t_s, at (session clock: seconds since MCP start, and RFC 3339 UTC), t (local time of day), source, level, text. Filter by source (alvr, vrserver, vrcompositor, vrmonitor or all), text (contains, ignoring case) and min_level (error, warning, info, debug; applies to ALVR events only, SteamVR lines are filtered by text only). Returns the newest limit lines (1 to 1000, default 100).")]
     async fn get_logs(&self, Parameters(args): Parameters<LogQuery>) -> Result<CallToolResult, String> {
         self.run(move |s| json(s.logs(args)?)).await.map_err(message)
     }
