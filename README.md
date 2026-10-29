@@ -13,7 +13,7 @@ The server joins a stock ALVR 21 streamer as a headset client over loopback. Ste
 - An AMD or Intel GPU for SteamVR. ALVR 21 direct mode is broken on NVIDIA upstream (ALVR #3421), so a machine with only NVIDIA GPUs is refused. A hybrid laptop works if SteamVR runs on the AMD or Intel GPU (see [Hybrid GPUs](#hybrid-gpus)).
 - VA-API H.264 encoding on that GPU (Mesa's `radeonsi` or Intel's media driver).
 - A default audio input. ALVR's client opens it at every connection.
-- Optional: PipeWire for `record_audio` and `audio_level`, and xdg-desktop-portal with your desktop's backend for desktop screenshots.
+- Optional: PipeWire for `record_audio` and `audio_level`.
 
 `vr_status` lists every startup check with its result and the fix.
 
@@ -53,7 +53,7 @@ Stdout carries only the protocol. Logs go to stderr (see [Logging](#logging)).
 
 ### Tool gating
 
-Most hosts see only `vr_status`, `get_logs`, `vr_acquire` and `vr_release` at first. Every other tool appears while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes.
+Most hosts see a tool only while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes. `vr_status`, `get_logs`, `vr_acquire` and `vr_release` are always listed. Before any session a healthy machine also lists `vr_start`, `record_audio` and `audio_level`, plus `vr_restore` when `restore.json` exists and `read_app_log` and `wait_for_log` when `app_logs` is set. The input tools appear once the headset streams.
 
 Claude Code is the exception: it gets every tool listed from the start. It does act on `tools/list_changed` (for MCP protocol 2026-07-28 through `subscriptions/listen`, which the server serves), but its subagents keep the tool list they were spawned with, and a refresh in the middle of a turn removes tools the model already planned to call. Hosts like this are listed in `HOSTS_WITHOUT_LIST_CHANGED` in `src/server.rs`.
 
@@ -81,7 +81,7 @@ A minimal file:
 streamer_dir = "/path/to/alvr_streamer_linux"
 ```
 
-The server reads the file at startup, at each `vr_start`, and at `vr_status` when the file changed or a core check fails. It applies a new version only while nothing runs, so after you fix a failing check, the next `vr_status` shows it without restarting the MCP. If SteamVR or a session is up, run `vr_stop` first. A malformed file does not stop the server: the `config` check fails, and `vr_start` stays unavailable until the file parses.
+The server reads the file at startup, at each `vr_start`, and at `vr_status` when the file changed or a core check fails. It applies a new version only while nothing runs, so after you fix a failing check, the next `vr_status` shows it without restarting the MCP. If SteamVR or a session is up, run `vr_stop` first. A malformed file does not stop the server: the `config` check fails, and `vr_start` stays unavailable until the file parses. While `restore.json` exists, changing `streamer_dir`, `steam_dir` or `steamvr_dir` makes `vr_start` refuse until you run `vr_restore` (see [What it changes on your system](#what-it-changes-on-your-system)).
 
 ### Steam environment
 
@@ -105,6 +105,8 @@ Find `<vendor:device>` as the `[vvvv:dddd]` pair on the GPU's line in `lspci -nn
 ```
 VK_DRIVER_FILES=<icd json of the SteamVR GPU> MESA_VK_DEVICE_SELECT=<vendor:device>! %command%
 ```
+
+For `launch_app` with `via: "proton"`, pass `MESA_VK_DEVICE_SELECT` in its `env`. Its env allowlist refuses `VK_DRIVER_FILES` and `VK_ICD_FILENAMES`, which load drivers, so there the device selection alone picks the GPU.
 
 The MCP never edits your desktop launchers or a game's launch options.
 
@@ -135,11 +137,13 @@ The MCP never edits your desktop launchers or a game's launch options.
 "session_settings.video.preferred_fps" = 90.0
 ```
 
-The built-in defaults the MCP applies first: H.264 Baseline, foveated encoding off, view resolution scale 1.0, 72 fps, game audio and microphone streaming off, `Stage` recentering, tracked Index controllers with hand skeletons and gesture input, a manual button mapping that passes every Index input through, and client discovery off. `set_alvr_settings` changes last until the next `vr_start`, which applies the defaults and `alvr_settings` again.
+The built-in defaults the MCP applies first: H.264 Baseline, foveated encoding off, transcoding and emulated view resolution scale 1.0, 72 fps, game audio and microphone streaming off, `Stage` recentering, tracked Index controllers with hand skeletons and gesture input, a manual button mapping that passes every Index input through, client discovery off and the remote dashboard off. They set no keyframe or IDR interval, so ALVR's own encoder defaults apply. `set_alvr_settings` changes last until the next `vr_start`, which applies the defaults and `alvr_settings` again.
+
+`alvr_settings` in config.toml is not filtered the way `set_alvr_settings` is, so it can turn client discovery or the remote dashboard back on and change the connection settings. Leave those alone unless you mean to expose ALVR on the network.
 
 ## Tools
 
-Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters, degrees and seconds. The default `Stage` recentering means the poses you send are absolute.
+Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters, degrees and seconds. The default `Stage` recentering means the poses you send are absolute. A controller pose is the Index controller's raw pose, which ALVR moves by its default controller offset of 11 cm along the controller's own -Z, so `get_tracked_state` reports the controller 11 cm along its own -Z from the pose you set. Games aim and grip from poses SteamVR derives from the raw one (see [Observed behavior](#observed-behavior)).
 
 ### Session
 
@@ -147,11 +151,11 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 | --- | --- |
 | `vr_status` | Startup checks and the state of Steam, SteamVR, ALVR, the headset, the lease and the session clock. |
 | `vr_acquire` | Take or renew the SteamVR lease under a name you choose. |
-| `vr_release` | Give the lease up so another agent can take it. SteamVR keeps running. |
+| `vr_release` | Give the lease up so another agent can take it. Refuses while this MCP runs a session; `vr_stop` already releases it. |
 | `vr_start` | Start Steam if needed, then SteamVR with ALVR and the headset, and return once it streams. |
 | `vr_stop` | Shut SteamVR down and disconnect the headset; close Steam only if `vr_start` started it. |
-| `vr_restore` | Put back the SteamVR and ALVR setup from before the first `vr_start`. |
-| `set_alvr_settings` | Set ALVR session values by path, restarting SteamVR when ALVR needs it. |
+| `vr_restore` | Put back the SteamVR and ALVR setup from before the first `vr_start`, and report whether all of it is back. |
+| `set_alvr_settings` | Set ALVR session values by path in a `vr_start` session, restarting SteamVR when ALVR needs it. |
 | `set_hand_tracking_flavour` | Bare hands as the Index controller (`index`) or as separate skeletal hand trackers (`skeletal_tracker`). |
 
 ### Apps
@@ -159,7 +163,7 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 | Tool | What it does |
 | --- | --- |
 | `launch_app` | Launch a Steam app or shortcut through Steam, or a Steam app straight through its Proton (`via: "proton"`), and wait for its scene. |
-| `stop_app` | Stop the scene app, and for a Proton launch its whole process tree. |
+| `stop_app` | Stop the scene app, and for a Proton launch its whole process tree. Works without a streaming headset. |
 | `close_dashboard` | Click the right controller's system button once if SteamVR's dashboard is open, so the game gets focus. |
 
 ### Head and playspace
@@ -203,10 +207,10 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 
 | Tool | What it does |
 | --- | --- |
-| `screenshot` | PNG from `headset` (what the headset receives, the default), `compositor` (SteamVR's uncompressed scene textures) or `desktop` (the whole desktop through xdg-desktop-portal). |
+| `screenshot` | PNG from `headset` (what the headset receives, the default) or `compositor` (SteamVR's uncompressed scene textures). There is no desktop or window source. |
 | `get_tracked_state` | What SteamVR tracks: devices, poses, velocities, skeletons and curls, the scene app. |
 | `get_haptics` | Haptic events the app sent. |
-| `get_frame_timing` | SteamVR compositor frame timings and ALVR latency statistics over a window. |
+| `get_frame_timing` | SteamVR compositor frame timings, frame counts and ALVR latency statistics over a window. |
 | `get_logs` | ALVR events plus the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs. |
 | `read_app_log` | Lines of a game's own log files, as `app_logs` configures. |
 | `wait_for_log` | Wait for a game log line matching a regex, a `fail_pattern`, or the timeout. |
@@ -220,31 +224,71 @@ Each tool's full description, with every argument and limit, is in its MCP schem
 - `vr_start`, `vr_stop`, `set_alvr_settings`, `set_hand_tracking_flavour`, `launch_app`, `run_sequence` and `wait_for_log` return only when they finish, which can take minutes.
 - Waits end with an error that says why: `failed: <signal>` for a known failure, such as vrserver exiting, or `deadline N s`. `wait_for_log` answers `result: "match"`, `"fail"` or `"timeout"`, and fails with `failed: app exited` once the game it watched is gone.
 - Times come in two forms. `t_s` is seconds since the MCP started, and `at` is the same instant in UTC (RFC 3339). `vr_status` reports `now_t_s`, `now_at` and `t0_at`, so lines from different tools can be put in order.
-- The first connection against a fresh ALVR session always restarts SteamVR once. `vr_start` handles it and reports `restarts`.
+- The first connection against a fresh ALVR session always restarts SteamVR once. `vr_start` handles it and reports `restarts`. One `timeouts.streaming_s` deadline covers the whole `vr_start`, restarts included.
 - SteamVR opens its dashboard about 10 s after no scene app runs, and a game started under it stays unfocused (OpenXR `VISIBLE`, not `FOCUSED`). `vr_start` reports `dashboard_visible`. `launch_app` closes the dashboard by itself; for a game started another way, call `close_dashboard`.
 - SteamVR reserves the Index system click for its dashboard. System touch reaches apps.
 - SteamVR gives background OpenVR readers no input until a scene app (SteamVR Home counts) runs, so `get_tracked_state` skeletons read inactive right after `vr_start`.
-- `launch_app` with `via: "proton"` takes `exe` relative to the install dir (it must stay inside it) and refuses `STEAM_COMPAT_*`, `SteamAppId` and `SteamGameId` in `env`. The game's Steam launch options do not apply and Steam shows no dialogs. The launcher's output goes to the `run_log` it returns. Like the Steam mode, it needs a streaming headset.
-- The first desktop screenshot can bring up xdg-desktop-portal's permission prompt. Approve it once. If nobody answers, the call times out and cancels the request.
+- `set_alvr_settings` needs a `vr_start` session. It refuses `client_connections`, `session_settings.connection` and `session_settings.headset.vmc`, anything below them and their parents, because those would let ALVR stream to or take tracking from another host. Every `vr_start` also sets `allow_remote_dashboard` back to `false`.
+- `launch_app` with `via: "proton"` needs a `vr_start` session and a streaming headset, like the Steam mode. The game's Steam launch options do not apply and Steam shows no dialogs. The launcher's output goes to the `run_log` it returns. Its arguments are limited so a call cannot run a program of its choosing:
+  - `exe` is relative to the install dir and must stay inside it. It must be a real Windows `.exe` (an `MZ` header), and not a shell, script interpreter or loader: `cmd`, `powershell`, `pwsh`, `wscript`, `cscript`, `mshta`, `rundll32`, `regsvr32`, `node`, `start`, `explorer`, or a name starting with `python`, `java` or `wine`.
+  - `args` may not hold the Chromium/CEF switches that name a program to run: `renderer-cmd-prefix`, `gpu-launcher`, `utility-cmd-prefix` and `browser-subprocess-path`.
+  - `env` takes upper-case `[A-Z0-9_]` names starting with `MESA_`, `RADV_`, `VK_`, `DXVK_`, `VKD3D_`, `PROTON_`, `SDL_` or `__GL_`, except names that hold `PATH`, `FILENAMES`, `_FILES`, `LIBRARY`, `DYNAMIC_API` or `GL_DRIVER` or end in `_CMD`. It also takes `WINEDEBUG`, `WINEDLLOVERRIDES`, `DRI_PRIME`, `__NV_PRIME_RENDER_OFFLOAD`, `__VK_LAYER_NV_optimus`, `MANGOHUD`, `WINE_FULLSCREEN_FSR`, `WINEFSYNC`, `WINEESYNC`, `PULSE_LATENCY_MSEC`, `AMD_VULKAN_ICD`, and `__GLX_VENDOR_LIBRARY_NAME` with a plain `[a-z0-9_]` value. No value may hold `..`.
+  - Compatibility tools and runtimes (an install dir with a `toolmanifest.vdf`, such as Proton or the Steam Linux Runtime), non-Steam shortcuts and SteamVR itself are refused as apps.
+- `stop_app` works without a streaming headset, and stops a Proton launch even after SteamVR is gone.
+- `screenshot {source: "compositor"}` fails at once when vrcompositor logs `Screenshot: Failed to get the correct textures.`, which happens with some OpenXR and Proton scene apps; use the `headset` source then. Its 10 s timeout says whether vrcompositor logged the request at all (`vrcompositor logged the request but wrote no file`, or `vrcompositor logged no screenshot request; vrserver may not see this directory`).
+- `get_frame_timing` takes ALVR's statistics from the events stream the MCP holds during its session. Its `compositor` block summarizes only the frames still in SteamVR's frame history. The MCP asks for 1024, but SteamVR has been seen to return only about the last 128, whatever `window_s` is, and since the compositor can run far above the nominal refresh rate, those may span well under a second. The `counts` (presents, dropped and reprojected frames, from SteamVR's cumulative counters) cover the whole window, so for the frame rate over a long window use `counts.presents / window_s`.
+- The MCP talks only to the ALVR that this user's vrserver hosts. Any other listener on ALVR's port gets `not ours: the ALVR on port N does not belong to this user's SteamVR`. Responses are capped at 8 MiB, and a request ALVR leaves unanswered fails with its method and route, for example `GET /api/version: ALVR accepted the connection but did not answer within 10 s`.
+- An OpenVR call that never returns (a wedged vrserver) stays counted. Until it returns, OpenVR reads and `launch_app` fail at once, and `vr_status` warns `OpenVR client wedged (an OpenVR call never returned); restart the MCP`.
 - `record_audio` and `audio_level` hear the whole default output, other apps included. WAV files stay in the MCP's private runtime dir until logout.
+
+### Session watcher
+
+While the MCP manages a session, a watcher checks SteamVR every second.
+
+- If SteamVR exits on its own (it crashed or you quit it), the session ends once no SteamVR process has run for 3 s, or vrserver has been gone for 20 s. SteamVR's own restart, an update or vrmonitor relaunching vrserver stays within that. The MCP closes its headset and its ALVR dashboard, and `vr_status` warns `SteamVR exited without vr_stop (it crashed or was quit), so the session ended; run vr_start`, or `the last SteamVR restart failed and the headset is not streaming; run vr_start` when a restart failed. The lease is no longer renewed and expires; `vr_release` frees it at once.
+- If the headset stops streaming for 30 s, the watchdog restarts SteamVR with a fresh headset. It re-arms only after a stream has held for 60 s, and fires at most 3 times per `vr_start`, so a stream that keeps dropping cannot loop restarts and kill the game under test. After that `vr_status` warns `the headset went quiet again after 3 watchdog SteamVR restarts, which the watchdog no longer repeats; run vr_start`. When the headset stays quiet after a watchdog restart it warns `the watchdog restarted SteamVR but the headset stayed quiet; run vr_start`.
+
+`vr_status` joins every warning that applies into one `warning` string, separated by `; `.
+
+### Observed behavior
+
+These come from testing, and no test checks them. They may differ by game, GPU or SteamVR version.
+
+- With a static head pose, SteamVR goes into standby after about 5 minutes.
+- With Index controller emulation, one game's aim ray pointed about 30 to 35 degrees above the pose `set_controller_pose` set. SteamVR derives the aim and grip poses from the Index raw pose through fixed rotations in the Index render model, so expect a tilt like this, and check its size in each game.
+- An app's pause menu could be reached only through the system button, which opens SteamVR's dashboard, followed by `close_dashboard`.
+- During performance runs on an integrated GPU, a GPU stall of about 70 ms came every 20 s or so. The cause is unknown. The MCP's ALVR defaults set no keyframe or IDR interval; a `headset` screenshot does ask ALVR for one IDR frame.
 
 ## What it changes on your system
 
-The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/vr-test-mcp/restore.json` (usually `~/.local/state/vr-test-mcp/`). Later starts never overwrite it. The snapshot holds:
+The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/vr-test-mcp/restore.json` (usually `~/.local/state/vr-test-mcp/`). The snapshot holds:
 
+- the absolute paths of `steamvr.vrsettings`, the ALVR session file, `vrcompositor` and the ALVR driver, as found at that start;
 - the `external_drivers` list from `openvrpaths.vrpath`;
 - the whole `steamvr.vrsettings`;
-- the ALVR session file, and any file ALVR creates next to it;
+- the ALVR session file and the `session_old.json` and `session_invalid.json` next to it, which ALVR overwrites, plus the names of files that ALVR creates in that directory while the MCP writes its session;
 - the `vrcompositor` wrapper symlink an older ALVR left, if SteamVR had one.
 
-Then `vr_start`:
+Later starts keep the snapshot, with one exception. When a cold `vr_start` finds that SteamVR carries none of the MCP's changes (`forcedDriver` is not `alvr_server`, the recorded driver is not registered, and no restore is under way), it takes that to mean you put SteamVR back by hand, and retakes only the driver list and `steamvr.vrsettings`, keeps the session files and the compositor entry as first recorded, and notes `restore.json predated a SteamVR setup without the MCP's changes; took a fresh snapshot`.
 
-- registers the pinned ALVR driver in place of any other ALVR driver;
+`vr_start` refuses before it changes anything when:
+
+- `restore.json` does not parse: `<file> does not parse; inspect it, put back by hand what you need from it, then delete it`;
+- `restore.json` is partial (see [vr_restore](#vr_restore));
+- a recorded path differs from what the config gives now, for example after changing `streamer_dir`, `steam_dir` or `steamvr_dir`: `restore.json has <what> at <then>, but the config now gives <now>; run vr_restore first (it restores to the recorded paths)`.
+
+A cold `vr_start` then:
+
+- registers the pinned ALVR driver in `openvrpaths.vrpath`, dropping any other driver whose path contains `alvr`. The other drivers keep their order, and ALVR's goes last;
 - sets `forcedDriver` to `alvr_server` in `steamvr.vrsettings`;
-- clears `blocked_by_safe_mode` for the ALVR driver, and SteamVR's safe-mode blocks on other drivers before each cold start (SteamVR 2.18.4 otherwise stops the launch on a desktop dialog; `vr_status` lists the ones present as `blocked_drivers`);
+- clears `blocked_by_safe_mode` for the ALVR driver, and SteamVR's safe-mode blocks on other drivers (SteamVR 2.18.4 otherwise stops the launch on a desktop dialog; `vr_status` lists the ones present as `blocked_drivers`);
 - unwraps the `vrcompositor` wrapper an older ALVR left, if there is one;
 - writes the MCP's ALVR settings, with the headset as a trusted `127.0.0.1` client;
 - starts Steam with `steam.env` if it was not running.
+
+When SteamVR already runs with ALVR, `vr_start` adopts it. It still takes the snapshot, with the refusals above, but it changes no files; the settings and the client go to ALVR through its API. If ALVR's session file shows the previous client still connected, ALVR is stuck on a dead client and would not answer, so `vr_start` restarts SteamVR first.
+
+The MCP writes `restore.json`, `steamvr.vrsettings`, `openvrpaths.vrpath` and the files `vr_restore` puts back through a temp file, fsync and rename, so a crash leaves the old file or the new one, never a torn one. The new file keeps the old file's permissions. A file without the owner write bit is refused: some users make `openvrpaths.vrpath` read-only so SteamVR cannot reset the OpenXR runtime, and the MCP will not silently undo that. The error reads `<file> is read-only, perhaps to keep SteamVR from changing it; chmod u+w it, run this again, then make it read-only again`.
 
 It also keeps its own files:
 
@@ -253,13 +297,24 @@ It also keeps its own files:
 
 ### vr_stop
 
-`vr_stop` ends a game that `launch_app via proton` started, disconnects the headset, shuts SteamVR down through ALVR (with signals if ALVR hangs, which takes about 30 s), clears the safe-mode blocks that a signalled stop leaves, and closes Steam if `vr_start` started it. It stops only a SteamVR that runs ALVR; close one you started without ALVR yourself.
+`vr_stop` ends a game that `launch_app via proton` started and disconnects the headset. It then shuts SteamVR down through ALVR, and if SteamVR is still up after 30 s it sends SIGTERM and then SIGKILL. Once every SteamVR process is gone it clears the safe-mode blocks SteamVR may have set, closes Steam if `vr_start` started it, and releases the lease. It stops only a SteamVR that runs ALVR; close one you started without ALVR yourself.
+
+Tool calls run concurrently. A `vr_stop` that arrives while a `vr_start` or a SteamVR restart runs waits for it to give up. A start that already launched SteamVR first waits up to 20 s for Steam to hand the launch over, so `vr_stop` finds that SteamVR and stops it too. Meanwhile `vr_start` answers `not ready: vr_stop is running`.
 
 It does not put your setup back. After `vr_stop`, SteamVR still has the ALVR driver registered and forced, and ALVR keeps the MCP's settings, so a real headset will not work until you run `vr_restore`.
 
 ### vr_restore
 
-`vr_restore` writes back everything in `restore.json` and then deletes it: the driver list, the whole `steamvr.vrsettings`, the ALVR session file, and the `vrcompositor` wrapper. It removes files ALVR created. It refuses while SteamVR runs, so run `vr_stop` first. Anything you changed in SteamVR's settings between the first `vr_start` and `vr_restore` is lost. Because the state is a file, a crashed MCP can still restore. The next `vr_start` takes a fresh snapshot.
+`vr_restore` writes back everything in `restore.json` to the paths recorded there: the driver list, the whole `steamvr.vrsettings`, the ALVR session files and the `vrcompositor` wrapper. It removes the files ALVR created. Anything you changed in SteamVR's settings, the driver list or the ALVR session between the first `vr_start` and `vr_restore` is lost. It returns `restored` and `notes`. When everything is back it deletes `restore.json`, releases the lease and reports `restored: true`, and the next `vr_start` takes a fresh snapshot.
+
+It reports `restored: false` and keeps both `restore.json` and the lease when:
+
+- `openvrpaths.vrpath` cannot be read or written. The other steps still run, and a note says what failed. Fix the file and run `vr_restore` again.
+- A recorded file's directory is gone, for example a SteamVR library or the streamer on a drive that is not mounted. It puts back the rest, notes `left <file> unrestored: its directory is gone`, and rewrites `restore.json` as partial, holding only the skipped entries. `vr_start` refuses while it exists. Mount the drive and run `vr_restore` again, which retries only those entries. If you removed the install on purpose, run `vr_restore {forget_missing: true}` instead: it restores what it can, drops each entry whose directory is gone with a note, deletes `restore.json` and reports `restored: true`.
+
+It refuses while any SteamVR process runs (`vrserver`, `vrcompositor`, `vrmonitor`, `vrdashboard`, `vrwebhelper`, `vrstartup`, `steamtours`), because they can still rewrite `steamvr.vrsettings`; the message names them. It also refuses while a `vr_start`, `vr_stop` or SteamVR restart runs, or while this MCP runs a session. Run `vr_stop` first.
+
+`restore.json` is marked as restoring before anything changes, and every step can run again, so a restore that crashed or failed halfway finishes on the next `vr_restore`. Because the state is a file, a crashed MCP can still restore.
 
 ## Sharing SteamVR between agents
 
@@ -267,8 +322,9 @@ Several MCP processes (several agent sessions) on one machine share one SteamVR 
 
 - Any tool that changes something takes the lease by itself, for 30 minutes unless `vr_acquire` sets `ttl_s` (600 to 14400 s), and renews it once half is left. `vr_acquire` is only needed to choose the name or the ttl.
 - While another live MCP holds the lease, the mutating tools disappear from the list and answer `not ready: SteamVR is leased to ...`.
-- Read-only tools stay open: `vr_status`, `get_logs`, `get_haptics`, `get_tracked_state`, `screenshot`, `read_app_log`, `wait_for_log`, `get_frame_timing`, `record_audio`, `audio_level`, `vr_acquire` and `vr_release`. An observer has no headset of its own, so for it `get_frame_timing` is unavailable and `screenshot` takes only the `compositor` and `desktop` sources.
-- The holder's MCP keeps renewing the lease while it manages a session. The lease ends at `vr_release`, at a `vr_stop` that leaves no SteamVR process behind, at a successful `vr_restore`, or when the holder exits. A lease whose MCP died is free at once; one whose MCP no longer manages a session can be taken over once it expires.
+- Read-only tools stay open: `vr_status`, `get_logs`, `get_haptics`, `get_tracked_state`, `screenshot`, `read_app_log`, `wait_for_log`, `get_frame_timing`, `record_audio`, `audio_level`, `vr_acquire` and `vr_release`. An observer has no headset of its own, so for it `get_haptics` and `get_frame_timing` are unavailable and `screenshot` takes only the `compositor` source.
+- The holder's MCP keeps renewing the lease while it manages a session and SteamVR runs. The lease ends at `vr_release`, at a `vr_stop` that leaves no SteamVR process behind, at a `vr_restore` that reports `restored: true`, or when the holder exits. A lease whose MCP died is free at once. One whose MCP no longer manages a session, a lost session included, can be taken over once it expires.
+- `vr_release` refuses while this MCP runs a session (`run vr_stop first`) or while a `vr_start`, `vr_stop` or SteamVR restart runs. It works after a lost session. Since `vr_stop` releases the lease itself, a `vr_release` after a clean `vr_stop` returns `released: false`.
 - `vr_status` shows the owner and whether it is this MCP.
 
 ## Logging
@@ -299,20 +355,28 @@ Start with `vr_status`: each failed check names its reason and the fix.
 | `h264_encoder` | No VA-API H.264 encoder on that GPU | Install VA-API drivers with H.264 encoding. |
 | `openvr_client` | SteamVR's `libopenvr_api.so` does not load | Reinstall SteamVR. |
 | `screenshot_decoder` | OpenH264 fails to start | Rebuild. |
-| `desktop_portal` | No xdg-desktop-portal on the session bus | Install it with your desktop's backend (`-kde`, `-gnome`, `-gtk`, `-wlr`). |
 | `audio_capture` | No PipeWire | Run PipeWire for the session. |
 
 Common errors at run time:
 
 - `Steam is running without steam.env (...)`: close Steam, and `vr_start` starts it with `steam.env`.
-- `SteamVR is running without the ALVR driver` or `SteamVR is running without ALVR; close it yourself`: close the SteamVR you started by hand, then call `vr_start`.
+- `SteamVR is running without the ALVR driver; close SteamVR and retry` or `SteamVR is running without ALVR; close it yourself`: close the SteamVR you started by hand, then call `vr_start`.
+- `ALVR's API does not answer on port N (deadline 10 s); run vr_stop`: SteamVR runs with ALVR's driver, but ALVR is still starting or hangs. Run `vr_stop`, then `vr_start`.
+- `not ours: the ALVR on port N does not belong to this user's SteamVR`: another process listens on ALVR's port. Close it.
+- `<METHOD> <route>: ALVR accepted the connection but did not answer within N s`: ALVR hangs. Run `vr_stop`.
 - `port N answers, but no SteamVR of this user runs`: another user's SteamVR or ALVR holds the port. Close it.
 - `failed: Steam is waiting for a dialog on the desktop (...)`: Steam stopped a launch on a dialog (`ShowInterstitials` or `ShowLaunchOption`, for example "VR Theater Screen" for an app Steam treats as non-VR). Dismiss it on the desktop and retry.
 - `Steam did not take ...`, within 20 s of `vr_start` or `launch_app`: a second Steam client (Flatpak Steam, for example) took over Steam's runtime launch service. Close the other Steam, then restart this one. Two Steam clients under one user also cannot both run a game: the game's steamclient dies about 28 s in with "fatal stalled cross-thread pipe".
 - `failed: vrserver exited`: SteamVR crashed during the wait. `get_logs` with `source: "vrserver"` shows why. On a hybrid GPU, check that Steam and the game use the SteamVR GPU.
-- `SteamVR wrote no screenshot to ...`: vrserver runs in the Steam Linux Runtime container and cannot write that directory. Keep `$XDG_STATE_HOME` under your home directory.
-- `not ready: SteamVR is leased to ...`: another agent holds SteamVR. Wait for it to call `vr_release`, or for its lease to expire once it stops managing a session.
-- `vr_restore` refuses: SteamVR still runs. Call `vr_stop` first.
+- `failed: vrcompositor could not capture the scene app's textures (...)`: the scene app does not support compositor screenshots, which is common for OpenXR and Proton apps. Use `source: "headset"`.
+- `SteamVR wrote no screenshot to ... (deadline 10 s); vrcompositor logged no screenshot request; vrserver may not see this directory`: vrserver runs in the Steam Linux Runtime container and cannot write that directory. Keep `$XDG_STATE_HOME` under your home directory. The variant `vrcompositor logged the request but wrote no file` means the compositor took the request and failed silently.
+- `not ready: SteamVR is leased to ...`: another agent holds SteamVR. Wait for it to call `vr_stop` or `vr_release`, or for its lease to expire once it stops managing a session.
+- `not ready: vr_stop is running` or `not ready: vr_start or vr_stop is running`: wait for the other call to return.
+- `set_alvr_settings changes only the session vr_start set up; run vr_start first`: call `vr_start` first.
+- `OpenVR client wedged (an OpenVR call never returned); restart the MCP`: vrserver stopped answering mid-call. Restart the MCP; `vr_stop` first if SteamVR hangs.
+- `vr_restore` refuses with `SteamVR processes still run (...)`, `a vr_start session runs` or `vr_start is running`: call `vr_stop` first.
+- `vr_start` refuses over `restore.json` (it does not parse, is partial, or records other paths), or a file `is read-only`: see [What it changes on your system](#what-it-changes-on-your-system) and [vr_restore](#vr_restore).
+- `vr_status` warns that the session ended, a restart failed, or the watchdog gave up or the headset stayed quiet: see [Session watcher](#session-watcher). Run `vr_start`.
 
 ## Limitations
 
@@ -321,7 +385,9 @@ Common errors at run time:
 - ALVR 21 registers the left hand tracker's buttons from the right-hand map (`Controller.cpp:112-117`).
 - ALVR 21 has one flag per controller for connected and tracked, so a disconnected controller is also untracked.
 - Audio tools capture the whole default output, not one game.
-- Not covered: Monado, WiVRn, an OpenXR API layer, Windows, Flatpak Steam, headless or CI use, Steam Frame controllers, desktop window capture, eye, face and body tracking, and more than one virtual headset.
+- Compositor screenshots fail for some OpenXR and Proton scene apps; the `headset` source works for all of them.
+- The watchdog restarts SteamVR at most 3 times per `vr_start`. After that, a headset that keeps dropping needs a new `vr_start`.
+- Not covered: Monado, WiVRn, an OpenXR API layer, Windows, Flatpak Steam, headless or CI use, Steam Frame controllers, desktop or window capture, eye, face and body tracking, and more than one virtual headset.
 
 ## Development
 
@@ -334,12 +400,16 @@ Change `rev` for every `alvr_*` dependency in `Cargo.toml`, install the matching
 The live tests in `tests/live.rs` drive the real Steam, SteamVR and ALVR, so they need a desktop session, a working config and no other agent using SteamVR:
 
 ```sh
-VR_TEST_GAME_ID=<app id> cargo test --test live -- --ignored --test-threads=1
+VR_TEST_GAME_ID=<app id> VR_TEST_REQUIRE_ALL=1 cargo test --test live -- --ignored --test-threads=1
 ```
 
-`VR_TEST_GAME_ID` is the Steam app id or non-Steam shortcut game id of a Windows VR game; the menu tests were written against Beat Saber. The `xr_probe` example (`cargo build --release --example xr_probe`) is a native OpenXR app that the live tests use to check inputs and haptics.
+`--test-threads=1` runs the tests one at a time in name order, so `live_zz_stop_and_restore` runs last. `VR_TEST_GAME_ID` is the Steam app id or non-Steam shortcut game id of a Windows VR game; the menu tests were written against Beat Saber.
 
-The live tests leave SteamVR running for the next one. Only `live_zz_stop_and_restore` stops it and restores the setup. After running a single live test, run that one too, or call `vr_stop` and `vr_restore`.
+A live test that cannot run on the machine as it is prints `skipped (N live tests so far): <why>` to stderr and passes, and `live_zz_stop_and_restore` prints `live run: N live tests skipped`. With `VR_TEST_REQUIRE_ALL=1` a skip fails the test instead, so a run that exercised nothing is not green. One exception: `live_start_streams_and_stop_cleans` needs Steam closed and `live_start_streams_and_stop_cleans_with_steam_running` needs it running, so every run skips one of them, and that skip never fails.
+
+The streaming tests share one SteamVR and leave it running for the next test. The tests that need SteamVR closed (`live_prepare_restore_round_trip` and both `live_start_streams` tests) stop it and restore the setup first, and `live_zz_stop_and_restore` does the same at the end. After running a single live test, run `live_zz_stop_and_restore` too, or call `vr_stop` and `vr_restore`.
+
+The `xr_probe` example is a native OpenXR app that the live tests use to check inputs and haptics. The tests build it themselves with `cargo build --example xr_probe` (debug) and run it from `$CARGO_TARGET_DIR/debug/examples/`, or `target/debug/examples/` when that is unset.
 
 ### Manual checks through the MCP
 
@@ -347,22 +417,30 @@ The live tests leave SteamVR running for the next one. Only `live_zz_stop_and_re
 
 1. Clocks: `vr_status` shows `now_t_s`, `now_at` and `t0_at`. After `vr_start`, a `get_logs` vrserver line and an ALVR line from the same second have `t_s` within 1 s. A `get_haptics` event fired by `xr_probe` has `t_s` within 0.2 s of the probe's own log line.
 2. Cold start: a cold `vr_start`, and a `set_alvr_settings` that restarts SteamVR, never fail with `failed: vrserver exited`.
-3. Lease: start two MCP sessions. Session A calls `set_head_pose`. Session B's tool list drops the mutating tools within 2 s, `vr_status.state.owner.mine` is false in B, and B's `vr_start` answers `not ready: SteamVR is leased to mcp-<A pid>`. A runs `vr_release`, and B's mutating tools come back within 2 s. Kill A with SIGKILL while it holds the lease, and B can claim at once. While A runs a session and calls only read-only tools for over 30 minutes, A's lease stays renewed. While A restarts SteamVR, B's `get_tracked_state` fails or answers within 5 s and B keeps working afterwards. (In Claude Code every tool stays listed, so check B's answers instead of its tool list.)
+3. Lease: start two MCP sessions. Session A calls `set_head_pose`. Session B's tool list drops the mutating tools within 2 s, `vr_status.state.owner.mine` is false in B, and B's `vr_start` answers `not ready: SteamVR is leased to mcp-<A pid>`. A runs `vr_stop`, which releases the lease, and B's mutating tools come back within 2 s. Kill A with SIGKILL while it holds the lease, and B can claim at once. While A runs a session and calls only read-only tools for over 30 minutes, A's lease stays renewed. While A restarts SteamVR, B's `get_tracked_state` fails or answers within 5 s and B keeps working afterwards. (In Claude Code every tool stays listed, so check B's answers instead of its tool list.)
 4. Safe mode: `vr_start`, then kill vrmonitor with SIGKILL. Call `vr_status` until `blocked_drivers` lists the blocked drivers. `vr_stop`, and `blocked_drivers` is back to the snapshot's state. `vr_start` streams.
 5. App logs: add `[app_logs]` for a Unity Proton game and `launch_app` it. `read_app_log` returns lines from the new `Player.log` only. `wait_for_log {pattern: "<a line the game prints at its menu>", fail_pattern: "Exception"}` answers `match` within the game's load time.
 6. Proximity: the headset reports worn at each stream start (SteamVR 2.18 needs that to focus OpenXR apps). With an OpenXR app running, `set_proximity {on_head: false}` makes `get_tracked_state` show the HMD's `head_proximity: false`, and the app reports focus loss or idle. `on_head: true` reverses it. Call `get_tracked_state` right after `set_proximity`, both after `vr_start` and after `launch_app`: it shows the new value.
 7. Frame timing: with a game in VR, `get_frame_timing {window_s: 5}` returns a non-null `compositor` with `fps` near the stream fps, a non-null `alvr`, and empty `notes`.
 8. Compositor screenshot: `screenshot {source: "compositor", eye: "left"}` returns a PNG at the app's eye render size, sharper than `source: "headset"`.
 9. Proton launch: `launch_app {app_id, via: "proton", exe: "<game exe>", args: ["<arg>"], env: {"PROTON_LOG": "1"}}` reaches a running scene without a Steam dialog. The game sees the arg, and `run_log` has Proton's output. `stop_app` returns, and afterwards `/proc` has no process with that `STEAM_COMPAT_DATA_PATH` and app id. Launch again, then `vr_stop`: its `stopped_app` names the game, and a second Proton launch of the same app reaches its scene. Run it once with Proton Experimental and once with a custom compatibility tool.
-10. Desktop screenshot: `screenshot {source: "desktop"}` returns the current desktop. A permission prompt may appear on the first call; the second call shows none.
-11. Audio: play a test tone or the game's menu music. `audio_level {window_s: 1}` reads above -60 dBFS on both channels. Turn the head 90 degrees with `move_head {yaw: 90}`, and the L/R balance of a spatialized sound shifts. `record_audio {seconds: 3}` writes a WAV that plays back the same sound. Repeat on a mono and a 5.1 default sink.
+10. Audio: play a test tone or the game's menu music. `audio_level {window_s: 1}` reads above -60 dBFS on both channels. Turn the head 90 degrees with `move_head {yaw: 90}`, and the L/R balance of a spatialized sound shifts. `record_audio {seconds: 3}` writes a WAV that plays back the same sound. Repeat on a mono and a 5.1 default sink.
 
 ## Third-party files
 
 - `vendor/openvr/openvr_capi.h` is Valve's OpenVR SDK 2.15.6 C header, as ALVR's `openvr` submodule pins it, under the BSD 3-clause license in `vendor/openvr/LICENSE`.
-- `examples/xr_probe.rs` and its shaders in `examples/xr_probe/` are adapted from the openxrs 0.22 Vulkan example (MIT OR Apache-2.0).
+- `examples/xr_probe.rs` and its shaders in `examples/xr_probe/` are adapted from the Vulkan example of [openxrs](https://github.com/Ralith/openxrs) 0.22, by Benjamin Saunders and the openxrs contributors, Copyright (c) 2020 The openxrs Developers, used under MIT OR Apache-2.0. The MIT permission notice that covers it is the same text as this repository's [LICENSE-MIT](LICENSE-MIT); the changes are listed at the top of `examples/xr_probe.rs`.
 - `tests/fixtures/red_blue.h264` is a synthetic one-frame x264 encode; the command that makes it is next to the test in `src/headset.rs`.
 
 ## License
 
-No license has been chosen yet. Until one is added, all rights are reserved.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
