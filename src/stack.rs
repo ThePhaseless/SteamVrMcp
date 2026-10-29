@@ -3182,6 +3182,18 @@ mod tests {
         }
         stack.openvr_calls.fetch_add(1, SeqCst);
         assert_eq!(stack.status().warning.unwrap(), [LEAKED, WEDGED, SESSION_LOST, RESTART_FAILED].join("; "));
+        // the watchdog's two: stayed_quiet only when neither a failed restart nor gave_up says more
+        {
+            let mut state = stack.state.lock();
+            (state.watchdog.gave_up, state.watchdog.stayed_quiet) = (true, true);
+        }
+        assert_eq!(stack.status().warning.unwrap(), [LEAKED, WEDGED, SESSION_LOST, RESTART_FAILED, WATCHDOG_GAVE_UP].join("; "));
+        {
+            let mut state = stack.state.lock();
+            state.watchdog.gave_up = false;
+            state.last_restart_error = None;
+        }
+        assert_eq!(stack.status().warning.unwrap(), [LEAKED, WEDGED, SESSION_LOST, WATCHDOG_STAYED_QUIET].join("; "));
         stack.openvr_calls.fetch_sub(1, SeqCst);
         stack.state.lock().managing = false;
     }
