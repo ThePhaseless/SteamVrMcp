@@ -360,9 +360,18 @@ The live tests leave SteamVR running for the next one. Only `live_zz_stop_and_re
 ## Third-party files
 
 - `vendor/openvr/openvr_capi.h` is Valve's OpenVR SDK 2.15.6 C header, as ALVR's `openvr` submodule pins it, under the BSD 3-clause license in `vendor/openvr/LICENSE`.
-- `examples/xr_probe.rs` and its shaders in `examples/xr_probe/` are adapted from the openxrs 0.22 Vulkan example (MIT OR Apache-2.0).
+- `examples/xr_probe.rs` and its shaders in `examples/xr_probe/` are adapted from the Vulkan example of [openxrs](https://github.com/Ralith/openxrs) 0.22, by Benjamin Saunders and the openxrs contributors, Copyright (c) 2020 The openxrs Developers, used under MIT OR Apache-2.0. The MIT permission notice that covers it is the same text as this repository's [LICENSE-MIT](LICENSE-MIT); the changes are listed at the top of `examples/xr_probe.rs`.
 - `tests/fixtures/red_blue.h264` is a synthetic one-frame x264 encode; the command that makes it is next to the test in `src/headset.rs`.
 
 ## License
 
-No license has been chosen yet. Until one is added, all rights are reserved.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
