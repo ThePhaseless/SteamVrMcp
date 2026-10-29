@@ -252,7 +252,7 @@ While the MCP manages a session, a watcher checks SteamVR every second.
 
 ### Observed behavior
 
-These were seen in testing. The code does not cause them, and they may differ by game, GPU or SteamVR version.
+These come from testing, and no test checks them. They may differ by game, GPU or SteamVR version.
 
 - With a static head pose, SteamVR goes into standby after about 5 minutes.
 - With Index controller emulation, one game's aim ray pointed about 30 to 35 degrees above the pose `set_controller_pose` set. SteamVR derives the aim and grip poses from the Index raw pose through fixed rotations in the Index render model, so expect a tilt like this, and check its size in each game.
@@ -269,7 +269,7 @@ The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/vr-test-mcp/restore.js
 - the ALVR session file and the `session_old.json` and `session_invalid.json` next to it, which ALVR overwrites, plus the names of files that ALVR creates in that directory while the MCP writes its session;
 - the `vrcompositor` wrapper symlink an older ALVR left, if SteamVR had one.
 
-Later starts keep the snapshot, with one exception. When a cold `vr_start` finds that SteamVR carries none of the MCP's changes (`forcedDriver` is not `alvr_server`, the recorded driver is not registered, and no restore is under way), you have put SteamVR back by hand. It then retakes only the driver list and `steamvr.vrsettings`, keeps the session files and the compositor entry as first recorded, and notes `restore.json predated a SteamVR setup without the MCP's changes; took a fresh snapshot`.
+Later starts keep the snapshot, with one exception. When a cold `vr_start` finds that SteamVR carries none of the MCP's changes (`forcedDriver` is not `alvr_server`, the recorded driver is not registered, and no restore is under way), it takes that to mean you put SteamVR back by hand, and retakes only the driver list and `steamvr.vrsettings`, keeps the session files and the compositor entry as first recorded, and notes `restore.json predated a SteamVR setup without the MCP's changes; took a fresh snapshot`.
 
 `vr_start` refuses before it changes anything when:
 
@@ -323,7 +323,7 @@ Several MCP processes (several agent sessions) on one machine share one SteamVR 
 - Any tool that changes something takes the lease by itself, for 30 minutes unless `vr_acquire` sets `ttl_s` (600 to 14400 s), and renews it once half is left. `vr_acquire` is only needed to choose the name or the ttl.
 - While another live MCP holds the lease, the mutating tools disappear from the list and answer `not ready: SteamVR is leased to ...`.
 - Read-only tools stay open: `vr_status`, `get_logs`, `get_haptics`, `get_tracked_state`, `screenshot`, `read_app_log`, `wait_for_log`, `get_frame_timing`, `record_audio`, `audio_level`, `vr_acquire` and `vr_release`. An observer has no headset of its own, so for it `get_haptics` and `get_frame_timing` are unavailable and `screenshot` takes only the `compositor` source.
-- The holder's MCP keeps renewing the lease while it manages a session and SteamVR runs. The lease ends at `vr_release`, at a `vr_stop` that leaves no SteamVR process behind, at a `vr_restore` that reports `restored: true`, or when the holder exits. A lease whose MCP died is free at once. One whose session was lost, or whose MCP no longer manages a session, can be taken over once it expires.
+- The holder's MCP keeps renewing the lease while it manages a session and SteamVR runs. The lease ends at `vr_release`, at a `vr_stop` that leaves no SteamVR process behind, at a `vr_restore` that reports `restored: true`, or when the holder exits. A lease whose MCP died is free at once. One whose MCP no longer manages a session, a lost session included, can be taken over once it expires.
 - `vr_release` refuses while this MCP runs a session (`run vr_stop first`) or while a `vr_start`, `vr_stop` or SteamVR restart runs. It works after a lost session. Since `vr_stop` releases the lease itself, a `vr_release` after a clean `vr_stop` returns `released: false`.
 - `vr_status` shows the owner and whether it is this MCP.
 
@@ -403,7 +403,7 @@ The live tests in `tests/live.rs` drive the real Steam, SteamVR and ALVR, so the
 VR_TEST_GAME_ID=<app id> VR_TEST_REQUIRE_ALL=1 cargo test --test live -- --ignored --test-threads=1
 ```
 
-`--test-threads=1` matters: it runs the tests one at a time in name order, so `live_zz_stop_and_restore` runs last. `VR_TEST_GAME_ID` is the Steam app id or non-Steam shortcut game id of a Windows VR game; the menu tests were written against Beat Saber.
+`--test-threads=1` runs the tests one at a time in name order, so `live_zz_stop_and_restore` runs last. `VR_TEST_GAME_ID` is the Steam app id or non-Steam shortcut game id of a Windows VR game; the menu tests were written against Beat Saber.
 
 A live test that cannot run on the machine as it is prints `skipped (N live tests so far): <why>` to stderr and passes, and `live_zz_stop_and_restore` prints `live run: N live tests skipped`. With `VR_TEST_REQUIRE_ALL=1` a skip fails the test instead, so a run that exercised nothing is not green. One exception: `live_start_streams_and_stop_cleans` needs Steam closed and `live_start_streams_and_stop_cleans_with_steam_running` needs it running, so every run skips one of them, and that skip never fails.
 
