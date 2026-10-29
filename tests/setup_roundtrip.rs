@@ -83,7 +83,7 @@ fn prepare_then_restore_round_trips() {
     assert_eq!(session["client_connections"][HOST]["manual_ips"], json!(["127.0.0.1"]));
     assert!(f.paths.restore_file().exists());
 
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     assert!(!f.paths.restore_file().exists());
     fs::remove_dir_all(&f.root).ok();
@@ -113,7 +113,7 @@ fn restore_from_file_only() {
     drop(values);
 
     let fresh = Paths { ..f.paths.clone() };
-    restore(&fresh).unwrap();
+    restore(&fresh, false).unwrap();
     assert_eq!(Snap::take(&fresh), before);
     assert!(!created.exists() && !fresh.restore_file().exists());
     fs::remove_dir_all(&f.root).ok();
@@ -129,7 +129,7 @@ fn restore_deletes_files_created_after_an_earlier_snapshot() {
     let created = f.paths.session_file().unwrap().with_file_name("session_old.json");
     assert!(created.exists());
 
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     assert!(!created.exists());
     fs::remove_dir_all(&f.root).ok();
@@ -143,7 +143,7 @@ fn null_external_drivers_round_trips() {
     let values = session_values(&Config::default()).unwrap();
     prepare(&f.paths, &values, HOST).unwrap();
     assert_eq!(Snap::take(&f.paths).openvrpaths["external_drivers"], json!([f.paths.driver_dir().unwrap()]));
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
@@ -161,7 +161,7 @@ fn restore_puts_back_whole_vrsettings() {
     v["steamvr"]["ipd"] = json!(0.0634);
     fs::write(&file, v.to_string()).unwrap();
 
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(fs::read(&file).unwrap(), original);
     fs::remove_dir_all(&f.root).ok();
 }
@@ -175,7 +175,7 @@ fn absent_vrsettings_is_deleted_on_restore() {
     let mut state: Value = serde_json::from_slice(&fs::read(f.paths.restore_file()).unwrap()).unwrap();
     state["vrsettings_file"] = json!("Absent");
     fs::write(f.paths.restore_file(), state.to_string()).unwrap();
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert!(!file.exists());
     fs::remove_dir_all(&f.root).ok();
 }
@@ -198,7 +198,7 @@ fn old_restore_json_still_restores() {
     );
     fs::write(f.paths.restore_file(), state.to_string()).unwrap();
 
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
@@ -236,7 +236,7 @@ fn restore_uses_the_paths_recorded_at_snapshot() {
     prep(&f.paths);
     // a partial restore unregistered ALVR, or the config changed since: the current Paths know nothing
     let lost = Paths { steam_dir: None, steamvr_dir: None, streamer_dir: None, ..f.paths.clone() };
-    restore(&lost).unwrap();
+    restore(&lost, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
@@ -263,7 +263,7 @@ fn restore_finishes_after_a_crash_between_compositor_steps() {
     // a restore killed after moving Valve's binary back, before the symlink
     let compositor = f.paths.vrcompositor().unwrap();
     fs::rename(&compositor, compositor.with_file_name("vrcompositor.real")).unwrap();
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
@@ -275,12 +275,12 @@ fn restore_retried_after_a_failure_finishes_and_is_not_stale() {
     prep(&f.paths);
     let bin = f.paths.vrcompositor().unwrap().parent().unwrap().to_owned();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).unwrap();
-    let failed = restore(&f.paths);
+    let failed = restore(&f.paths, false);
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(failed.is_err(), "the vrcompositor step fails");
     // the driver list and forcedDriver are back, but the setup is half restored
     assert!(!refresh_stale_snapshot(&f.paths).unwrap(), "a partial restore is not stale");
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     assert!(!f.paths.restore_file().exists());
     fs::remove_dir_all(&f.root).ok();
@@ -291,7 +291,7 @@ fn restore_skips_the_rewrap_when_the_wrapper_is_gone() {
     let f = fixture("nowrapper", |v20| json!([v20]));
     prep(&f.paths);
     fs::remove_file(f.root.join("wrapper")).unwrap();
-    let notes = restore(&f.paths).unwrap();
+    let notes = restore(&f.paths, false).unwrap();
     let compositor = f.paths.vrcompositor().unwrap();
     assert!(fs::symlink_metadata(&compositor).unwrap().is_file(), "Valve's binary stays in place");
     assert!(notes.iter().any(|n| n.contains("vrcompositor")), "{notes:?}");
@@ -305,7 +305,7 @@ fn restore_puts_back_the_session_old_json_alvr_overwrites() {
     fs::write(config.join("session_old.json"), "mine").unwrap();
     prep(&f.paths); // `{}` is extrapolated, so ALVR overwrites session_old.json
     assert_ne!(fs::read_to_string(config.join("session_old.json")).unwrap(), "mine");
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(fs::read_to_string(config.join("session_old.json")).unwrap(), "mine");
     fs::remove_dir_all(&f.root).ok();
 }
@@ -318,7 +318,7 @@ fn restore_puts_back_the_session_invalid_json_alvr_overwrites() {
     fs::write(config.join("session_invalid.json"), "mine").unwrap();
     prep(&f.paths);
     assert_eq!(fs::read_to_string(config.join("session_invalid.json")).unwrap(), "not json");
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(fs::read_to_string(config.join("session_invalid.json")).unwrap(), "mine");
     assert_eq!(fs::read_to_string(config.join("session.json")).unwrap(), "not json");
     fs::remove_dir_all(&f.root).ok();
@@ -340,7 +340,7 @@ fn a_stale_snapshot_is_replaced() {
     let now = Snap::take(&f.paths);
 
     assert!(refresh_stale_snapshot(&f.paths).unwrap());
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_eq!(fs::read_to_string(&vrsettings).unwrap(), r#"{"steamvr":{"x":2}}"#, "the user's changes survive");
     // what the check never looked at comes back as first recorded: the original session, the wrapper, no session_old.json
     assert_eq!(Snap::take(&f.paths), Snap { openvrpaths: now.openvrpaths, vrsettings: now.vrsettings, ..before });
@@ -363,15 +363,15 @@ fn restore_keeps_files_whose_directory_is_gone_for_a_retry() {
     // Steam's library on a second drive that is not mounted now
     let (steam, unmounted) = (f.root.join("steam"), f.root.join("steam.unmounted"));
     fs::rename(&steam, &unmounted).unwrap();
-    let notes = restore(&f.paths).unwrap();
+    let notes = restore(&f.paths, false).unwrap();
     assert!(notes.iter().any(|n| n.contains("steamvr.vrsettings")), "{notes:?}");
     assert!(!steam.exists());
     assert_eq!(fs::read_to_string(f.paths.session_file().unwrap()).unwrap(), "{}");
     let kept = f.paths.restore_file();
-    assert!(kept.exists() && notes.iter().any(|n| n.contains("delete") && n.contains(&kept.display().to_string())), "{notes:?}");
+    assert!(kept.exists() && notes.iter().any(|n| n.contains("forget_missing") && n.contains(&kept.display().to_string())), "{notes:?}");
     // vr_start must not build on a restore.json that holds only the skipped files
     let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
-    assert!(e.contains("vr_restore") && e.contains(&kept.display().to_string()), "{e}");
+    assert!(e.contains("vr_restore") && e.contains("forget_missing") && e.contains(&kept.display().to_string()), "{e}");
     assert!(!steam.exists());
 
     // the retry puts back only what was skipped: openvrpaths.vrpath changed since stays as it is
@@ -380,9 +380,48 @@ fn restore_keeps_files_whose_directory_is_gone_for_a_retry() {
     openvr["external_drivers"] = json!(["/elsewhere"]);
     fs::write(&vrpath, openvr.to_string()).unwrap();
     fs::rename(&unmounted, &steam).unwrap();
-    assert!(restore(&f.paths).unwrap().is_empty());
+    assert!(restore(&f.paths, false).unwrap().is_empty());
     assert!(!kept.exists());
     assert_eq!(Snap::take(&f.paths), Snap { openvrpaths: openvr, ..before });
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn forget_missing_drops_only_what_is_still_gone() {
+    let f = fixture("forgetmissing", |v20| json!([v20]));
+    prep(&f.paths);
+    // both on a drive that is not mounted now
+    let (steam, steam_away) = (f.root.join("steam"), f.root.join("steam.away"));
+    let (steamvr, steamvr_away) = (f.root.join("steamvr"), f.root.join("steamvr.away"));
+    fs::rename(&steam, &steam_away).unwrap();
+    fs::rename(&steamvr, &steamvr_away).unwrap();
+    restore(&f.paths, false).unwrap();
+    assert!(f.paths.restore_file().exists(), "partial");
+
+    // SteamVR's drive is back; Steam was removed on purpose
+    fs::rename(&steamvr_away, &steamvr).unwrap();
+    let notes = restore(&f.paths, true).unwrap();
+    let vrsettings = steam.join("config/steamvr.vrsettings");
+    assert!(notes.iter().any(|n| n.contains("forgot") && n.contains(&vrsettings.display().to_string())), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("vrcompositor")), "{notes:?}");
+    assert!(!f.paths.restore_file().exists());
+    let compositor = f.paths.vrcompositor().unwrap();
+    assert_eq!(fs::read_link(&compositor).unwrap(), f.root.join("wrapper"), "rewrapped, not dropped");
+    assert_eq!(fs::read_to_string(compositor.with_file_name("vrcompositor.real")).unwrap(), "real");
+    assert!(!steam.exists(), "a forgotten file is not written");
+    fs::remove_dir_all(&f.root).ok();
+}
+
+#[test]
+fn forget_missing_drops_the_compositor_wrap_with_its_directory() {
+    let f = fixture("forgetsteamvr", |v20| json!([v20]));
+    prep(&f.paths);
+    let compositor = f.paths.vrcompositor().unwrap();
+    fs::remove_dir_all(f.root.join("steamvr")).unwrap();
+    let notes = restore(&f.paths, true).unwrap();
+    assert!(notes.iter().any(|n| n.contains("forgot") && n.contains(&compositor.display().to_string())), "{notes:?}");
+    assert!(!f.paths.restore_file().exists());
+    assert!(!f.root.join("steamvr").exists());
     fs::remove_dir_all(&f.root).ok();
 }
 
@@ -394,12 +433,12 @@ fn restore_keeps_the_compositor_wrap_when_steamvr_is_gone_for_a_retry() {
     // the SteamVR library is on a drive that is not mounted now
     let (steamvr, unmounted) = (f.root.join("steamvr"), f.root.join("steamvr.unmounted"));
     fs::rename(&steamvr, &unmounted).unwrap();
-    let notes = restore(&f.paths).unwrap();
+    let notes = restore(&f.paths, false).unwrap();
     assert!(notes.iter().any(|n| n.contains("vrcompositor")), "{notes:?}");
     assert!(!steamvr.exists());
     assert!(f.paths.restore_file().exists(), "kept for a retry");
     fs::rename(&unmounted, &steamvr).unwrap();
-    assert!(restore(&f.paths).unwrap().is_empty());
+    assert!(restore(&f.paths, false).unwrap().is_empty());
     assert_eq!(Snap::take(&f.paths), before);
     assert!(!f.paths.restore_file().exists());
     fs::remove_dir_all(&f.root).ok();
@@ -413,11 +452,11 @@ fn old_restore_json_keeps_its_paths_for_a_retry() {
     strip_paths(&f.paths, |_| ());
     let bin = f.paths.vrcompositor().unwrap().parent().unwrap().to_owned();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).unwrap();
-    let failed = restore(&f.paths);
+    let failed = restore(&f.paths, false);
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(failed.is_err(), "the vrcompositor step fails");
     // ALVR is unregistered now, so detection no longer finds the streamer
-    restore(&Paths { streamer_dir: None, ..f.paths.clone() }).unwrap();
+    restore(&Paths { streamer_dir: None, ..f.paths.clone() }, false).unwrap();
     assert_eq!(Snap::take(&f.paths), before);
     fs::remove_dir_all(&f.root).ok();
 }
@@ -429,7 +468,7 @@ fn old_restore_json_without_a_wrap_needs_no_steamvr() {
     strip_paths(&f.paths, |obj| {
         obj.insert("vrcompositor".into(), Value::Null);
     });
-    restore(&Paths { steamvr_dir: None, ..f.paths.clone() }).unwrap();
+    restore(&Paths { steamvr_dir: None, ..f.paths.clone() }, false).unwrap();
     assert_eq!(fs::read_to_string(f.paths.session_file().unwrap()).unwrap(), "{}");
     assert!(!f.paths.restore_file().exists());
     fs::remove_dir_all(&f.root).ok();
@@ -445,7 +484,7 @@ fn openvrpaths_is_replaced_atomically() {
     prep(&f.paths);
     let prepared = ino();
     assert_ne!(prepared, first, "prepare renames a new file into place");
-    restore(&f.paths).unwrap();
+    restore(&f.paths, false).unwrap();
     assert_ne!(ino(), prepared, "restore renames a new file into place");
     fs::remove_dir_all(&f.root).ok();
 }
@@ -457,14 +496,14 @@ fn restore_goes_on_past_a_torn_openvrpaths() {
     prep(&f.paths);
     let vrpath = f.root.join("xdg/openvr/openvrpaths.vrpath");
     fs::write(&vrpath, r#"{"external_drivers": ["#).unwrap();
-    let notes = restore(&f.paths).unwrap();
+    let notes = restore(&f.paths, false).unwrap();
     assert!(notes.iter().any(|n| n.contains("openvrpaths.vrpath")), "{notes:?}");
     assert_eq!(fs::read_to_string(f.paths.vrsettings_file().unwrap()).unwrap(), original);
     assert_eq!(fs::read_to_string(f.paths.session_file().unwrap()).unwrap(), "{}");
     assert!(f.paths.restore_file().exists(), "kept for a retry");
 
     fs::write(&vrpath, json!({"external_drivers": [], "jsonid": "vrpathreg", "version": 1}).to_string()).unwrap();
-    assert!(restore(&f.paths).unwrap().is_empty());
+    assert!(restore(&f.paths, false).unwrap().is_empty());
     let openvr: Value = serde_json::from_str(&fs::read_to_string(&vrpath).unwrap()).unwrap();
     assert_eq!(openvr["external_drivers"], json!([f.root.join("alvr20/lib64/alvr")]));
     assert!(!f.paths.restore_file().exists());

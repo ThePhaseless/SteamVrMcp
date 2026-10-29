@@ -173,19 +173,22 @@ fn put_file(path: &Path, state: &FileState) -> Result<()> {
     }
 }
 
-/// True, with a note, when `path`'s directory no longer exists: its drive is not mounted, or the install moved or was removed.
-fn dir_gone(path: &Path, notes: &mut Vec<String>) -> bool {
+/// True, with a note, when `path`'s directory no longer exists: its drive is not mounted, or the install moved or was
+/// removed. The note says the entry is forgotten when `forget`.
+fn dir_gone(path: &Path, forget: bool, notes: &mut Vec<String>) -> bool {
     let gone = path.parent().is_some_and(|d| !d.exists());
     if gone {
-        notes.push(format!("left {} unrestored: its directory is gone", path.display()));
+        let what = if forget { "forgot" } else { "left unrestored" };
+        notes.push(format!("{what} {}: its directory is gone", path.display()));
     }
     gone
 }
 
-/// put_file, unless `path`'s directory is gone: false then, and restore keeps the entry for a retry.
-fn put_back(path: &Path, state: &FileState, notes: &mut Vec<String>) -> Result<bool> {
-    if dir_gone(path, notes) {
-        return Ok(false);
+/// put_file, unless `path`'s directory is gone. True when done with the entry (put back, or gone and `forget`);
+/// false keeps it for a retry.
+fn put_back(path: &Path, state: &FileState, forget: bool, notes: &mut Vec<String>) -> Result<bool> {
+    if dir_gone(path, forget, notes) {
+        return Ok(forget);
     }
     put_file(path, state)?;
     Ok(true)
@@ -531,9 +534,10 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
 
 /// Puts back everything restore.json recorded, at the paths it recorded, then deletes it. Every step can run
 /// again, so a retry after a failure finishes the job. A file whose directory is gone (an unmounted drive) is
-/// skipped and restore.json rewritten as partial, holding only those for a retry; an unreadable openvrpaths.vrpath
-/// is skipped and restore.json kept whole for a retry. Returns notes on what it left as it was.
-pub fn restore(paths: &Paths) -> Result<Vec<String>> {
+/// skipped and restore.json rewritten as partial, holding only those for a retry, or with `forget_missing` dropped
+/// (an install removed on purpose); an unreadable openvrpaths.vrpath is skipped and restore.json kept whole for a
+/// retry. Returns notes on what it left as it was.
+pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
     let mut state = read_state(paths)?;
     let at = restore_paths(paths, &state)?;
     if !state.restoring || state.paths.is_none() {
@@ -550,35 +554,43 @@ pub fn restore(paths: &Paths) -> Result<Vec<String>> {
         notes.push(format!("left openvrpaths.vrpath as it is and kept restore.json; fix the file, then run vr_restore again: {e:#}"));
     }
 
+    // restore.json is kept whole then, so nothing would be forgotten
+    let forget = forget_missing && drivers_back.is_ok();
+
     // each step clears what it put back, so a partial restore.json holds only what was skipped
     if let Some(original) = &state.vrsettings_file {
-        if put_back(&at.vrsettings, original, &mut notes)? {
+        if put_back(&at.vrsettings, original, forget, &mut notes)? {
             state.vrsettings_file = None;
         }
-    } else if !state.vrsettings.is_empty() && !dir_gone(&at.vrsettings, &mut notes) {
-        let mut settings = read_json(&at.vrsettings)?;
-        for (name, original) in &state.vrsettings {
-            let (section, key) = name.split_once('/').context("bad vrsettings key in restore.json")?;
-            put(&mut settings, section, key, original.clone());
+    } else if !state.vrsettings.is_empty() {
+        let gone = dir_gone(&at.vrsettings, forget, &mut notes);
+        if !gone {
+            let mut settings = read_json(&at.vrsettings)?;
+            for (name, original) in &state.vrsettings {
+                let (section, key) = name.split_once('/').context("bad vrsettings key in restore.json")?;
+                put(&mut settings, section, key, original.clone());
+            }
+            write_json(&at.vrsettings, &settings)?;
         }
-        write_json(&at.vrsettings, &settings)?;
-        state.vrsettings.clear();
+        if !gone || forget {
+            state.vrsettings.clear();
+        }
     }
 
     if let Some(original) = &state.session
-        && put_back(&at.session, original, &mut notes)?
+        && put_back(&at.session, original, forget, &mut notes)?
     {
         state.session = None;
     }
     for file in std::mem::take(&mut state.created_files) {
-        if dir_gone(&file, &mut notes) {
-            state.created_files.push(file);
-        } else {
+        if !dir_gone(&file, forget, &mut notes) {
             remove_file(&file)?;
+        } else if !forget {
+            state.created_files.push(file);
         }
     }
     for (file, original) in std::mem::take(&mut state.session_backups) {
-        if !put_back(&file, &original, &mut notes)? {
+        if !put_back(&file, &original, forget, &mut notes)? {
             state.session_backups.insert(file, original);
         }
     }
@@ -590,7 +602,10 @@ pub fn restore(paths: &Paths) -> Result<Vec<String>> {
         && fs::read_link(compositor).is_err()
     {
         let target = compositor.parent().context("vrcompositor has no parent")?.join(&wrap.link_target);
-        if !compositor.exists() && !wrap.real_path.exists() {
+        let missing = !compositor.exists() && !wrap.real_path.exists();
+        // forget drops the wrap only with its directory: SteamVR files missing from one that exists stay for a retry
+        if missing && forget && dir_gone(compositor, true, &mut notes) {
+        } else if missing {
             rewrap_left = true;
             notes.push(format!(
                 "left vrcompositor unwrapped: neither {} nor {} exists; SteamVR's drive is not mounted, or SteamVR moved or was removed",
@@ -637,7 +652,7 @@ pub fn restore(paths: &Paths) -> Result<Vec<String>> {
 fn left_message(file: &Path) -> String {
     format!(
         "{0} holds only what vr_restore could not put back, a directory being gone; mount the drive and run vr_restore \
-         again, or delete {0} to give up on those files",
+         again, or, if that install was removed on purpose, run vr_restore {{forget_missing: true}} to drop those files",
         file.display()
     )
 }

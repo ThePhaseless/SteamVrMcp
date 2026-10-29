@@ -989,14 +989,14 @@ impl Stack {
     }
 
     /// Holds `starting` and `restarting` throughout, so no vr_start snapshots or prepares while restore.json goes away.
-    pub fn restore(&self) -> Result<RestoreReport> {
+    pub fn restore(&self, forget_missing: bool) -> Result<RestoreReport> {
         let Some(_starting) = self.starting.try_lock() else { bail!("vr_start is running; run vr_stop first") };
         let Some(_restarting) = self.restarting.try_lock() else { bail!("SteamVR is stopping or restarting") };
         if self.state.lock().managing {
             bail!("a vr_start session runs; run vr_stop first");
         }
         restore_guard(&self.vr.alive())?; // the Stack's VrProcs: a unit test never sees the user's SteamVR
-        let notes = setup::restore(&self.paths())?;
+        let notes = setup::restore(&self.paths(), forget_missing)?;
         Ok(self.finish_restore(notes))
     }
 
@@ -2722,13 +2722,13 @@ mod tests {
     fn vr_restore_refuses_while_a_start_restart_or_session_runs() {
         let stack = test_stack();
         let starting = stack.starting.lock();
-        assert_eq!(stack.restore().unwrap_err().to_string(), "vr_start is running; run vr_stop first");
+        assert_eq!(stack.restore(false).unwrap_err().to_string(), "vr_start is running; run vr_stop first");
         drop(starting);
         let restarting = stack.restarting.lock();
-        assert_eq!(stack.restore().unwrap_err().to_string(), "SteamVR is stopping or restarting");
+        assert_eq!(stack.restore(false).unwrap_err().to_string(), "SteamVR is stopping or restarting");
         drop(restarting);
         stack.state.lock().managing = true;
-        assert_eq!(stack.restore().unwrap_err().to_string(), "a vr_start session runs; run vr_stop first");
+        assert_eq!(stack.restore(false).unwrap_err().to_string(), "a vr_start session runs; run vr_stop first");
     }
 
     #[test]

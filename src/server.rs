@@ -60,6 +60,14 @@ struct TrackedStateArgs {
 
 #[derive(Deserialize, rmcp::schemars::JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
+struct RestoreArgs {
+    /// Drop, with a note, each recorded file whose directory is still gone (an install removed on purpose), then delete restore.json. Never drops one whose directory exists.
+    #[serde(default)]
+    forget_missing: bool,
+}
+
+#[derive(Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
 struct ProximityArgs {
     /// true: the headset is worn; false: taken off.
     on_head: bool,
@@ -414,9 +422,9 @@ impl VrServer {
         self.run(|s| json(s.stop_app()?)).await.map_err(message)
     }
 
-    #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs. Returns restored and notes; restored is false when a step was skipped (see notes) and restore.json stays for a retry.")]
-    async fn vr_restore(&self) -> Result<CallToolResult, String> {
-        self.run(|s| json(s.restore()?)).await.map_err(message)
+    #[tool(description = "Put back the SteamVR and ALVR setup from before the first vr_start. Refuses while SteamVR runs. Returns restored and notes; restored is false when a step was skipped (see notes) and restore.json stays for a retry. A file whose directory is gone is skipped: mount its drive and run vr_restore again, or, if that install was removed on purpose, run it with forget_missing true to drop those files and finish.")]
+    async fn vr_restore(&self, Parameters(args): Parameters<RestoreArgs>) -> Result<CallToolResult, String> {
+        self.run(move |s| json(s.restore(args.forget_missing)?)).await.map_err(message)
     }
 }
 

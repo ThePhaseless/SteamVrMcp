@@ -108,7 +108,7 @@ fn live_prepare_restore_round_trip() {
     }
 
     // restore even when a check above failed, so the machine is never left switched
-    let restored = restore(&paths);
+    let restored = restore(&paths, false);
     assert!(problems.is_empty(), "{problems:?}");
     restored.unwrap();
     assert_eq!(Snap::take(&paths), before);
@@ -197,7 +197,7 @@ fn start_streams_and_stop_cleans(steam_was_running: bool) {
 
     // stop and restore even when a check failed, so the machine is never left switched
     let stopped = s.stop();
-    let restored = restore(&paths);
+    let restored = restore(&paths, false);
     if let Err(p) = checks {
         panic::resume_unwind(p);
     }
@@ -885,7 +885,7 @@ fn stop_and_restore() -> Result<(), String> {
     println!("{stopped:?}");
     assert!(stopped.remaining_processes.is_empty(), "{stopped:?}");
     if paths.restore_file().exists() {
-        restore(&paths).unwrap();
+        restore(&paths, false).unwrap();
     }
     assert!(!paths.restore_file().exists());
     Ok(())
