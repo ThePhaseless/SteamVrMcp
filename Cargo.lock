@@ -3,6 +3,40 @@
 version = 4
 
 [[package]]
+name = "SteamVrMcp"
+version = "0.1.0"
+dependencies = [
+ "alvr_audio",
+ "alvr_client_core",
+ "alvr_common",
+ "alvr_events",
+ "alvr_filesystem",
+ "alvr_packets",
+ "alvr_server_io",
+ "alvr_session",
+ "alvr_system_info",
+ "ash",
+ "base64",
+ "bindgen",
+ "chrono",
+ "dirs",
+ "glob",
+ "libc",
+ "libloading 0.8.9",
+ "openh264",
+ "openxr",
+ "pipewire",
+ "png",
+ "regex",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tungstenite",
+]
+
+[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2858,40 +2892,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "steamvr-mcp"
-version = "0.1.0"
-dependencies = [
- "alvr_audio",
- "alvr_client_core",
- "alvr_common",
- "alvr_events",
- "alvr_filesystem",
- "alvr_packets",
- "alvr_server_io",
- "alvr_session",
- "alvr_system_info",
- "ash",
- "base64",
- "bindgen",
- "chrono",
- "dirs",
- "glob",
- "libc",
- "libloading 0.8.9",
- "openh264",
- "openxr",
- "pipewire",
- "png",
- "regex",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tungstenite",
-]
 
 [[package]]
 name = "strsim"
