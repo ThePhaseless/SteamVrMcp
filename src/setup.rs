@@ -173,22 +173,26 @@ fn put_file(path: &Path, state: &FileState) -> Result<()> {
     }
 }
 
-/// True, with a note, when `path`'s directory no longer exists: its drive is not mounted, or the install moved or was
-/// removed. The note says the entry is forgotten when `forget`.
-fn dir_gone(path: &Path, forget: bool, notes: &mut Vec<String>) -> bool {
-    let gone = path.parent().is_some_and(|d| !d.exists());
-    if gone {
-        let what = if forget { "forgot" } else { "left unrestored" };
-        notes.push(format!("{what} {}: its directory is gone", path.display()));
-    }
-    gone
+/// None when `path`'s directory is there, so its entry can be put back. Otherwise Some, with a note: Some(true) drops
+/// the entry, only with `forget` and the directory known gone (its drive not mounted, or the install moved or was
+/// removed); Some(false) keeps it for a retry.
+fn skipped(path: &Path, forget: bool, notes: &mut Vec<String>) -> Option<bool> {
+    let dir = path.parent()?;
+    let (dropped, why) = match dir.try_exists() {
+        Ok(true) => return None,
+        Ok(false) => (forget, "its directory is gone".to_owned()),
+        // EACCES, EIO, a dead FUSE or NFS mount: maybe still there, so never forgotten
+        Err(e) => (false, format!("cannot check its directory: {e}")),
+    };
+    let what = if dropped { "forgot" } else { "left unrestored" };
+    notes.push(format!("{what} {}: {why}", path.display()));
+    Some(dropped)
 }
 
-/// put_file, unless `path`'s directory is gone. True when done with the entry (put back, or gone and `forget`);
-/// false keeps it for a retry.
+/// put_file, unless `skipped`. True when done with the entry (put back, or dropped); false keeps it for a retry.
 fn put_back(path: &Path, state: &FileState, forget: bool, notes: &mut Vec<String>) -> Result<bool> {
-    if dir_gone(path, forget, notes) {
-        return Ok(forget);
+    if let Some(dropped) = skipped(path, forget, notes) {
+        return Ok(dropped);
     }
     put_file(path, state)?;
     Ok(true)
@@ -540,7 +544,8 @@ pub fn prepare(paths: &Paths, values: &[PathValuePair], hostname: &str) -> Resul
 pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
     let mut state = read_state(paths)?;
     let at = restore_paths(paths, &state)?;
-    if !state.restoring || state.paths.is_none() {
+    let detected = state.paths.is_none();
+    if !state.restoring || detected {
         state.restoring = true;
         // an old restore.json keeps the paths found now, so a retry never depends on detecting them again
         state.paths.get_or_insert_with(|| at.clone());
@@ -554,8 +559,17 @@ pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
         notes.push(format!("left openvrpaths.vrpath as it is and kept restore.json; fix the file, then run vr_restore again: {e:#}"));
     }
 
-    // restore.json is kept whole then, so nothing would be forgotten
-    let forget = forget_missing && drivers_back.is_ok();
+    // a torn openvrpaths.vrpath keeps restore.json whole, so nothing would be forgotten
+    let forget = forget_missing && drivers_back.is_ok() && !detected;
+    if forget_missing && detected {
+        // detected paths may come from a stale config.toml override, so a gone directory may just be a wrong path
+        notes.push(
+            "ignored forget_missing: this restore.json recorded no paths, so restore used the ones detected now \
+             (config.toml overrides included) and recorded them; if a path in these notes is wrong, fix config.toml; \
+             if they are right, run vr_restore {forget_missing: true} again"
+                .into(),
+        );
+    }
 
     // each step clears what it put back, so a partial restore.json holds only what was skipped
     if let Some(original) = &state.vrsettings_file {
@@ -563,8 +577,8 @@ pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
             state.vrsettings_file = None;
         }
     } else if !state.vrsettings.is_empty() {
-        let gone = dir_gone(&at.vrsettings, forget, &mut notes);
-        if !gone {
+        let skip = skipped(&at.vrsettings, forget, &mut notes);
+        if skip.is_none() {
             let mut settings = read_json(&at.vrsettings)?;
             for (name, original) in &state.vrsettings {
                 let (section, key) = name.split_once('/').context("bad vrsettings key in restore.json")?;
@@ -572,7 +586,7 @@ pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
             }
             write_json(&at.vrsettings, &settings)?;
         }
-        if !gone || forget {
+        if skip != Some(false) {
             state.vrsettings.clear();
         }
     }
@@ -583,10 +597,10 @@ pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
         state.session = None;
     }
     for file in std::mem::take(&mut state.created_files) {
-        if !dir_gone(&file, forget, &mut notes) {
-            remove_file(&file)?;
-        } else if !forget {
-            state.created_files.push(file);
+        match skipped(&file, forget, &mut notes) {
+            None => remove_file(&file)?,
+            Some(true) => (),
+            Some(false) => state.created_files.push(file),
         }
     }
     for (file, original) in std::mem::take(&mut state.session_backups) {
@@ -602,27 +616,36 @@ pub fn restore(paths: &Paths, forget_missing: bool) -> Result<Vec<String>> {
         && fs::read_link(compositor).is_err()
     {
         let target = compositor.parent().context("vrcompositor has no parent")?.join(&wrap.link_target);
-        let missing = !compositor.exists() && !wrap.real_path.exists();
-        // forget drops the wrap only with its directory: SteamVR files missing from one that exists stay for a retry
-        if missing && forget && dir_gone(compositor, true, &mut notes) {
-        } else if missing {
-            rewrap_left = true;
-            notes.push(format!(
-                "left vrcompositor unwrapped: neither {} nor {} exists; SteamVR's drive is not mounted, or SteamVR moved or was removed",
-                compositor.display(),
-                wrap.real_path.display()
-            ));
-        } else if !target.exists() {
-            notes.push(format!("left Valve's vrcompositor in place: the wrapper it linked to, {}, is gone", target.display()));
-        } else {
-            // a retry after a crash finds Valve's binary already moved back
-            if !wrap.real_path.exists() {
-                fs::rename(compositor, &wrap.real_path).with_context(|| format!("{} -> {}", compositor.display(), wrap.real_path.display()))?;
+        let neither = format!("neither {} nor {} exists", compositor.display(), wrap.real_path.display());
+        // try_exists: a stat error is not "gone"
+        match (compositor.try_exists(), wrap.real_path.try_exists()) {
+            // nothing to rewrap, whether or not bin/linux64 is there
+            (Ok(false), Ok(false)) if forget => notes.push(format!("forgot the vrcompositor wrap: Valve's binary is gone ({neither})")),
+            (Ok(false), Ok(false)) => {
+                rewrap_left = true;
+                let why = match compositor.parent().is_some_and(|d| d.exists()) {
+                    true => "verify SteamVR's files in Steam, then run vr_restore again (or with forget_missing true)",
+                    false => "SteamVR's drive is not mounted, or SteamVR moved or was removed",
+                };
+                notes.push(format!("left vrcompositor unwrapped: {neither}; {why}"));
             }
-            let tmp = compositor.with_file_name("vrcompositor.tmp");
-            remove_file(&tmp)?;
-            std::os::unix::fs::symlink(&wrap.link_target, &tmp).with_context(|| tmp.display().to_string())?;
-            fs::rename(&tmp, compositor).with_context(|| compositor.display().to_string())?;
+            (Err(e), _) | (_, Err(e)) => {
+                rewrap_left = true;
+                notes.push(format!("left vrcompositor unwrapped: cannot check {}: {e}", compositor.display()));
+            }
+            _ if !target.exists() => {
+                notes.push(format!("left Valve's vrcompositor in place: the wrapper it linked to, {}, is gone", target.display()))
+            }
+            _ => {
+                // a retry after a crash finds Valve's binary already moved back
+                if !wrap.real_path.exists() {
+                    fs::rename(compositor, &wrap.real_path).with_context(|| format!("{} -> {}", compositor.display(), wrap.real_path.display()))?;
+                }
+                let tmp = compositor.with_file_name("vrcompositor.tmp");
+                remove_file(&tmp)?;
+                std::os::unix::fs::symlink(&wrap.link_target, &tmp).with_context(|| tmp.display().to_string())?;
+                fs::rename(&tmp, compositor).with_context(|| compositor.display().to_string())?;
+            }
         }
     }
     if !rewrap_left {
