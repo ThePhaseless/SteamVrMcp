@@ -46,25 +46,31 @@ fn dashboard_child_role() {
 static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 
 /// Reports a live test that cannot run on this machine as it is, which libtest still counts as ok.
-/// With VR_TEST_REQUIRE_ALL=1 it fails instead, so a run that exercised nothing is not green; the two
-/// live_start_streams tests need Steam closed and running, so run those two in separate runs.
+/// With VR_TEST_REQUIRE_ALL=1 it fails instead, so a run that exercised nothing is not green.
 fn skip(why: &str) {
-    skip_or_fail(why, std::env::var_os("VR_TEST_REQUIRE_ALL").is_some_and(|v| v == "1"));
+    skip_or_fail(why, std::env::var_os("VR_TEST_REQUIRE_ALL").is_some_and(|v| v == "1"), &SKIPPED);
 }
 
-fn skip_or_fail(why: &str, require_all: bool) {
+/// A skip VR_TEST_REQUIRE_ALL=1 lets pass: the two live_start_streams tests need Steam closed and
+/// running, so every run skips one of them (the first runs when Steam was closed, else the second).
+fn skip_steam_state(why: &str) {
+    skip_or_fail(why, false, &SKIPPED);
+}
+
+fn skip_or_fail(why: &str, require_all: bool, skipped: &AtomicUsize) {
     assert!(!require_all, "not run, and VR_TEST_REQUIRE_ALL=1: {why}");
-    let n = SKIPPED.fetch_add(1, Ordering::SeqCst) + 1;
+    let n = skipped.fetch_add(1, Ordering::SeqCst) + 1;
     // straight to stderr: libtest hides eprintln! of a passing test
     let _ = writeln!(std::io::stderr(), "skipped ({n} live tests so far): {why}");
 }
 
 #[test]
 fn skips_count_and_fail_when_all_are_required() {
-    let before = SKIPPED.load(Ordering::SeqCst);
-    skip_or_fail("a reason", false);
-    assert_eq!(SKIPPED.load(Ordering::SeqCst), before + 1);
-    let failed = panic::catch_unwind(|| skip_or_fail("a reason", true)).unwrap_err();
+    // its own counter: live_zz_stop_and_restore prints SKIPPED, which counts live tests only
+    let skipped = AtomicUsize::new(0);
+    skip_or_fail("a reason", false, &skipped);
+    assert_eq!(skipped.load(Ordering::SeqCst), 1);
+    let failed = panic::catch_unwind(|| skip_or_fail("a reason", true, &skipped)).unwrap_err();
     assert!(failed.downcast_ref::<String>().is_some_and(|m| m.contains("VR_TEST_REQUIRE_ALL=1: a reason")));
 }
 
@@ -73,6 +79,9 @@ fn skips_count_and_fail_when_all_are_required() {
 #[test]
 #[ignore]
 fn live_prepare_restore_round_trip() {
+    if let Err(e) = stop_and_restore() {
+        return skip(&e);
+    }
     if steamvr::is_steamvr_running() {
         return skip("vrserver is running; close SteamVR (or run live_zz_stop_and_restore) first");
     }
@@ -116,8 +125,11 @@ fn live_prepare_restore_round_trip() {
 #[test]
 #[ignore]
 fn live_start_streams_and_stop_cleans() {
+    if let Err(e) = stop_and_restore() {
+        return skip(&e);
+    }
     if steamvr::is_steam_running() {
-        return skip("Steam is running; close it first");
+        return skip_steam_state("Steam is running; close it first");
     }
     start_streams_and_stop_cleans(false);
 }
@@ -127,8 +139,14 @@ fn live_start_streams_and_stop_cleans() {
 #[test]
 #[ignore]
 fn live_start_streams_and_stop_cleans_with_steam_running() {
-    if !steamvr::is_steam_running() || steamvr::is_steamvr_running() {
-        return skip("needs Steam running and SteamVR closed");
+    if let Err(e) = stop_and_restore() {
+        return skip(&e);
+    }
+    if !steamvr::is_steam_running() {
+        return skip_steam_state("needs Steam running");
+    }
+    if steamvr::is_steamvr_running() {
+        return skip("needs SteamVR closed");
     }
     start_streams_and_stop_cleans(true);
     assert!(steamvr::is_steam_running(), "the user's Steam was closed");
@@ -856,12 +874,19 @@ fn live_flavour_switch() {
 #[ignore]
 fn live_zz_stop_and_restore() {
     let _ = writeln!(std::io::stderr(), "live run: {} live tests skipped (VR_TEST_REQUIRE_ALL=1 fails them instead)", SKIPPED.load(Ordering::SeqCst));
+    stop_and_restore().unwrap();
+}
+
+/// Stops the shared stack (or a SteamVR left by an earlier process) and restores SteamVR's files, so the
+/// tests that need SteamVR closed also run after the streaming ones. Err when vr_stop refuses: SteamVR runs without ALVR.
+fn stop_and_restore() -> Result<(), String> {
     let paths = Paths::detect(&Config::load().unwrap());
-    let stopped = shared_stack().stop().unwrap();
+    let stopped = shared_stack().stop().map_err(|e| format!("{e:#}"))?;
     println!("{stopped:?}");
     assert!(stopped.remaining_processes.is_empty(), "{stopped:?}");
     if paths.restore_file().exists() {
         restore(&paths).unwrap();
     }
     assert!(!paths.restore_file().exists());
+    Ok(())
 }
