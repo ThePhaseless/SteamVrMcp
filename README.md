@@ -13,7 +13,7 @@ The server joins a stock ALVR 21 streamer as a headset client over loopback. Ste
 - An AMD or Intel GPU for SteamVR. ALVR 21 direct mode is broken on NVIDIA upstream (ALVR #3421), so a machine with only NVIDIA GPUs is refused. A hybrid laptop works if SteamVR runs on the AMD or Intel GPU (see [Hybrid GPUs](#hybrid-gpus)).
 - VA-API H.264 encoding on that GPU (Mesa's `radeonsi` or Intel's media driver).
 - A default audio input. ALVR's client opens it at every connection.
-- Optional: PipeWire for `record_audio` and `audio_level`, and xdg-desktop-portal with your desktop's backend for desktop screenshots.
+- Optional: PipeWire for `record_audio` and `audio_level`.
 
 `vr_status` lists every startup check with its result and the fix.
 
@@ -203,7 +203,7 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 
 | Tool | What it does |
 | --- | --- |
-| `screenshot` | PNG from `headset` (what the headset receives, the default), `compositor` (SteamVR's uncompressed scene textures) or `desktop` (the whole desktop through xdg-desktop-portal). |
+| `screenshot` | PNG from `headset` (what the headset receives, the default) or `compositor` (SteamVR's uncompressed scene textures). There is no desktop or window source. |
 | `get_tracked_state` | What SteamVR tracks: devices, poses, velocities, skeletons and curls, the scene app. |
 | `get_haptics` | Haptic events the app sent. |
 | `get_frame_timing` | SteamVR compositor frame timings and ALVR latency statistics over a window. |
@@ -225,7 +225,6 @@ Each tool's full description, with every argument and limit, is in its MCP schem
 - SteamVR reserves the Index system click for its dashboard. System touch reaches apps.
 - SteamVR gives background OpenVR readers no input until a scene app (SteamVR Home counts) runs, so `get_tracked_state` skeletons read inactive right after `vr_start`.
 - `launch_app` with `via: "proton"` takes `exe` relative to the install dir (it must stay inside it) and refuses `STEAM_COMPAT_*`, `SteamAppId` and `SteamGameId` in `env`. The game's Steam launch options do not apply and Steam shows no dialogs. The launcher's output goes to the `run_log` it returns. Like the Steam mode, it needs a streaming headset.
-- The first desktop screenshot can bring up xdg-desktop-portal's permission prompt. Approve it once. If nobody answers, the call times out and cancels the request.
 - `record_audio` and `audio_level` hear the whole default output, other apps included. WAV files stay in the MCP's private runtime dir until logout.
 
 ## What it changes on your system
@@ -267,7 +266,7 @@ Several MCP processes (several agent sessions) on one machine share one SteamVR 
 
 - Any tool that changes something takes the lease by itself, for 30 minutes unless `vr_acquire` sets `ttl_s` (600 to 14400 s), and renews it once half is left. `vr_acquire` is only needed to choose the name or the ttl.
 - While another live MCP holds the lease, the mutating tools disappear from the list and answer `not ready: SteamVR is leased to ...`.
-- Read-only tools stay open: `vr_status`, `get_logs`, `get_haptics`, `get_tracked_state`, `screenshot`, `read_app_log`, `wait_for_log`, `get_frame_timing`, `record_audio`, `audio_level`, `vr_acquire` and `vr_release`. An observer has no headset of its own, so for it `get_frame_timing` is unavailable and `screenshot` takes only the `compositor` and `desktop` sources.
+- Read-only tools stay open: `vr_status`, `get_logs`, `get_haptics`, `get_tracked_state`, `screenshot`, `read_app_log`, `wait_for_log`, `get_frame_timing`, `record_audio`, `audio_level`, `vr_acquire` and `vr_release`. An observer has no headset of its own, so for it `get_haptics` and `get_frame_timing` are unavailable and `screenshot` takes only the `compositor` source.
 - The holder's MCP keeps renewing the lease while it manages a session. The lease ends at `vr_release`, at a `vr_stop` that leaves no SteamVR process behind, at a successful `vr_restore`, or when the holder exits. A lease whose MCP died is free at once; one whose MCP no longer manages a session can be taken over once it expires.
 - `vr_status` shows the owner and whether it is this MCP.
 
@@ -299,7 +298,6 @@ Start with `vr_status`: each failed check names its reason and the fix.
 | `h264_encoder` | No VA-API H.264 encoder on that GPU | Install VA-API drivers with H.264 encoding. |
 | `openvr_client` | SteamVR's `libopenvr_api.so` does not load | Reinstall SteamVR. |
 | `screenshot_decoder` | OpenH264 fails to start | Rebuild. |
-| `desktop_portal` | No xdg-desktop-portal on the session bus | Install it with your desktop's backend (`-kde`, `-gnome`, `-gtk`, `-wlr`). |
 | `audio_capture` | No PipeWire | Run PipeWire for the session. |
 
 Common errors at run time:
@@ -321,7 +319,7 @@ Common errors at run time:
 - ALVR 21 registers the left hand tracker's buttons from the right-hand map (`Controller.cpp:112-117`).
 - ALVR 21 has one flag per controller for connected and tracked, so a disconnected controller is also untracked.
 - Audio tools capture the whole default output, not one game.
-- Not covered: Monado, WiVRn, an OpenXR API layer, Windows, Flatpak Steam, headless or CI use, Steam Frame controllers, desktop window capture, eye, face and body tracking, and more than one virtual headset.
+- Not covered: Monado, WiVRn, an OpenXR API layer, Windows, Flatpak Steam, headless or CI use, Steam Frame controllers, desktop or window capture, eye, face and body tracking, and more than one virtual headset.
 
 ## Development
 
@@ -354,8 +352,7 @@ The live tests leave SteamVR running for the next one. Only `live_zz_stop_and_re
 7. Frame timing: with a game in VR, `get_frame_timing {window_s: 5}` returns a non-null `compositor` with `fps` near the stream fps, a non-null `alvr`, and empty `notes`.
 8. Compositor screenshot: `screenshot {source: "compositor", eye: "left"}` returns a PNG at the app's eye render size, sharper than `source: "headset"`.
 9. Proton launch: `launch_app {app_id, via: "proton", exe: "<game exe>", args: ["<arg>"], env: {"PROTON_LOG": "1"}}` reaches a running scene without a Steam dialog. The game sees the arg, and `run_log` has Proton's output. `stop_app` returns, and afterwards `/proc` has no process with that `STEAM_COMPAT_DATA_PATH` and app id. Launch again, then `vr_stop`: its `stopped_app` names the game, and a second Proton launch of the same app reaches its scene. Run it once with Proton Experimental and once with a custom compatibility tool.
-10. Desktop screenshot: `screenshot {source: "desktop"}` returns the current desktop. A permission prompt may appear on the first call; the second call shows none.
-11. Audio: play a test tone or the game's menu music. `audio_level {window_s: 1}` reads above -60 dBFS on both channels. Turn the head 90 degrees with `move_head {yaw: 90}`, and the L/R balance of a spatialized sound shifts. `record_audio {seconds: 3}` writes a WAV that plays back the same sound. Repeat on a mono and a 5.1 default sink.
+10. Audio: play a test tone or the game's menu music. `audio_level {window_s: 1}` reads above -60 dBFS on both channels. Turn the head 90 degrees with `move_head {yaw: 90}`, and the L/R balance of a spatialized sound shifts. `record_audio {seconds: 3}` writes a WAV that plays back the same sound. Repeat on a mono and a 5.1 default sink.
 
 ## Third-party files
 
