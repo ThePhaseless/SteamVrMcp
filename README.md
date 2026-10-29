@@ -229,21 +229,34 @@ Each tool's full description, with every argument and limit, is in its MCP schem
 
 ## What it changes on your system
 
-The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/vr-test-mcp/restore.json` (usually `~/.local/state/vr-test-mcp/`). Later starts never overwrite it. The snapshot holds:
+The first `vr_start` saves a snapshot to `$XDG_STATE_HOME/vr-test-mcp/restore.json` (usually `~/.local/state/vr-test-mcp/`). The snapshot holds:
 
+- the absolute paths of `steamvr.vrsettings`, the ALVR session file, `vrcompositor` and the ALVR driver, as found at that start;
 - the `external_drivers` list from `openvrpaths.vrpath`;
 - the whole `steamvr.vrsettings`;
-- the ALVR session file, and any file ALVR creates next to it;
+- the ALVR session file and the `session_old.json` and `session_invalid.json` next to it, which ALVR overwrites, plus the names of files that ALVR creates in that directory while the MCP writes its session;
 - the `vrcompositor` wrapper symlink an older ALVR left, if SteamVR had one.
 
-Then `vr_start`:
+Later starts keep the snapshot, with one exception. When a cold `vr_start` finds that SteamVR carries none of the MCP's changes (`forcedDriver` is not `alvr_server`, the recorded driver is not registered, and no restore is under way), you have put SteamVR back by hand. It then retakes only the driver list and `steamvr.vrsettings`, keeps the session files and the compositor entry as first recorded, and notes `restore.json predated a SteamVR setup without the MCP's changes; took a fresh snapshot`.
 
-- registers the pinned ALVR driver in place of any other ALVR driver;
+`vr_start` refuses before it changes anything when:
+
+- `restore.json` does not parse: `<file> does not parse; inspect it, put back by hand what you need from it, then delete it`;
+- `restore.json` is partial (see [vr_restore](#vr_restore));
+- a recorded path differs from what the config gives now, for example after changing `streamer_dir`, `steam_dir` or `steamvr_dir`: `restore.json has <what> at <then>, but the config now gives <now>; run vr_restore first (it restores to the recorded paths)`.
+
+A cold `vr_start` then:
+
+- registers the pinned ALVR driver in `openvrpaths.vrpath`, dropping any other driver whose path contains `alvr`. The other drivers keep their order, and ALVR's goes last;
 - sets `forcedDriver` to `alvr_server` in `steamvr.vrsettings`;
-- clears `blocked_by_safe_mode` for the ALVR driver, and SteamVR's safe-mode blocks on other drivers before each cold start (SteamVR 2.18.4 otherwise stops the launch on a desktop dialog; `vr_status` lists the ones present as `blocked_drivers`);
+- clears `blocked_by_safe_mode` for the ALVR driver, and SteamVR's safe-mode blocks on other drivers (SteamVR 2.18.4 otherwise stops the launch on a desktop dialog; `vr_status` lists the ones present as `blocked_drivers`);
 - unwraps the `vrcompositor` wrapper an older ALVR left, if there is one;
 - writes the MCP's ALVR settings, with the headset as a trusted `127.0.0.1` client;
 - starts Steam with `steam.env` if it was not running.
+
+When SteamVR already runs with ALVR, `vr_start` adopts it. It still takes the snapshot, with the refusals above, but it changes no files; the settings and the client go to ALVR through its API. If ALVR's session file shows the previous client still connected, ALVR is stuck on a dead client and would not answer, so `vr_start` restarts SteamVR first.
+
+The MCP writes `restore.json`, `steamvr.vrsettings`, `openvrpaths.vrpath` and the files `vr_restore` puts back through a temp file, fsync and rename, so a crash leaves the old file or the new one, never a torn one. The new file keeps the old file's permissions. A file without the owner write bit is refused: some users make `openvrpaths.vrpath` read-only so SteamVR cannot reset the OpenXR runtime, and the MCP will not silently undo that. The error reads `<file> is read-only, perhaps to keep SteamVR from changing it; chmod u+w it, run this again, then make it read-only again`.
 
 It also keeps its own files:
 
@@ -252,13 +265,24 @@ It also keeps its own files:
 
 ### vr_stop
 
-`vr_stop` ends a game that `launch_app via proton` started, disconnects the headset, shuts SteamVR down through ALVR (with signals if ALVR hangs, which takes about 30 s), clears the safe-mode blocks that a signalled stop leaves, and closes Steam if `vr_start` started it. It stops only a SteamVR that runs ALVR; close one you started without ALVR yourself.
+`vr_stop` ends a game that `launch_app via proton` started and disconnects the headset. It then shuts SteamVR down through ALVR, and if SteamVR is still up after 30 s it sends SIGTERM and then SIGKILL. Once every SteamVR process is gone it clears the safe-mode blocks SteamVR may have set, closes Steam if `vr_start` started it, and releases the lease. It stops only a SteamVR that runs ALVR; close one you started without ALVR yourself.
+
+Tool calls run concurrently. A `vr_stop` that arrives while a `vr_start` or a SteamVR restart runs waits for it to give up. A start that already launched SteamVR first waits up to 20 s for Steam to hand the launch over, so `vr_stop` finds that SteamVR and stops it too. Meanwhile `vr_start` answers `not ready: vr_stop is running`.
 
 It does not put your setup back. After `vr_stop`, SteamVR still has the ALVR driver registered and forced, and ALVR keeps the MCP's settings, so a real headset will not work until you run `vr_restore`.
 
 ### vr_restore
 
-`vr_restore` writes back everything in `restore.json` and then deletes it: the driver list, the whole `steamvr.vrsettings`, the ALVR session file, and the `vrcompositor` wrapper. It removes files ALVR created. It refuses while SteamVR runs, so run `vr_stop` first. Anything you changed in SteamVR's settings between the first `vr_start` and `vr_restore` is lost. Because the state is a file, a crashed MCP can still restore. The next `vr_start` takes a fresh snapshot.
+`vr_restore` writes back everything in `restore.json` to the paths recorded there: the driver list, the whole `steamvr.vrsettings`, the ALVR session files and the `vrcompositor` wrapper. It removes the files ALVR created. Anything you changed in SteamVR's settings, the driver list or the ALVR session between the first `vr_start` and `vr_restore` is lost. It returns `restored` and `notes`. When everything is back it deletes `restore.json`, releases the lease and reports `restored: true`, and the next `vr_start` takes a fresh snapshot.
+
+It reports `restored: false` and keeps both `restore.json` and the lease when:
+
+- `openvrpaths.vrpath` cannot be read or written. The other steps still run, and a note says what failed. Fix the file and run `vr_restore` again.
+- A recorded file's directory is gone, for example a SteamVR library or the streamer on a drive that is not mounted. It puts back the rest, notes `left <file> unrestored: its directory is gone`, and rewrites `restore.json` as partial, holding only the skipped entries. `vr_start` refuses while it exists. Mount the drive and run `vr_restore` again, which retries only those entries. If you removed the install on purpose, run `vr_restore {forget_missing: true}` instead: it restores what it can, drops each entry whose directory is gone with a note, deletes `restore.json` and reports `restored: true`.
+
+It refuses while any SteamVR process runs (`vrserver`, `vrcompositor`, `vrmonitor`, `vrdashboard`, `vrwebhelper`, `vrstartup`, `steamtours`), because they can still rewrite `steamvr.vrsettings`; the message names them. It also refuses while a `vr_start`, `vr_stop` or SteamVR restart runs, or while this MCP runs a session. Run `vr_stop` first.
+
+`restore.json` is marked as restoring before anything changes, and every step can run again, so a restore that crashed or failed halfway finishes on the next `vr_restore`. Because the state is a file, a crashed MCP can still restore.
 
 ## Sharing SteamVR between agents
 
