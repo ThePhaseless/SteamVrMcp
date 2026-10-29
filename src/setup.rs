@@ -140,12 +140,22 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
 }
 
 /// Temp file in the same dir, fsync, rename (as lease.rs does): a crash leaves the old file or the new one, never a torn one.
+/// The new file keeps the old one's mode; a read-only one is refused, as a plain write would fail on it.
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     // a symlinked file keeps its link: the target is replaced
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let perms = fs::metadata(&path).ok().map(|m| m.permissions());
+    if perms.as_ref().is_some_and(|p| p.mode() & 0o200 == 0) {
+        // users chmod 444 openvrpaths.vrpath so SteamVR cannot reset `runtime`
+        bail!("{} is read-only, perhaps to keep SteamVR from changing it; chmod u+w it, run this again, then make it read-only again", path.display());
+    }
     let name = path.file_name().with_context(|| path.display().to_string())?.to_string_lossy();
     let tmp = path.with_file_name(format!("{name}.tmp"));
     let mut file = fs::File::create(&tmp).with_context(|| tmp.display().to_string())?;
+    if let Some(perms) = perms {
+        file.set_permissions(perms).with_context(|| tmp.display().to_string())?;
+    }
     file.write_all(contents).and_then(|()| file.sync_all()).with_context(|| tmp.display().to_string())?;
     fs::rename(&tmp, &path).with_context(|| path.display().to_string())?;
     // so the rename itself survives a power loss
@@ -681,6 +691,27 @@ mod tests {
         assert_eq!(v["driver_alvr_server"]["blocked_by_safe_mode"], false);
         assert!(!unblock_safe_mode(&path).unwrap());
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_refuses_a_read_only_target_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vr-test-mcp-atomic-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // chmod 444 keeps SteamVR from resetting `runtime` in openvrpaths.vrpath
+        let locked = dir.join("locked");
+        fs::write(&locked, "mine").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+        let e = format!("{:#}", write_atomic(&locked, b"new").unwrap_err());
+        assert!(e.contains(&locked.display().to_string()) && e.contains("read-only"), "{e}");
+        assert_eq!((fs::read_to_string(&locked).unwrap(), mode(&locked)), ("mine".into(), 0o444));
+        let private = dir.join("private");
+        fs::write(&private, "mine").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomic(&private, b"new").unwrap();
+        assert_eq!((fs::read_to_string(&private).unwrap(), mode(&private)), ("new".into(), 0o600));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
