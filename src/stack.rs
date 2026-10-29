@@ -5,7 +5,6 @@ use crate::{
     checks::{self, Check, Readiness},
     clock,
     config::{Config, Paths},
-    desktop,
     headset::{self, Eye, HapticEvent, Headset, HeadsetStatus, Screenshot, Source},
     lease::{self, Lease, Owner},
     openvr::{self, OpenVr},
@@ -140,23 +139,15 @@ fn unique_stem(wall: SystemTime, pid: u32) -> String {
     format!("vr-{ms}-{pid}")
 }
 
-fn desktop_screenshot(eye: Eye) -> Result<Screenshot> {
-    if eye != Eye::Both {
-        bail!("source desktop is the whole screen: eye must be both");
-    }
-    let t_s = clock::now_s();
-    let png = desktop::screenshot()?;
-    let info = png::Decoder::new(std::io::Cursor::new(&png)).read_info()?.info().clone();
-    Ok(Screenshot { png, width: info.width, height: info.height, source: Source::Desktop.name(), frame_timestamp_ms: None, t_s, at: clock::at(t_s) })
-}
-
 /// The file's bytes once its size is non-zero and the same on two polls 100 ms apart: vrserver writes it on its own schedule.
-/// Fails at once when `exited` names a SteamVR process gone, or when vrcompositor's log since the request (`compositor_log`) shows it failed.
+/// Fails at once when `exited` names a SteamVR process gone, or when vrcompositor's log since the request (`compositor_log`) shows
+/// this request failed; the request is the one for `path`'s stem (`<stem>.png`).
 fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> Option<&'static str>, mut compositor_log: impl FnMut() -> String) -> Result<Vec<u8>> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
     let (mut last, mut gone, mut failed) = (0, None, None);
     let stable = steamvr::wait_for(timeout, || {
         gone = exited();
-        failed = compositor_shot(&compositor_log()).1.map(str::to_owned);
+        failed = compositor_shot(&compositor_log(), stem).1.map(str::to_owned);
         let size = std::fs::metadata(path).map_or(0, |m| m.len());
         gone.is_some() || failed.is_some() || (size > 0 && size == std::mem::replace(&mut last, size))
     });
@@ -167,7 +158,7 @@ fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> 
         bail!("failed: vrcompositor could not capture the scene app's textures ({line}); OpenXR or Proton scene apps may not support compositor screenshots; use source headset");
     }
     if !stable {
-        let why = match compositor_shot(&compositor_log()).0 {
+        let why = match compositor_shot(&compositor_log(), stem).0 {
             true => "vrcompositor logged the request but wrote no file",
             false => "vrcompositor logged no screenshot request; vrserver may not see this directory",
         };
@@ -176,10 +167,15 @@ fn read_when_stable(path: &Path, timeout: Duration, mut exited: impl FnMut() -> 
     std::fs::read(path).with_context(|| path.display().to_string())
 }
 
-/// Whether vrcompositor's log shows a stereo screenshot request, and its `Screenshot: Failed` line if it logged one.
-fn compositor_shot(log: &str) -> (bool, Option<&str>) {
-    let failed = log.lines().find_map(|l| l.find("Screenshot: Failed").map(|i| l[i..].trim_end()));
-    (log.contains("Take stereo screenshot request"), failed)
+/// Whether vrcompositor's log shows the stereo screenshot request for `stem`, and its `Screenshot: Failed` line if it logged one:
+/// one before the next request, since tool calls run concurrently and another request's failure is not this one's.
+fn compositor_shot<'a>(log: &'a str, stem: &str) -> (bool, Option<&'a str>) {
+    const REQUEST: &str = "Take stereo screenshot request";
+    let ours = format!("/{stem}-preview");
+    let mut lines = log.lines().skip_while(|l| !(l.contains(REQUEST) && l.contains(&ours)));
+    let requested = lines.next().is_some();
+    let failed = lines.take_while(|l| !l.contains(REQUEST)).find_map(|l| l.find("Screenshot: Failed").map(|i| l[i..].trim_end()));
+    (requested, failed)
 }
 
 /// True when the session lists `hostname` in any state but Disconnected: ALVR's handshake loop
@@ -464,6 +460,8 @@ const LOG_SOURCES: [&str; 5] = ["alvr", "vrserver", "vrcompositor", "vrmonitor",
 const STEAMVR_LOGS: [&str; 3] = ["vrserver", "vrcompositor", "vrmonitor"];
 /// ALVR events kept, and SteamVR lines read per log.
 const LOGS_KEPT: usize = 1000;
+/// ALVR statistics summaries kept: ALVR sends one every 500 ms, so two of get_frame_timing's longest (60 s) windows.
+const STATS_KEPT: usize = 240;
 
 fn level_name(severity: LogSeverity) -> String {
     format!("{severity:?}").to_lowercase()
@@ -681,6 +679,9 @@ pub struct Stack {
     rig: Arc<Mutex<Rig>>,
     /// The newest LOGS_KEPT ALVR log events the supervisor saw, oldest first. Locked only briefly.
     alvr_logs: Mutex<VecDeque<LogLine>>,
+    /// The newest STATS_KEPT ALVR statistics summaries the supervisor saw, with when, oldest first, for
+    /// get_frame_timing: a stream of its own per call made ALVR log a failed send when it closed. Locked only briefly.
+    alvr_stats: Mutex<VecDeque<(Instant, alvr_events::StatisticsSummary)>>,
     /// The owner name and ttl the lease is taken and renewed with.
     lease: Mutex<(String, Duration)>,
     /// The game log rings from `[app_logs]`; rebuilt when the config reloads. Locked briefly, never while sleeping.
@@ -774,6 +775,7 @@ impl Stack {
             on_change: Mutex::new(None),
             rig: Arc::default(),
             alvr_logs: Mutex::default(),
+            alvr_stats: Mutex::default(),
             lease: Mutex::new((format!("mcp-{}", std::process::id()), lease::DEFAULT_TTL)),
             app_logs: Mutex::new(AppLogs::new(&app_log_patterns)),
             vr,
@@ -1011,7 +1013,6 @@ impl Stack {
     pub fn screenshot(&self, source: Source, eye: Eye) -> Result<Screenshot> {
         match source {
             Source::Compositor => return self.compositor_screenshot(eye),
-            Source::Desktop => return desktop_screenshot(eye),
             Source::Headset => (),
         }
         let grabber = self.state.lock().headset.as_ref().map(Headset::grabber).context("no headset")?;
@@ -1193,24 +1194,10 @@ impl Stack {
             bail!("window_s must be from 0.5 to 60, got {window_s}");
         }
         let mut notes = Vec::new();
-        let mut events = self.api().events().map_err(|e| notes.push(format!("alvr: {e:#}"))).ok();
+        let start = Instant::now();
         let s0 = self.frame_stats().map_err(|e| notes.push(format!("counts: {e:#}")));
-        let (end, mut summaries) = (Instant::now() + Duration::from_secs_f64(window_s), Vec::new());
-        loop {
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            match events.as_mut().map(|e| e.next(left)) {
-                Some(Ok(Some(Event { event_type: EventType::StatisticsSummary(s), .. }))) => summaries.push(s),
-                Some(Ok(_)) => (),
-                Some(Err(e)) => {
-                    notes.push(format!("alvr: {e:#}"));
-                    events = None;
-                }
-                None => std::thread::sleep(left),
-            }
-        }
+        std::thread::sleep(Duration::from_secs_f64(window_s).saturating_sub(start.elapsed()));
+        let summaries = self.stats_since(start);
         let s1 = self.frame_stats().map_err(|e| notes.push(format!("counts: {e:#}")));
         let counts = s0.ok().zip(s1.ok()).map(|(a, b)| {
             serde_json::json!({
@@ -1227,8 +1214,8 @@ impl Stack {
             }
         };
         let alvr = alvr_api::average(&summaries);
-        if alvr.is_none() && events.is_some() {
-            notes.push("alvr: no statistics summary arrived, the headset may not be streaming".to_owned());
+        if alvr.is_none() {
+            notes.push("alvr: no statistics summary arrived, the headset may not be streaming or the MCP's ALVR events stream is down".to_owned());
         }
         let t_s = clock::now_s();
         Ok(serde_json::json!({ "window_s": window_s, "t_s": t_s, "at": clock::at(t_s), "compositor": compositor, "counts": counts, "alvr": alvr, "notes": notes }))
@@ -1951,6 +1938,19 @@ impl Stack {
         ring.push_back(LogLine { t_s, at: clock::at(t_s), t, source: "alvr".into(), level: level_name(entry.severity), text: entry.content });
     }
 
+    fn keep_stats(&self, at: Instant, summary: alvr_events::StatisticsSummary) {
+        let mut ring = self.alvr_stats.lock();
+        if ring.len() == STATS_KEPT {
+            ring.pop_front();
+        }
+        ring.push_back((at, summary));
+    }
+
+    /// The kept statistics summaries that arrived at or after `start`, oldest first.
+    fn stats_since(&self, start: Instant) -> Vec<alvr_events::StatisticsSummary> {
+        self.alvr_stats.lock().iter().filter(|(at, _)| *at >= start).map(|(_, s)| s.clone()).collect()
+    }
+
     /// Replaces the headset with a fresh one and restarts SteamVR so ALVR accepts it.
     pub fn recreate_headset(&self) -> Result<()> {
         // shortcut: ALVR TCP EOF spin (sockets/src/stream_socket/tcp.rs:137-147) leaves the server stuck Disconnecting; drop when fixed upstream
@@ -2224,6 +2224,7 @@ fn supervise(stack: Weak<Stack>) {
             Some(stream) => match stream.next(Duration::from_millis(500)) {
                 Ok(Some(Event { event_type: EventType::ServerRequestsSelfRestart, .. })) => restart = true,
                 Ok(Some(Event { timestamp, event_type: EventType::Log(entry) })) => s.keep_log(timestamp, entry),
+                Ok(Some(Event { event_type: EventType::StatisticsSummary(summary), .. })) => s.keep_stats(Instant::now(), summary),
                 Ok(_) => (),
                 Err(e) => {
                     warn!("ALVR events stream closed: {e:#}");
@@ -2824,13 +2825,6 @@ mod tests {
     }
 
     #[test]
-    fn desktop_takes_both_eyes_only() {
-        for eye in [Eye::Left, Eye::Right] {
-            assert!(test_stack().screenshot(Source::Desktop, eye).unwrap_err().to_string().contains("both"), "{eye:?}");
-        }
-    }
-
-    #[test]
     fn unique_stems_differ_across_restarts() {
         let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
         assert_eq!(unique_stem(at, 7), "vr-1700000000123-7");
@@ -2914,6 +2908,23 @@ mod tests {
     }
 
     #[test]
+    fn frame_timing_reads_the_supervisors_statistics() {
+        let stack = test_stack();
+        let summary = |ms| alvr_events::StatisticsSummary { total_latency_ms: ms, ..Default::default() };
+        let start = Instant::now();
+        let ms = |n| start + Duration::from_millis(n);
+        stack.keep_stats(start - Duration::from_millis(1), summary(1.0));
+        stack.keep_stats(start, summary(2.0));
+        stack.keep_stats(ms(500), summary(3.0));
+        let got: Vec<f32> = stack.stats_since(start).iter().map(|s| s.total_latency_ms).collect();
+        assert_eq!(got, [2.0, 3.0], "only the summaries that arrived in the window");
+        for _ in 0..STATS_KEPT {
+            stack.keep_stats(ms(600), summary(4.0));
+        }
+        assert_eq!(stack.stats_since(start).len(), STATS_KEPT, "the ring keeps the newest STATS_KEPT");
+    }
+
+    #[test]
     fn read_when_stable_waits_for_the_writer() {
         let dir = std::env::temp_dir().join(format!("vr-test-mcp-stack-stable-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2933,14 +2944,17 @@ mod tests {
         assert_eq!(polls, 4, "stable once two polls see the same size");
         let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None, String::new).unwrap_err().to_string();
         assert!(err.contains("never.png") && err.contains("deadline 0.3 s") && err.contains("vrserver may not see this directory"), "{err}");
-        let err = read_when_stable(&dir.join("never.png"), Duration::from_millis(300), || None, || COMPOSITOR_REQUESTED.into()).unwrap_err().to_string();
+        let err = read_when_stable(&dir.join("vr-1-2.png"), Duration::from_millis(300), || None, || COMPOSITOR_REQUESTED.into()).unwrap_err().to_string();
         assert!(err.contains("vrcompositor logged the request") && !err.contains("may not see"), "{err}");
+        let other = || format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}").replace("vr-1-2", "vr-1-1");
+        let err = read_when_stable(&dir.join("vr-1-2.png"), Duration::from_millis(300), || None, other).unwrap_err().to_string();
+        assert!(err.contains("deadline") && err.contains("logged no screenshot request"), "another request's failure is not ours: {err}");
         let began = Instant::now();
         let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || Some("vrserver"), String::new).unwrap_err();
         assert!(err.to_string().contains("failed: vrserver exited") && began.elapsed() < Duration::from_secs(2), "{err}");
         let began = Instant::now();
         let failed = || format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}");
-        let err = read_when_stable(&dir.join("never.png"), Duration::from_secs(30), || None, failed).unwrap_err().to_string();
+        let err = read_when_stable(&dir.join("vr-1-2.png"), Duration::from_secs(30), || None, failed).unwrap_err().to_string();
         assert!(began.elapsed() < Duration::from_secs(2), "bails at the failure line, not the deadline: {err}");
         assert_eq!(
             err,
@@ -2950,18 +2964,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// vrcompositor.txt after a TakeStereoScreenshot with an OpenXR scene app under Proton.
-    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 - Take stereo screenshot request dest filename=/h/.local/state/vr-test-mcp/screenshots/vr-1-2\n\
-        Tue Oct 27 2026 21:14:02.104 - Marked submission of screenshot textures for screenshot type 2, flags 3\n\
-        Tue Oct 27 2026 21:14:02.110 - Capturing Stereo2D texture\n";
-    const COMPOSITOR_FAILED: &str = "Tue Oct 27 2026 21:14:02.116 - Screenshot: Failed to get the correct textures.\n";
+    /// vrcompositor.txt after a TakeStereoScreenshot (stem vr-1-2) with an OpenXR scene app under Proton.
+    const COMPOSITOR_REQUESTED: &str = "Tue Oct 27 2026 21:14:02.100 [Info] - Screenshot: Take stereo screenshot request dest filename=\"/h/.local/state/vr-test-mcp/screenshots/vr-1-2-preview\"\n\
+        Tue Oct 27 2026 21:14:02.104 [Info] - Screenshot: Marked submission of screenshot textures for screenshot type 2, flags 3\n\
+        Tue Oct 27 2026 21:14:02.110 [Info] - Screenshot: Capturing Stereo2D texture\n";
+    const COMPOSITOR_FAILED: &str = "Tue Oct 27 2026 21:14:02.116 [Info] - Screenshot: Failed to get the correct textures.\n";
 
     #[test]
     fn compositor_log_shows_the_request_and_its_failure() {
-        assert_eq!(compositor_shot(""), (false, None));
-        assert_eq!(compositor_shot(COMPOSITOR_REQUESTED), (true, None));
+        assert_eq!(compositor_shot("", "vr-1-2"), (false, None));
+        assert_eq!(compositor_shot(COMPOSITOR_REQUESTED, "vr-1-2"), (true, None));
         let failed = format!("{COMPOSITOR_REQUESTED}{COMPOSITOR_FAILED}");
-        assert_eq!(compositor_shot(&failed), (true, Some("Screenshot: Failed to get the correct textures.")));
+        assert_eq!(compositor_shot(&failed, "vr-1-2"), (true, Some("Screenshot: Failed to get the correct textures.")));
+        assert_eq!(compositor_shot(&failed, "vr-1-22"), (false, None), "another request's lines");
+    }
+
+    #[test]
+    fn compositor_log_counts_only_this_requests_failure() {
+        // calls run concurrently: an earlier request (vr-1-1) fails after ours is logged, then ours (vr-1-2) fails
+        let other = COMPOSITOR_REQUESTED.replace("vr-1-2", "vr-1-1");
+        let log = format!("{other}{COMPOSITOR_FAILED}{COMPOSITOR_REQUESTED}");
+        assert_eq!(compositor_shot(&log, "vr-1-2"), (true, None), "the earlier request's failure is not ours");
+        assert_eq!(compositor_shot(&log, "vr-1-1"), (true, Some("Screenshot: Failed to get the correct textures.")));
+        let log = format!("{COMPOSITOR_REQUESTED}{other}{COMPOSITOR_FAILED}");
+        assert_eq!(compositor_shot(&log, "vr-1-2"), (true, None), "a failure after the next request belongs to that one");
+        assert_eq!(compositor_shot(&log, "vr-1-1"), (true, Some("Screenshot: Failed to get the correct textures.")));
     }
 
     fn pairs(path: &str, value: serde_json::Value) -> Vec<PathValuePair> {

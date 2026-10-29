@@ -52,8 +52,6 @@ pub enum Source {
     Headset,
     /// SteamVR's compositor: the scene app's uncompressed textures, side by side.
     Compositor,
-    /// The whole desktop, through xdg-desktop-portal.
-    Desktop,
 }
 
 impl Source {
@@ -61,7 +59,6 @@ impl Source {
         match self {
             Source::Headset => "headset",
             Source::Compositor => "compositor",
-            Source::Desktop => "desktop",
         }
     }
 }
@@ -443,6 +440,14 @@ impl Drop for Headset {
 mod tests {
     use super::*;
     use alvr_common::glam::UVec2;
+
+    #[test]
+    fn sources_are_headset_and_compositor_only() {
+        let parse = |s: &str| serde_json::from_value::<Source>(serde_json::json!(s)).map(Source::name).map_err(|e| e.to_string());
+        assert_eq!(parse("headset"), Ok("headset"));
+        assert_eq!(parse("compositor"), Ok("compositor"));
+        assert!(parse("desktop").is_err(), "the desktop source showed the user's whole screen");
+    }
 
     #[test]
     fn capabilities_are_modest() {
