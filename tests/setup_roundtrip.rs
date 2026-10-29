@@ -356,28 +356,51 @@ fn strip_paths(paths: &Paths, edit: impl FnOnce(&mut serde_json::Map<String, Val
 }
 
 #[test]
-fn restore_skips_files_whose_directory_is_gone() {
+fn restore_keeps_files_whose_directory_is_gone_for_a_retry() {
     let f = fixture("steamgone", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
     prep(&f.paths);
-    // Flatpak Steam removed after moving to native Steam
-    fs::remove_dir_all(f.root.join("steam")).unwrap();
+    // Steam's library on a second drive that is not mounted now
+    let (steam, unmounted) = (f.root.join("steam"), f.root.join("steam.unmounted"));
+    fs::rename(&steam, &unmounted).unwrap();
     let notes = restore(&f.paths).unwrap();
     assert!(notes.iter().any(|n| n.contains("steamvr.vrsettings")), "{notes:?}");
-    assert!(!f.root.join("steam").exists());
+    assert!(!steam.exists());
     assert_eq!(fs::read_to_string(f.paths.session_file().unwrap()).unwrap(), "{}");
-    assert!(!f.paths.restore_file().exists());
+    let kept = f.paths.restore_file();
+    assert!(kept.exists() && notes.iter().any(|n| n.contains("delete") && n.contains(&kept.display().to_string())), "{notes:?}");
+    // vr_start must not build on a restore.json that holds only the skipped files
+    let e = format!("{:#}", prepare(&f.paths, &session_values(&Config::default()).unwrap(), HOST).unwrap_err());
+    assert!(e.contains("vr_restore") && e.contains(&kept.display().to_string()), "{e}");
+    assert!(!steam.exists());
+
+    // the retry puts back only what was skipped: openvrpaths.vrpath changed since stays as it is
+    let vrpath = f.root.join("xdg/openvr/openvrpaths.vrpath");
+    let mut openvr: Value = serde_json::from_str(&fs::read_to_string(&vrpath).unwrap()).unwrap();
+    openvr["external_drivers"] = json!(["/elsewhere"]);
+    fs::write(&vrpath, openvr.to_string()).unwrap();
+    fs::rename(&unmounted, &steam).unwrap();
+    assert!(restore(&f.paths).unwrap().is_empty());
+    assert!(!kept.exists());
+    assert_eq!(Snap::take(&f.paths), Snap { openvrpaths: openvr, ..before });
     fs::remove_dir_all(&f.root).ok();
 }
 
 #[test]
-fn restore_skips_the_compositor_when_steamvr_is_gone() {
+fn restore_keeps_the_compositor_wrap_when_steamvr_is_gone_for_a_retry() {
     let f = fixture("steamvrgone", |v20| json!([v20]));
+    let before = Snap::take(&f.paths);
     prep(&f.paths);
-    // SteamVR moved to another library
-    fs::remove_dir_all(f.root.join("steamvr")).unwrap();
+    // the SteamVR library is on a drive that is not mounted now
+    let (steamvr, unmounted) = (f.root.join("steamvr"), f.root.join("steamvr.unmounted"));
+    fs::rename(&steamvr, &unmounted).unwrap();
     let notes = restore(&f.paths).unwrap();
     assert!(notes.iter().any(|n| n.contains("vrcompositor")), "{notes:?}");
-    assert!(!f.root.join("steamvr").exists());
+    assert!(!steamvr.exists());
+    assert!(f.paths.restore_file().exists(), "kept for a retry");
+    fs::rename(&unmounted, &steamvr).unwrap();
+    assert!(restore(&f.paths).unwrap().is_empty());
+    assert_eq!(Snap::take(&f.paths), before);
     assert!(!f.paths.restore_file().exists());
     fs::remove_dir_all(&f.root).ok();
 }
