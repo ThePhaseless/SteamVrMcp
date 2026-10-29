@@ -53,7 +53,7 @@ Stdout carries only the protocol. Logs go to stderr (see [Logging](#logging)).
 
 ### Tool gating
 
-Most hosts see only `vr_status`, `get_logs`, `vr_acquire` and `vr_release` at first. Every other tool appears while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes.
+Most hosts see a tool only while its prerequisites hold, and the server sends `notifications/tools/list_changed` when that changes. `vr_status`, `get_logs`, `vr_acquire` and `vr_release` are always listed. Before any session a healthy machine also lists `vr_start`, `record_audio` and `audio_level`, plus `vr_restore` when `restore.json` exists and `read_app_log` and `wait_for_log` when `app_logs` is set. The input tools appear once the headset streams.
 
 Claude Code is the exception: it gets every tool listed from the start. It does act on `tools/list_changed` (for MCP protocol 2026-07-28 through `subscriptions/listen`, which the server serves), but its subagents keep the tool list they were spawned with, and a refresh in the middle of a turn removes tools the model already planned to call. Hosts like this are listed in `HOSTS_WITHOUT_LIST_CHANGED` in `src/server.rs`.
 
@@ -81,7 +81,7 @@ A minimal file:
 streamer_dir = "/path/to/alvr_streamer_linux"
 ```
 
-The server reads the file at startup, at each `vr_start`, and at `vr_status` when the file changed or a core check fails. It applies a new version only while nothing runs, so after you fix a failing check, the next `vr_status` shows it without restarting the MCP. If SteamVR or a session is up, run `vr_stop` first. A malformed file does not stop the server: the `config` check fails, and `vr_start` stays unavailable until the file parses.
+The server reads the file at startup, at each `vr_start`, and at `vr_status` when the file changed or a core check fails. It applies a new version only while nothing runs, so after you fix a failing check, the next `vr_status` shows it without restarting the MCP. If SteamVR or a session is up, run `vr_stop` first. A malformed file does not stop the server: the `config` check fails, and `vr_start` stays unavailable until the file parses. While `restore.json` exists, changing `streamer_dir`, `steam_dir` or `steamvr_dir` makes `vr_start` refuse until you run `vr_restore` (see [What it changes on your system](#what-it-changes-on-your-system)).
 
 ### Steam environment
 
@@ -105,6 +105,8 @@ Find `<vendor:device>` as the `[vvvv:dddd]` pair on the GPU's line in `lspci -nn
 ```
 VK_DRIVER_FILES=<icd json of the SteamVR GPU> MESA_VK_DEVICE_SELECT=<vendor:device>! %command%
 ```
+
+For `launch_app` with `via: "proton"`, pass `MESA_VK_DEVICE_SELECT` in its `env`. Its env allowlist refuses `VK_DRIVER_FILES` and `VK_ICD_FILENAMES`, which load drivers, so there the device selection alone picks the GPU.
 
 The MCP never edits your desktop launchers or a game's launch options.
 
@@ -135,11 +137,13 @@ The MCP never edits your desktop launchers or a game's launch options.
 "session_settings.video.preferred_fps" = 90.0
 ```
 
-The built-in defaults the MCP applies first: H.264 Baseline, foveated encoding off, view resolution scale 1.0, 72 fps, game audio and microphone streaming off, `Stage` recentering, tracked Index controllers with hand skeletons and gesture input, a manual button mapping that passes every Index input through, and client discovery off. `set_alvr_settings` changes last until the next `vr_start`, which applies the defaults and `alvr_settings` again.
+The built-in defaults the MCP applies first: H.264 Baseline, foveated encoding off, transcoding and emulated view resolution scale 1.0, 72 fps, game audio and microphone streaming off, `Stage` recentering, tracked Index controllers with hand skeletons and gesture input, a manual button mapping that passes every Index input through, client discovery off and the remote dashboard off. They set no keyframe or IDR interval, so ALVR's own encoder defaults apply. `set_alvr_settings` changes last until the next `vr_start`, which applies the defaults and `alvr_settings` again.
+
+`alvr_settings` in config.toml is not filtered the way `set_alvr_settings` is, so it can turn client discovery or the remote dashboard back on and change the connection settings. Leave those alone unless you mean to expose ALVR on the network.
 
 ## Tools
 
-Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters, degrees and seconds. The default `Stage` recentering means the poses you send are absolute.
+Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters, degrees and seconds. The default `Stage` recentering means the poses you send are absolute. A controller pose is the Index controller's raw pose, which ALVR moves by its default controller offset of 11 cm along the controller's own -Z, so `get_tracked_state` reports the controller 11 cm along its own -Z from the pose you set. Games aim and grip from poses SteamVR derives from the raw one (see [Observed behavior](#observed-behavior)).
 
 ### Session
 
@@ -147,11 +151,11 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 | --- | --- |
 | `vr_status` | Startup checks and the state of Steam, SteamVR, ALVR, the headset, the lease and the session clock. |
 | `vr_acquire` | Take or renew the SteamVR lease under a name you choose. |
-| `vr_release` | Give the lease up so another agent can take it. SteamVR keeps running. |
+| `vr_release` | Give the lease up so another agent can take it. Refuses while this MCP runs a session; `vr_stop` already releases it. |
 | `vr_start` | Start Steam if needed, then SteamVR with ALVR and the headset, and return once it streams. |
 | `vr_stop` | Shut SteamVR down and disconnect the headset; close Steam only if `vr_start` started it. |
-| `vr_restore` | Put back the SteamVR and ALVR setup from before the first `vr_start`. |
-| `set_alvr_settings` | Set ALVR session values by path, restarting SteamVR when ALVR needs it. |
+| `vr_restore` | Put back the SteamVR and ALVR setup from before the first `vr_start`, and report whether all of it is back. |
+| `set_alvr_settings` | Set ALVR session values by path in a `vr_start` session, restarting SteamVR when ALVR needs it. |
 | `set_hand_tracking_flavour` | Bare hands as the Index controller (`index`) or as separate skeletal hand trackers (`skeletal_tracker`). |
 
 ### Apps
@@ -159,7 +163,7 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 | Tool | What it does |
 | --- | --- |
 | `launch_app` | Launch a Steam app or shortcut through Steam, or a Steam app straight through its Proton (`via: "proton"`), and wait for its scene. |
-| `stop_app` | Stop the scene app, and for a Proton launch its whole process tree. |
+| `stop_app` | Stop the scene app, and for a Proton launch its whole process tree. Works without a streaming headset. |
 | `close_dashboard` | Click the right controller's system button once if SteamVR's dashboard is open, so the game gets focus. |
 
 ### Head and playspace
@@ -206,7 +210,7 @@ Coordinates are SteamVR standing space: +Y up, -Z forward. Arguments use meters,
 | `screenshot` | PNG from `headset` (what the headset receives, the default) or `compositor` (SteamVR's uncompressed scene textures). There is no desktop or window source. |
 | `get_tracked_state` | What SteamVR tracks: devices, poses, velocities, skeletons and curls, the scene app. |
 | `get_haptics` | Haptic events the app sent. |
-| `get_frame_timing` | SteamVR compositor frame timings and ALVR latency statistics over a window. |
+| `get_frame_timing` | SteamVR compositor frame timings, frame counts and ALVR latency statistics over a window. |
 | `get_logs` | ALVR events plus the tails of SteamVR's vrserver, vrcompositor and vrmonitor logs. |
 | `read_app_log` | Lines of a game's own log files, as `app_logs` configures. |
 | `wait_for_log` | Wait for a game log line matching a regex, a `fail_pattern`, or the timeout. |
