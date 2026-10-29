@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 description = "MCP server that drives SteamVR through ALVR with a virtual headset, for automated VR testing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ThePhaseless/vr-test-mcp"
 
 [dependencies]
 alvr_client_core = { git = "https://github.com/alvr-org/ALVR", rev = "ebec107b7e5f81677fb9c631d239daf2110bf573" }
