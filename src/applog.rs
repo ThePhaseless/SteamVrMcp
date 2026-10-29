@@ -238,7 +238,7 @@ mod tests {
     use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
 
     fn tmp(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("vr-test-mcp-applog-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("steamvr-mcp-applog-{name}-{}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
         dir

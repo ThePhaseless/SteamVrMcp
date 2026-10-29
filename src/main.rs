@@ -1,6 +1,6 @@
 use alvr_common::anyhow::Result;
 use std::path::Path;
-use vr_test_mcp::{
+use steamvr_mcp::{
     config::{Config, Paths},
     server,
     stack::Stack,
@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         alvr_common::error!("{e:#}");
         Config::default()
     });
-    std::sync::LazyLock::force(&vr_test_mcp::clock::T0);
+    std::sync::LazyLock::force(&steamvr_mcp::clock::T0);
     let stack = Stack::new(cfg.clone(), Paths::detect(&cfg));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let served = runtime.block_on(server::serve(stack));

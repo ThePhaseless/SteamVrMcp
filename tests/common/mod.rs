@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use std::{collections::BTreeSet, fs, path::PathBuf};
-use vr_test_mcp::{config::Paths, setup::VRSETTINGS_KEYS};
+use steamvr_mcp::{config::Paths, setup::VRSETTINGS_KEYS};
 
 /// What a round trip must give back. SteamVR rewrites the rest of steamvr.vrsettings, so only
 /// VRSETTINGS_KEYS are compared; openvrpaths.vrpath is compared parsed, as ALVR rewrites it.

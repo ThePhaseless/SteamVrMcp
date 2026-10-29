@@ -474,17 +474,17 @@ impl VrServer {
 impl ServerHandler for VrServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build())
-            .with_server_info(Implementation::new("vr-test-mcp", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("steamvr-mcp", env!("CARGO_PKG_VERSION")))
     }
 
     /// Legacy lifecycle (`initialize`): notifications go straight to the peer.
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         let client = context.peer.peer_info().map(|i| i.client_info.name.clone()).unwrap_or_default();
-        eprintln!("vr-test-mcp: client {client:?} initialized");
+        eprintln!("steamvr-mcp: client {client:?} initialized");
         let peer = context.peer;
         self.forward_changes(move || {
             let peer = peer.clone();
-            async move { peer.notify_tool_list_changed().await.unwrap_or_else(|e| eprintln!("vr-test-mcp: {e}")) }
+            async move { peer.notify_tool_list_changed().await.unwrap_or_else(|e| eprintln!("steamvr-mcp: {e}")) }
         });
     }
 
@@ -494,11 +494,11 @@ impl ServerHandler for VrServer {
 
     /// 2026-07-28 lifecycle: notifications go through the client's `subscriptions/listen` request.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
-        eprintln!("vr-test-mcp: client {:?} listens", client_name(context.request_context()));
+        eprintln!("steamvr-mcp: client {:?} listens", client_name(context.request_context()));
         let sink = context.sink().clone();
         self.forward_changes(move || {
             let sink = sink.clone();
-            async move { sink.notify_tool_list_changed().await.unwrap_or_else(|e| eprintln!("vr-test-mcp: {e}")) }
+            async move { sink.notify_tool_list_changed().await.unwrap_or_else(|e| eprintln!("steamvr-mcp: {e}")) }
         });
         context.cancelled().await;
         Ok(())
@@ -555,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_foreign_live_lease_refuses_mutating_calls_only() {
-        let dir = std::env::temp_dir().join(format!("vr-test-mcp-server-lease-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("steamvr-mcp-server-lease-{}", std::process::id()));
         crate::steamvr::private_dir(&dir).unwrap();
         let other = crate::lease::Lease {
             owner: "other agent".into(),

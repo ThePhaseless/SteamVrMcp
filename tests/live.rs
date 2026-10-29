@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use vr_test_mcp::{
+use steamvr_mcp::{
     checks::startup_checks,
     config::{Config, Paths},
     headset::{Eye, Source},
@@ -737,7 +737,7 @@ fn live_haptics_recorded() {
     s.haptics(f64::NEG_INFINITY, true);
     let a = ButtonArgs { hand: Hand::Left, button: Button::A };
     s.apply(RigAction::PressButton(a.clone())).unwrap();
-    let pulse = |e: &vr_test_mcp::headset::HapticEvent| e.hand == "left" && (e.amplitude - 0.8).abs() <= 0.05;
+    let pulse = |e: &steamvr_mcp::headset::HapticEvent| e.hand == "left" && (e.amplitude - 0.8).abs() <= 0.05;
     let recorded = steamvr::wait_for(Duration::from_secs(1), || s.haptics(f64::NEG_INFINITY, false).iter().any(pulse));
     s.apply(RigAction::ReleaseButton(a)).unwrap();
     let events = s.haptics(f64::NEG_INFINITY, false);

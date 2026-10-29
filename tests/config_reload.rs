@@ -2,7 +2,7 @@
 //! fails) or an MCP restart. The only test in this binary: it sets XDG_CONFIG_HOME before any thread runs.
 
 use std::fs;
-use vr_test_mcp::{
+use steamvr_mcp::{
     checks::Check,
     config::{Config, Paths},
     stack::Stack,
@@ -19,9 +19,9 @@ fn vr_status_applies_a_fixed_config() {
         eprintln!("skipped: SteamVR runs, and the config is applied only while nothing runs");
         return;
     }
-    let root = std::env::temp_dir().join(format!("vr-test-mcp-config-reload-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("steamvr-mcp-config-reload-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
-    let file = root.join("xdg/vr-test-mcp/config.toml");
+    let file = root.join("xdg/steamvr-mcp/config.toml");
     fs::create_dir_all(file.parent().unwrap()).unwrap();
     unsafe { std::env::set_var("XDG_CONFIG_HOME", root.join("xdg")) };
     let streamer = |name: &str| format!("streamer_dir = {:?}\n", root.join(name).display().to_string());

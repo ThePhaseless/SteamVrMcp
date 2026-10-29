@@ -39,9 +39,9 @@ impl Default for Timeouts {
 }
 
 impl Config {
-    /// `$XDG_CONFIG_HOME/vr-test-mcp/config.toml`.
+    /// `$XDG_CONFIG_HOME/steamvr-mcp/config.toml`.
     pub fn file() -> Result<PathBuf> {
-        Ok(dirs::config_dir().context("no config dir")?.join("vr-test-mcp/config.toml"))
+        Ok(dirs::config_dir().context("no config dir")?.join("steamvr-mcp/config.toml"))
     }
 
     /// The file's text now; None when it is absent or unreadable.
@@ -71,7 +71,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Reads `$XDG_CONFIG_HOME/vr-test-mcp/config.toml`; a missing file gives the defaults.
+    /// Reads `$XDG_CONFIG_HOME/steamvr-mcp/config.toml`; a missing file gives the defaults.
     pub fn load() -> Result<Config> {
         let path = Config::file()?;
         match fs::read_to_string(&path) {
@@ -124,8 +124,8 @@ impl Paths {
             steam_dir,
             steamvr_dir,
             streamer_dir,
-            state_dir: dirs::state_dir().unwrap_or_default().join("vr-test-mcp"),
-            runtime_dir: dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join("vr-test-mcp"),
+            state_dir: dirs::state_dir().unwrap_or_default().join("steamvr-mcp"),
+            runtime_dir: dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join("steamvr-mcp"),
         }
     }
 
@@ -164,7 +164,7 @@ mod tests {
 
     #[test]
     fn flatpak_steam_only_when_steam_dir_is_flatpak_or_missing() {
-        let home = std::env::temp_dir().join(format!("vr-test-mcp-flatpak-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("steamvr-mcp-flatpak-{}", std::process::id()));
         let flatpak = home.join(".var/app/com.valvesoftware.Steam");
         std::fs::create_dir_all(&flatpak).unwrap();
         let native = home.join(".local/share/Steam");

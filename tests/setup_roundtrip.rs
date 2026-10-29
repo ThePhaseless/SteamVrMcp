@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::Mutex,
 };
-use vr_test_mcp::{
+use steamvr_mcp::{
     config::{Config, Paths},
     setup::{prepare, refresh_stale_snapshot, restore, session_values, snapshot},
 };
@@ -25,7 +25,7 @@ struct Fixture {
 
 fn fixture(name: &str, external_drivers: impl FnOnce(&PathBuf) -> Value) -> Fixture {
     let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-    let root = std::env::temp_dir().join(format!("vr-test-mcp-setup-{}-{name}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("steamvr-mcp-setup-{}-{name}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     let xdg = root.join("xdg");
     unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
